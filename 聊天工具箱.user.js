@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.7.0
-// @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改与逐段改写
+// @version      0.8.0
+// @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @connect      *
@@ -10,13 +10,15 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.6.0';
-    const PREFIX = 'ctb-v020';
+    const VERSION = '0.8.0';
+    const PREFIX = 'ctb-v080';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
     const FLOAT_ID = `${PREFIX}-float`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
-    const INSTANCE_KEY = '__ChatToolbox_v020__';
+    const SETTINGS_ID = `${PREFIX}-extension-settings`;
+    const INSTANCE_KEY = '__ChatToolbox_v080__';
+    const LEGACY_INSTANCE_KEY = '__ChatToolbox_v020__';
     const STORAGE_KEY = 'chat-toolbox-v020-settings';
     const MAX_RESULTS = 2000;
 
@@ -31,6 +33,7 @@
 
     // 让从旧版查找替换脚本直接升级的用户不会同时留下旧的悬浮图标。
     try { host.__ChatSearchReplace_v010__?.(); } catch (_) {}
+    try { host[LEGACY_INSTANCE_KEY]?.(); } catch (_) {}
     try { host[INSTANCE_KEY]?.(); } catch (_) {}
 
     let root = null;
@@ -69,6 +72,42 @@
     let rewriteWorldBooks = [];
     let rewriteWorldBook = '';
     const rewriteWorldEntryCache = new Map();
+    let theaterLoading = false;
+    let theaterResult = '';
+    let theaterHistory = [];
+    let theaterWorldPickerOpen = false;
+    let theaterWorldLoading = false;
+    let theaterWorldError = '';
+    let theaterWorldBooks = [];
+    let theaterWorldBook = '';
+    const theaterWorldEntryCache = new Map();
+    let worldbookLoading = false;
+    let worldbookLoadedOnce = false;
+    let worldbookSaving = false;
+    let worldbookBooks = [];
+    let worldbookBook = '';
+    let worldbookDocument = null;
+    let worldbookEntries = [];
+    let worldbookSearch = '';
+    let worldbookVisibleLimit = 120;
+    let worldbookSelected = new Set();
+    let worldbookEditingUid = '';
+    let worldbookDraft = null;
+    let worldbookDirty = false;
+    let worldbookTransferTarget = '';
+    let presetTransferLoading = false;
+    let presetTransferLoadedOnce = false;
+    let presetTransferApi = 'openai';
+    let presetTransferSource = '';
+    let presetTransferTarget = '';
+    let presetTransferSourceEntries = [];
+    let presetTransferTargetEntries = [];
+    let presetTransferSourceDocument = null;
+    let presetTransferTargetDocument = null;
+    let presetTransferSelected = new Set();
+    let presetTransferSearch = '';
+    let presetTransferVisibleLimit = 120;
+    let presetTransferError = '';
     let initAttempts = 0;
     let transientNotice = null;
     let pendingConfirm = null;
@@ -107,10 +146,22 @@
         'rewrite-context': '发送顺序固定为：角色卡 → 用户设定 → 你手动勾选的世界书具体条目 → 所选楼层之前最近 N 楼。这里只发送明确勾选的条目，不会自动混入整本世界书或其他已触发条目。',
         'rewrite-floor-tag': '楼层决定要改写哪一条 AI 回复；正文标签只截取该楼层对应标签内的文字，标签本身与其余内容不会交给模型改写。',
         'channel-main': '“跟随酒馆主接口”不需要重复填写地址和密钥；自定义渠道通过酒馆的 OpenAI 兼容代理请求。',
+        'theater-scope': '小剧场只在插件里独立生成和保存最近结果，不会插入聊天楼层，也不会改动原聊天。',
+        'worldbook-save': '世界书编辑采用先在界面修改、再一次保存的方式。移动条目时会先保存目标世界书，确认成功后才从来源删除。',
+        'preset-transfer': '这里只处理预设中的提示词条目：复制会保留来源，移动会在目标保存成功后删除来源；不会修改其他预设参数。',
     });
 
     function defaults() {
         return {
+            modules: {
+                search: true,
+                export: true,
+                postEdit: true,
+                rewrite: true,
+                theater: true,
+                worldbook: true,
+                presetTransfer: true,
+            },
             bookmarks: {},
             ai: {
                 channels: [],
@@ -137,7 +188,50 @@
                 worldEntries: [],
                 globalInstruction: '',
             },
+            theater: {
+                channelId: 'main',
+                prompt: '',
+                contextFloors: 6,
+                contextTags: '',
+                includeCharacter: true,
+                includePersona: true,
+                worldEntries: [],
+                presetName: '',
+                selectedPresetId: '',
+                presets: [],
+                history: [],
+            },
+            worldbook: {
+                currentBook: '',
+            },
+            presetTransfer: {
+                apiId: 'openai',
+                source: '',
+                target: '',
+            },
         };
+    }
+
+    const MODULES = Object.freeze([
+        { key: 'search', tab: 'search', label: '查找/替换' },
+        { key: 'export', tab: 'export', label: '文本导出' },
+        { key: 'postEdit', tab: 'post-edit', label: '词句修改' },
+        { key: 'rewrite', tab: 'rewrite', label: '段落改写' },
+        { key: 'theater', tab: 'theater', label: '小剧场' },
+        { key: 'worldbook', tab: 'worldbook', label: '世界书管理' },
+        { key: 'presetTransfer', tab: 'preset-transfer', label: '预设条目转移' },
+    ]);
+
+    function enabledModules() {
+        return MODULES.filter((module) => settings.modules?.[module.key] !== false);
+    }
+
+    function ensureActiveTab() {
+        const enabled = enabledModules();
+        if (!enabled.some((module) => module.tab === activeTab)) {
+            activeTab = enabled[0]?.tab || '';
+        }
+        return enabled;
     }
 
     function loadSettings() {
@@ -149,6 +243,10 @@
             const stored = contextStored && typeof contextStored === 'object' ? contextStored : localStored;
             const base = defaults();
             const next = {
+                modules: {
+                    ...base.modules,
+                    ...(stored.modules && typeof stored.modules === 'object' ? stored.modules : {}),
+                },
                 bookmarks: stored.bookmarks && typeof stored.bookmarks === 'object' ? stored.bookmarks : {},
                 ai: {
                     ...base.ai,
@@ -168,6 +266,25 @@
                             .filter((item) => item && item.world !== undefined && item.uid !== undefined)
                             .map((item) => ({ world: String(item.world), uid: String(item.uid) }))
                         : [],
+                },
+                theater: {
+                    ...base.theater,
+                    ...(stored.theater && typeof stored.theater === 'object' ? stored.theater : {}),
+                    presets: Array.isArray(stored.theater?.presets) ? stored.theater.presets : [],
+                    history: Array.isArray(stored.theater?.history) ? stored.theater.history.slice(0, 20) : [],
+                    worldEntries: Array.isArray(stored.theater?.worldEntries)
+                        ? stored.theater.worldEntries
+                            .filter((item) => item && item.world !== undefined && item.uid !== undefined)
+                            .map((item) => ({ world: String(item.world), uid: String(item.uid) }))
+                        : [],
+                },
+                worldbook: {
+                    ...base.worldbook,
+                    ...(stored.worldbook && typeof stored.worldbook === 'object' ? stored.worldbook : {}),
+                },
+                presetTransfer: {
+                    ...base.presetTransfer,
+                    ...(stored.presetTransfer && typeof stored.presetTransfer === 'object' ? stored.presetTransfer : {}),
                 },
             };
             if (stored.rewrite?.contextFloors === undefined && stored.rewrite?.contextRounds !== undefined) {
@@ -2003,6 +2120,7 @@
     function showPanel(tab = activeTab) {
         if (!root) return;
         activeTab = tab;
+        ensureActiveTab();
         root.hidden = false;
         renderPanel();
     }
@@ -2287,13 +2405,816 @@
             ${reviewList}`;
     }
 
+    function theaterSelectionKey(world, uid) {
+        return `${String(world)}\u0000${String(uid)}`;
+    }
+
+    function theaterSelectedWorldKeys() {
+        return new Set((settings.theater?.worldEntries || []).map((item) => theaterSelectionKey(item.world, item.uid)));
+    }
+
+    async function fetchTheaterWorldEntries(world, { force = false } = {}) {
+        const name = String(world || '').trim();
+        if (!name) return [];
+        if (!force && theaterWorldEntryCache.has(name)) return theaterWorldEntryCache.get(name);
+        const data = await stProxyJson('/api/worldinfo/get', { name });
+        const entries = normalizeWorldBookEntries(name, data);
+        theaterWorldEntryCache.set(name, entries);
+        return entries;
+    }
+
+    async function loadTheaterWorldBooks({ force = false } = {}) {
+        if (theaterWorldLoading) return;
+        theaterWorldLoading = true;
+        theaterWorldError = '';
+        renderPanel();
+        try {
+            if (force || !theaterWorldBooks.length) {
+                const data = await stProxyJson('/api/settings/get', {});
+                theaterWorldBooks = [...new Set((Array.isArray(data?.world_names) ? data.world_names : []).map(String).filter(Boolean))]
+                    .sort((left, right) => left.localeCompare(right));
+            }
+            theaterWorldBook = theaterWorldBook || theaterWorldBooks[0] || '';
+            if (theaterWorldBook) await fetchTheaterWorldEntries(theaterWorldBook, { force });
+        } catch (error) {
+            theaterWorldError = error.message || String(error);
+        } finally {
+            theaterWorldLoading = false;
+            renderPanel();
+        }
+    }
+
+    async function chooseTheaterWorldBook(name) {
+        theaterWorldBook = String(name || '');
+        theaterWorldError = '';
+        if (!theaterWorldBook) return renderPanel();
+        theaterWorldLoading = true;
+        renderPanel();
+        try {
+            await fetchTheaterWorldEntries(theaterWorldBook);
+        } catch (error) {
+            theaterWorldError = error.message || String(error);
+        } finally {
+            theaterWorldLoading = false;
+            renderPanel();
+        }
+    }
+
+    function setTheaterWorldEntrySelected(world, uid, selected) {
+        const key = theaterSelectionKey(world, uid);
+        const existing = settings.theater.worldEntries || [];
+        settings.theater.worldEntries = selected
+            ? (existing.some((item) => theaterSelectionKey(item.world, item.uid) === key)
+                ? existing
+                : [...existing, { world: String(world), uid: String(uid) }])
+            : existing.filter((item) => theaterSelectionKey(item.world, item.uid) !== key);
+        saveSettings();
+        renderPanel();
+    }
+
+    function setTheaterWorldBookSelection(selected) {
+        if (!theaterWorldBook) return;
+        const entries = theaterWorldEntryCache.get(theaterWorldBook) || [];
+        const current = String(theaterWorldBook);
+        const other = (settings.theater.worldEntries || []).filter((item) => item.world !== current);
+        settings.theater.worldEntries = selected
+            ? [...other, ...entries.map((entry) => ({ world: entry.world, uid: entry.uid }))]
+            : other;
+        saveSettings();
+        renderPanel();
+    }
+
+    async function collectTheaterWorldEntries() {
+        const selections = settings.theater?.worldEntries || [];
+        if (!selections.length) return '';
+        const books = [...new Set(selections.map((item) => item.world))];
+        const loaded = new Map();
+        for (const world of books) {
+            try { loaded.set(world, await fetchTheaterWorldEntries(world)); } catch (_) {}
+        }
+        return selections.map((selection) => {
+            const entry = (loaded.get(selection.world) || []).find((item) => item.uid === String(selection.uid));
+            return entry?.content?.trim() ? `【${entry.world} · ${entry.comment}】\n${entry.content.trim()}` : '';
+        }).filter(Boolean).join('\n\n');
+    }
+
+    function theaterWorldLabel(item) {
+        const entries = theaterWorldEntryCache.get(item.world) || [];
+        const entry = entries.find((candidate) => candidate.uid === String(item.uid));
+        return `${item.world} · ${entry?.comment || `条目 ${item.uid}`}`;
+    }
+
+    function theaterCharacterAndPersona() {
+        const context = getContext();
+        const parts = [];
+        if (settings.theater.includeCharacter !== false) {
+            const characterId = context.characterId ?? context.this_chid ?? host.this_chid;
+            const card = context.characters?.[characterId] || host.characters?.[characterId];
+            if (card) {
+                const text = [
+                    card.name ? `角色名：${card.name}` : '',
+                    card.description ? `角色描述：${card.description}` : '',
+                    card.personality ? `性格：${card.personality}` : '',
+                    card.scenario ? `场景：${card.scenario}` : '',
+                ].filter(Boolean).join('\n');
+                if (text) parts.push(`【角色卡】\n${text}`);
+            }
+        }
+        if (settings.theater.includePersona !== false) {
+            try {
+                const persona = String(context.substituteParams?.('{{persona}}') || '').trim();
+                if (persona) parts.push(`【用户设定】\n${persona}`);
+            } catch (_) {}
+        }
+        return parts;
+    }
+
+    async function buildTheaterMessages() {
+        const prompt = String(settings.theater.prompt || '').trim();
+        if (!prompt) throw new Error('请先输入小剧场主题或问题');
+        const limit = Math.max(0, Math.min(50, Number(settings.theater.contextFloors) || 0));
+        const tags = parseTags(settings.theater.contextTags);
+        const history = getRows().slice(-limit).map((row) => {
+            const text = extractTags(row.text, tags).trim();
+            return text ? `${row.isUser ? '用户' : row.name}（#${row.id}）：${text}` : '';
+        }).filter(Boolean).join('\n\n');
+        const worldEntries = await collectTheaterWorldEntries();
+        const contextParts = [
+            ...theaterCharacterAndPersona(),
+            worldEntries ? `【用户选择的世界书条目】\n${worldEntries}` : '',
+            history ? `【最近上下文】\n${history}` : '',
+        ].filter(Boolean);
+        const system = '你是一个独立的小剧场生成器。只在插件内回答用户提出的 IF 线、角色想法或幕后片段，不创建新聊天楼层，不改变主线事实。请明确区分已知剧情与假设内容。';
+        const user = [...contextParts, `【小剧场请求】\n${prompt}`].join('\n\n');
+        return [{ role: 'system', content: system }, { role: 'user', content: user }];
+    }
+
+    function saveTheaterPreset() {
+        const config = settings.theater;
+        const name = String(config.presetName || '').trim();
+        if (!name) return notify('请先填写小剧场预设名称', 'warning');
+        let preset = config.presets.find((item) => item.id === config.selectedPresetId);
+        const data = {
+            prompt: String(config.prompt || ''),
+            contextFloors: Number(config.contextFloors) || 0,
+            contextTags: String(config.contextTags || ''),
+            includeCharacter: config.includeCharacter !== false,
+            includePersona: config.includePersona !== false,
+            worldEntries: (config.worldEntries || []).map((item) => ({ world: String(item.world), uid: String(item.uid) })),
+            channelId: config.channelId || 'main',
+        };
+        if (!preset) {
+            preset = { id: `theater-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, name, ...data };
+            config.presets.push(preset);
+            config.selectedPresetId = preset.id;
+        } else Object.assign(preset, { name, ...data });
+        saveSettings();
+        renderPanel();
+        notify(`小剧场预设“${name}”已保存`, 'success');
+    }
+
+    function deleteTheaterPreset() {
+        const config = settings.theater;
+        const index = config.presets.findIndex((item) => item.id === config.selectedPresetId);
+        if (index < 0) return;
+        config.presets.splice(index, 1);
+        config.selectedPresetId = '';
+        config.presetName = '';
+        saveSettings();
+        renderPanel();
+    }
+
+    async function runTheater() {
+        if (theaterLoading) return;
+        theaterLoading = true;
+        theaterResult = '';
+        renderPanel();
+        try {
+            const messages = await buildTheaterMessages();
+            const output = await callAiText('theater', messages);
+            theaterResult = String(output || '').trim();
+            const item = { id: `theater-result-${Date.now().toString(36)}`, prompt: settings.theater.prompt, output: theaterResult, time: new Date().toLocaleString() };
+            theaterHistory = [item, ...(theaterHistory || [])].slice(0, 20);
+            settings.theater.history = theaterHistory;
+            saveSettings();
+            notify('小剧场生成完成；内容只保存在插件缓存中', 'success');
+        } catch (error) {
+            notify(`小剧场生成失败：${error.message}`, 'error');
+        } finally {
+            theaterLoading = false;
+            renderPanel();
+        }
+    }
+
+    function renderTheaterWorldPicker() {
+        const selections = settings.theater.worldEntries || [];
+        const selected = theaterSelectedWorldKeys();
+        const entries = theaterWorldEntryCache.get(theaterWorldBook) || [];
+        const books = theaterWorldBooks.map((name) => `<option value="${escapeHTML(name)}"${name === theaterWorldBook ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
+        const list = theaterWorldLoading
+            ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>'
+            : theaterWorldError
+                ? `<div class="ctb-world-empty ctb-world-error">${escapeHTML(theaterWorldError)}</div>`
+                : entries.length
+                    ? `<div class="ctb-world-entry-list">${entries.map((entry) => `<label class="ctb-world-entry${selected.has(theaterSelectionKey(entry.world, entry.uid)) ? ' is-selected' : ''}"><input type="checkbox" data-theater-world-entry-uid="${escapeHTML(entry.uid)}" data-theater-world-name="${escapeHTML(entry.world)}"${selected.has(theaterSelectionKey(entry.world, entry.uid)) ? ' checked' : ''}><span class="ctb-world-entry-main"><strong>${escapeHTML(entry.comment)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 110) || '（空条目）')}</small></span><span class="ctb-world-entry-meta">UID ${escapeHTML(entry.uid)}</span></label>`).join('')}</div>`
+                    : '<div class="ctb-world-empty">没有可选条目。</div>';
+        return `<div class="ctb-world-picker-summary"><button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-theater-world-picker"><i class="fa-solid fa-book-open"></i> 世界书条目 <span>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button>${selections.length ? '<button type="button" class="ctb-button" data-action="clear-theater-world-selection">清空</button>' : ''}</div>${selections.length ? `<div class="ctb-world-selected-summary">${selections.map((item) => `<span title="${escapeHTML(theaterWorldLabel(item))}">${escapeHTML(theaterWorldLabel(item))}</span>`).join('')}</div>` : ''}${theaterWorldPickerOpen ? `<div class="ctb-world-picker"><div class="ctb-inline ctb-world-book-row"><select class="ctb-input" id="ctb-theater-world-book">${books || '<option value="">没有世界书</option>'}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-world-books" title="刷新"><i class="fa-solid fa-rotate"></i></button><button type="button" class="ctb-button" data-action="close-theater-world-picker">完成</button></div>${theaterWorldBook ? `<div class="ctb-inline ctb-world-bulk"><span>${escapeHTML(theaterWorldBook)} · ${entries.length} 条</span><button type="button" class="ctb-button" data-action="select-theater-world-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-world-book">清空本书</button></div>` : ''}${list}</div>` : ''}`;
+    }
+
+    function renderTheaterTab() {
+        const config = settings.theater;
+        const presetOptions = ['<option value="">选择小剧场预设…</option>'].concat((config.presets || []).map((preset) => `<option value="${escapeHTML(preset.id)}"${config.selectedPresetId === preset.id ? ' selected' : ''}>${escapeHTML(preset.name)}</option>`)).join('');
+        const history = (theaterHistory || []).map((item, index) => `<details class="ctb-theater-history"><summary>${escapeHTML(item.time || '')} · ${escapeHTML(item.prompt || '').slice(0, 70)}</summary><pre>${escapeHTML(item.output || '')}</pre><button type="button" class="ctb-button" data-action="use-theater-history" data-history-index="${index}">载入结果</button></details>`).join('');
+        return `<section class="ctb-section"><div class="ctb-section-title">独立小剧场 ${infoButton('theater-scope')}</div><div class="ctb-hint">只在这里查看 IF 线、角色想法和幕后片段，不会写入聊天楼层。</div></section>
+            <section class="ctb-section"><div class="ctb-section-title">生成渠道</div>${renderChannelSettings('theater')}</section>
+            <section class="ctb-section"><div class="ctb-section-title">小剧场预设</div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-preset">${presetOptions}</select><input class="ctb-input" id="ctb-theater-preset-name" placeholder="预设名称" value="${escapeHTML(config.presetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-preset"${config.selectedPresetId ? '' : ' disabled'}>删除</button></div></section>
+            <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
+            <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="例如：如果这一刻没有人打断，角色会怎么想？">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterLoading ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterLoading ? '生成中…' : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div></section>
+            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果</div><pre class="ctb-theater-result">${escapeHTML(theaterResult)}</pre></section>` : ''}
+            ${theaterHistory.length ? `<section class="ctb-section"><div class="ctb-section-title">最近结果 <span>最多保留 20 条</span></div>${history}</section>` : ''}${theaterPromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览</span><button type="button" class="ctb-review-expand" data-action="close-theater-preview">×</button></div><pre>${escapeHTML(theaterPromptPreview)}</pre></section>` : ''}`;
+    }
+
+    let theaterPromptPreview = '';
+
+    async function previewTheaterPrompt() {
+        try {
+            theaterPromptPreview = formatPromptPreview(await buildTheaterMessages());
+        } catch (error) {
+            notify(error.message, 'warning');
+        }
+        renderPanel();
+    }
+
+    function loadTheaterHistory(index) {
+        const item = theaterHistory[Number(index)];
+        if (!item) return;
+        settings.theater.prompt = item.prompt || '';
+        theaterResult = item.output || '';
+        renderPanel();
+    }
+
+    function deepClone(value) {
+        try { return structuredClone(value); } catch (_) {
+            return JSON.parse(JSON.stringify(value));
+        }
+    }
+
+    async function getWorldBookNames() {
+        const context = getContext();
+        try { await context.updateWorldInfoList?.(); } catch (_) {}
+        const direct = context.world_names || context.worldNames || host.world_names || host.worldNames;
+        if (Array.isArray(direct) && direct.length) return [...new Set(direct.map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+        const data = await stProxyJson('/api/settings/get', {});
+        return [...new Set((Array.isArray(data?.world_names) ? data.world_names : []).map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    }
+
+    async function loadWorldInfoDocument(name) {
+        const context = getContext();
+        if (typeof context.loadWorldInfo === 'function') {
+            const data = await context.loadWorldInfo(name);
+            if (data && typeof data === 'object') return deepClone(data);
+        }
+        return deepClone(await stProxyJson('/api/worldinfo/get', { name }));
+    }
+
+    async function saveWorldInfoDocument(name, data, createNew = false) {
+        const context = getContext();
+        if (typeof context.saveWorldInfo !== 'function') throw new Error('当前酒馆版本没有公开世界书保存接口');
+        await context.saveWorldInfo(name, deepClone(data), Boolean(createNew));
+        try { await context.updateWorldInfoList?.(); } catch (_) {}
+        const verify = await loadWorldInfoDocument(name);
+        if (!verify || typeof verify.entries !== 'object') throw new Error('保存后无法回读世界书');
+        return verify;
+    }
+
+    function worldbookRecords(data) {
+        return Object.entries(data?.entries || {}).map(([key, raw]) => {
+            const value = raw && typeof raw === 'object' ? deepClone(raw) : {};
+            const uid = String(value.uid ?? key);
+            if (value.uid === undefined) value.uid = uid;
+            return { uid, sourceKey: String(key), raw: value };
+        });
+    }
+
+    function serializeWorldbookRecords(records) {
+        const entries = {};
+        for (const record of records) {
+            const raw = deepClone(record.raw || {});
+            const uid = String(raw.uid ?? record.uid);
+            raw.uid = raw.uid ?? uid;
+            entries[uid] = raw;
+        }
+        return entries;
+    }
+
+    function worldbookRecordLabel(record) {
+        const raw = record?.raw || {};
+        const keys = Array.isArray(raw.key) ? raw.key.filter(Boolean).join('、') : '';
+        return String(raw.comment || raw.name || keys || `条目 ${record?.uid || ''}`);
+    }
+
+    function worldbookRecordPreview(record) {
+        return String(record?.raw?.content || '').replace(/\s+/g, ' ').trim().slice(0, 130);
+    }
+
+    async function loadWorldbookManager({ force = false, book = '' } = {}) {
+        if (worldbookLoading) return;
+        worldbookLoading = true;
+        renderPanel();
+        try {
+            if (force || !worldbookBooks.length) worldbookBooks = await getWorldBookNames();
+            const preferred = String(book || worldbookBook || settings.worldbook.currentBook || '');
+            worldbookBook = worldbookBooks.includes(preferred) ? preferred : (worldbookBooks[0] || '');
+            settings.worldbook.currentBook = worldbookBook;
+            if (worldbookBook) {
+                worldbookDocument = await loadWorldInfoDocument(worldbookBook);
+                worldbookEntries = worldbookRecords(worldbookDocument);
+            } else {
+                worldbookDocument = null;
+                worldbookEntries = [];
+            }
+            worldbookSelected = new Set();
+            worldbookVisibleLimit = 120;
+            worldbookEditingUid = '';
+            worldbookDraft = null;
+            worldbookDirty = false;
+            worldbookTransferTarget = worldbookBooks.find((name) => name !== worldbookBook) || '';
+            saveSettings();
+        } catch (error) {
+            notify(`读取世界书失败：${error.message}`, 'error');
+        } finally {
+            worldbookLoading = false;
+            worldbookLoadedOnce = true;
+            renderPanel();
+        }
+    }
+
+    async function chooseWorldbook(name) {
+        if (worldbookDirty && !host.confirm('当前世界书有尚未保存的修改。放弃修改并切换吗？')) {
+            return renderPanel();
+        }
+        return loadWorldbookManager({ force: false, book: name });
+    }
+
+    function editWorldbookEntry(uid) {
+        const record = worldbookEntries.find((item) => item.uid === String(uid));
+        if (!record) return;
+        worldbookEditingUid = record.uid;
+        worldbookDraft = deepClone(record.raw);
+        renderPanel();
+    }
+
+    function applyWorldbookDraft({ quiet = false } = {}) {
+        if (!worldbookDraft || !worldbookEditingUid) return false;
+        const record = worldbookEntries.find((item) => item.uid === worldbookEditingUid);
+        if (!record) return false;
+        record.raw = deepClone(worldbookDraft);
+        record.raw.uid = record.raw.uid ?? record.uid;
+        worldbookDirty = true;
+        if (!quiet) {
+            renderPanel();
+            notify('条目修改已暂存；请点击“保存世界书”写入文件', 'success');
+        }
+        return true;
+    }
+
+    function createWorldbookEntry() {
+        const uid = `ctb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+        const raw = {
+            uid,
+            comment: '新条目',
+            key: [],
+            keysecondary: [],
+            content: '',
+            constant: false,
+            selective: true,
+            order: 100,
+            position: 0,
+            disable: false,
+            depth: 4,
+        };
+        worldbookEntries.unshift({ uid, sourceKey: uid, raw });
+        worldbookEditingUid = uid;
+        worldbookDraft = deepClone(raw);
+        worldbookDirty = true;
+        renderPanel();
+    }
+
+    async function saveCurrentWorldbook() {
+        if (!worldbookBook || worldbookSaving) return;
+        applyWorldbookDraft({ quiet: true });
+        worldbookSaving = true;
+        renderPanel();
+        try {
+            const next = { ...(worldbookDocument || {}), entries: serializeWorldbookRecords(worldbookEntries) };
+            const verified = await saveWorldInfoDocument(worldbookBook, next, false);
+            worldbookDocument = verified;
+            worldbookEntries = worldbookRecords(verified);
+            worldbookDirty = false;
+            rewriteWorldEntryCache.delete(worldbookBook);
+            theaterWorldEntryCache.delete(worldbookBook);
+            notify(`世界书“${worldbookBook}”已保存，共 ${worldbookEntries.length} 条`, 'success');
+        } catch (error) {
+            notify(`保存世界书失败：${error.message}`, 'error');
+        } finally {
+            worldbookSaving = false;
+            renderPanel();
+        }
+    }
+
+    async function createWorldbookBook() {
+        const name = String(host.prompt('新世界书名称：') || '').trim();
+        if (!name) return;
+        if (worldbookBooks.includes(name)) return notify('已经存在同名世界书', 'warning');
+        try {
+            await saveWorldInfoDocument(name, { entries: {} }, true);
+            worldbookBooks = [];
+            await loadWorldbookManager({ force: true, book: name });
+            notify(`世界书“${name}”已创建`, 'success');
+        } catch (error) {
+            notify(`创建世界书失败：${error.message}`, 'error');
+        }
+    }
+
+    async function deleteWorldbookBook(name) {
+        const book = String(name || worldbookBook || '');
+        if (!book || !host.confirm(`确定删除世界书“${book}”吗？此操作会删除文件。`)) return;
+        try {
+            await stProxyJson('/api/worldinfo/delete', { name: book });
+            worldbookBooks = [];
+            await loadWorldbookManager({ force: true });
+            notify(`世界书“${book}”已删除`, 'success');
+        } catch (error) {
+            notify(`删除世界书失败：${error.message}`, 'error');
+        }
+    }
+
+    async function renameWorldbookBook() {
+        if (!worldbookBook) return;
+        const oldName = worldbookBook;
+        const name = String(host.prompt('新的世界书名称：', oldName) || '').trim();
+        if (!name || name === oldName) return;
+        if (worldbookBooks.includes(name)) return notify('已经存在同名世界书', 'warning');
+        try {
+            applyWorldbookDraft({ quiet: true });
+            const next = { ...(worldbookDocument || {}), entries: serializeWorldbookRecords(worldbookEntries) };
+            await saveWorldInfoDocument(name, next, true);
+            await stProxyJson('/api/worldinfo/delete', { name: oldName });
+            worldbookBooks = [];
+            await loadWorldbookManager({ force: true, book: name });
+            notify(`世界书已重命名为“${name}”`, 'success');
+        } catch (error) {
+            notify(`重命名世界书失败：${error.message}`, 'error');
+        }
+    }
+
+    async function deleteSelectedWorldbookEntries() {
+        const ids = [...worldbookSelected];
+        if (!ids.length || !host.confirm(`确定删除选中的 ${ids.length} 个世界书条目并保存吗？`)) return;
+        worldbookEntries = worldbookEntries.filter((record) => !worldbookSelected.has(record.uid));
+        worldbookSelected = new Set();
+        if (ids.includes(worldbookEditingUid)) {
+            worldbookEditingUid = '';
+            worldbookDraft = null;
+        }
+        worldbookDirty = true;
+        await saveCurrentWorldbook();
+    }
+
+    function nextWorldbookUid(existing) {
+        let uid;
+        do { uid = `ctb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; } while (existing.has(uid));
+        existing.add(uid);
+        return uid;
+    }
+
+    async function transferWorldbookEntries(mode) {
+        const selected = worldbookEntries.filter((record) => worldbookSelected.has(record.uid));
+        const targetName = String(worldbookTransferTarget || '');
+        if (!selected.length) return notify('请先勾选要转移的世界书条目', 'warning');
+        if (!targetName || targetName === worldbookBook) return notify('请选择另一本目标世界书', 'warning');
+        if (worldbookDirty) return notify('请先保存当前世界书，再执行跨书转移', 'warning');
+        worldbookSaving = true;
+        renderPanel();
+        try {
+            const targetDocument = await loadWorldInfoDocument(targetName);
+            const targetRecords = worldbookRecords(targetDocument);
+            const existing = new Set(targetRecords.map((record) => record.uid));
+            for (const source of selected) {
+                const raw = deepClone(source.raw);
+                let uid = String(raw.uid ?? source.uid);
+                if (existing.has(uid)) {
+                    uid = nextWorldbookUid(existing);
+                    raw.uid = uid;
+                } else existing.add(uid);
+                targetRecords.push({ uid, sourceKey: uid, raw });
+            }
+            const targetNext = { ...targetDocument, entries: serializeWorldbookRecords(targetRecords) };
+            await saveWorldInfoDocument(targetName, targetNext, false);
+            if (mode === 'move') {
+                const sourceNextRecords = worldbookEntries.filter((record) => !worldbookSelected.has(record.uid));
+                const sourceNext = { ...worldbookDocument, entries: serializeWorldbookRecords(sourceNextRecords) };
+                const sourceVerified = await saveWorldInfoDocument(worldbookBook, sourceNext, false);
+                worldbookDocument = sourceVerified;
+                worldbookEntries = worldbookRecords(sourceVerified);
+            }
+            worldbookSelected = new Set();
+            rewriteWorldEntryCache.delete(targetName);
+            theaterWorldEntryCache.delete(targetName);
+            notify(`已${mode === 'move' ? '移动' : '复制'} ${selected.length} 个条目到“${targetName}”`, 'success');
+        } catch (error) {
+            notify(`世界书条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}`, 'error');
+        } finally {
+            worldbookSaving = false;
+            renderPanel();
+        }
+    }
+
+    function renderWorldbookTab() {
+        if (!worldbookLoadedOnce && !worldbookLoading) host.setTimeout(() => loadWorldbookManager(), 0);
+        const filtered = worldbookEntries.filter((record) => {
+            const query = worldbookSearch.trim().toLowerCase();
+            if (!query) return true;
+            const raw = record.raw || {};
+            return [worldbookRecordLabel(record), record.uid, ...(Array.isArray(raw.key) ? raw.key : []), raw.content || ''].join('\n').toLowerCase().includes(query);
+        });
+        const visible = filtered.slice(0, worldbookVisibleLimit);
+        const books = worldbookBooks.map((name) => `<option value="${escapeHTML(name)}"${name === worldbookBook ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
+        const targets = worldbookBooks.filter((name) => name !== worldbookBook).map((name) => `<option value="${escapeHTML(name)}"${name === worldbookTransferTarget ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
+        const list = worldbookLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>' : filtered.length
+            ? `<div class="ctb-manager-list">${visible.map((record) => `<div class="ctb-manager-row${record.uid === worldbookEditingUid ? ' is-active' : ''}"><input type="checkbox" data-worldbook-select-uid="${escapeHTML(record.uid)}"${worldbookSelected.has(record.uid) ? ' checked' : ''}><button type="button" data-action="edit-worldbook-entry" data-worldbook-uid="${escapeHTML(record.uid)}"><strong>${escapeHTML(worldbookRecordLabel(record))}</strong><small>${escapeHTML(worldbookRecordPreview(record) || '（空条目）')}</small></button><span>优先级 ${escapeHTML(record.raw?.order ?? 0)}</span></div>`).join('')}${filtered.length > visible.length ? `<button type="button" class="ctb-list-more" data-action="more-worldbook-entries">再显示 ${Math.min(120, filtered.length - visible.length)} 条（共 ${filtered.length} 条）</button>` : ''}</div>`
+            : '<div class="ctb-world-empty">没有符合条件的条目。</div>';
+        const draft = worldbookDraft;
+        const editor = draft ? `<div class="ctb-manager-editor"><div class="ctb-section-title">编辑条目 <span>UID ${escapeHTML(worldbookEditingUid)}</span></div><input class="ctb-input" id="ctb-worldbook-comment" placeholder="条目名称/备注" value="${escapeHTML(draft.comment || '')}"><input class="ctb-input" id="ctb-worldbook-keys" placeholder="关键词，用逗号分隔" value="${escapeHTML((Array.isArray(draft.key) ? draft.key : []).join(', '))}"><textarea class="ctb-input ctb-textarea ctb-manager-content" id="ctb-worldbook-content" placeholder="世界书内容">${escapeHTML(draft.content || '')}</textarea><div class="ctb-inline ctb-manager-fields"><label class="ctb-mini-field">优先级 <input class="ctb-input" id="ctb-worldbook-order" type="number" value="${escapeHTML(draft.order ?? 100)}"></label><label class="ctb-mini-field">深度 <input class="ctb-input" id="ctb-worldbook-depth" type="number" min="0" value="${escapeHTML(draft.depth ?? 4)}"></label><select class="ctb-input" id="ctb-worldbook-position">${[['0','角色定义前'],['1','角色定义后'],['2','示例前'],['3','示例后'],['4','深度']].map(([value,label]) => `<option value="${value}"${String(draft.position ?? 0) === value ? ' selected' : ''}>${label}</option>`).join('')}</select><label class="ctb-check"><input id="ctb-worldbook-constant" type="checkbox"${draft.constant ? ' checked' : ''}> 常驻</label><label class="ctb-check"><input id="ctb-worldbook-disabled" type="checkbox"${draft.disable ? ' checked' : ''}> 禁用</label></div><div class="ctb-inline ctb-manager-actions"><button type="button" class="ctb-button ctb-primary" data-action="apply-worldbook-entry">暂存条目</button></div></div>` : '<div class="ctb-world-empty">点击条目开始编辑。</div>';
+        return `<section class="ctb-section"><div class="ctb-section-title">世界书管理 ${infoButton('worldbook-save')}</div><div class="ctb-inline ctb-manager-toolbar"><select class="ctb-input" id="ctb-worldbook-book">${books || '<option value="">没有世界书</option>'}</select><button type="button" class="ctb-button" data-action="refresh-worldbook">刷新</button><button type="button" class="ctb-button" data-action="create-worldbook">新建书</button><button type="button" class="ctb-button" data-action="rename-worldbook"${worldbookBook ? '' : ' disabled'}>重命名</button><button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook"${worldbookBook ? '' : ' disabled'}>删除书</button></div></section>
+            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><input class="ctb-input" id="ctb-worldbook-search" placeholder="搜索条目名称、关键词或内容" value="${escapeHTML(worldbookSearch)}"><button type="button" class="ctb-button" data-action="filter-worldbook">筛选</button><button type="button" class="ctb-button" data-action="new-worldbook-entry"${worldbookBook ? '' : ' disabled'}>新条目</button><button type="button" class="ctb-button" data-action="sort-worldbook-priority">按优先级排序</button></div><div class="ctb-manager-grid"><div>${list}</div>${editor}</div></section>
+            <section class="ctb-section"><div class="ctb-section-title">批量条目操作 <span>已选 ${worldbookSelected.size} 条</span></div><div class="ctb-inline ctb-manager-toolbar"><select class="ctb-input" id="ctb-worldbook-transfer-target">${targets || '<option value="">没有其他世界书</option>'}</select><button type="button" class="ctb-button" data-action="copy-worldbook-entries"${worldbookSelected.size ? '' : ' disabled'}>复制到目标</button><button type="button" class="ctb-button" data-action="move-worldbook-entries"${worldbookSelected.size ? '' : ' disabled'}>移动到目标</button><button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook-entries"${worldbookSelected.size ? '' : ' disabled'}>批量删除</button></div></section>
+            <div class="ctb-inline ctb-manager-savebar"><span>${worldbookDirty ? '有尚未保存的修改' : '当前世界书已同步'}</span><button type="button" class="ctb-button ctb-save" data-action="save-worldbook"${worldbookBook && !worldbookSaving ? '' : ' disabled'}>${worldbookSaving ? '保存中…' : '保存世界书'}</button></div>`;
+    }
+
+    function getPresetTransferManager() {
+        const context = getContext();
+        const getter = context.getPresetManager || host.SillyTavern?.getPresetManager || host.getPresetManager;
+        if (typeof getter !== 'function') throw new Error('当前酒馆版本没有公开预设管理接口');
+        const manager = getter.call(context, presetTransferApi || 'openai');
+        if (!manager) throw new Error('没有找到 Chat Completion 预设管理器，请先切换到可用的聊天补全接口');
+        return manager;
+    }
+
+    function presetTransferNames(manager) {
+        if (typeof manager.getAllPresets === 'function') {
+            const names = manager.getAllPresets();
+            if (Array.isArray(names)) return [...new Set(names.map(String).filter(Boolean))];
+        }
+        const list = manager.getPresetList?.(presetTransferApi) || {};
+        if (Array.isArray(list.preset_names)) return list.preset_names.map(String).filter(Boolean);
+        return Object.keys(list.preset_names || {});
+    }
+
+    async function loadPresetTransferDocument(manager, name) {
+        let data;
+        if (typeof manager.getCompletionPresetByName === 'function') data = await manager.getCompletionPresetByName(name);
+        if (!data && typeof manager.getPresetList === 'function') {
+            const list = manager.getPresetList(presetTransferApi) || {};
+            const names = list.preset_names || [];
+            const index = Array.isArray(names) ? names.indexOf(name) : names[name];
+            if (index !== undefined && index !== -1) data = list.presets?.[index];
+        }
+        if (!data) throw new Error(`无法读取预设“${name}”`);
+        return deepClone(data);
+    }
+
+    function presetEntryArrayInfo(document) {
+        if (Array.isArray(document?.prompts)) return { key: 'prompts', entries: document.prompts };
+        if (Array.isArray(document?.entries)) return { key: 'entries', entries: document.entries };
+        throw new Error('所选预设没有可转移的提示词条目');
+    }
+
+    function presetTransferRecords(document) {
+        const { entries } = presetEntryArrayInfo(document);
+        return entries.map((raw, index) => {
+            const value = raw && typeof raw === 'object' ? deepClone(raw) : { content: String(raw ?? '') };
+            const id = String(value.identifier ?? value.id ?? value.uid ?? `entry-${index}`);
+            return {
+                id,
+                index,
+                raw: value,
+                name: String(value.name || value.comment || value.identifier || `条目 ${index + 1}`),
+                content: String(value.content ?? value.system_prompt ?? value.prompt ?? ''),
+                marker: Boolean(value.marker),
+            };
+        });
+    }
+
+    function uniquePresetIdentifier(raw, existing) {
+        let id = String(raw.identifier ?? raw.id ?? raw.uid ?? `ctb-prompt-${Date.now().toString(36)}`);
+        if (!existing.has(id)) {
+            existing.add(id);
+            return id;
+        }
+        const base = id.replace(/-\d+$/, '');
+        let counter = 2;
+        while (existing.has(`${base}-copy-${counter}`)) counter += 1;
+        id = `${base}-copy-${counter}`;
+        existing.add(id);
+        return id;
+    }
+
+    function addPresetPromptOrder(document, identifier, enabled = true) {
+        if (!Array.isArray(document?.prompt_order)) return;
+        for (const orderGroup of document.prompt_order) {
+            if (!Array.isArray(orderGroup?.order)) continue;
+            if (!orderGroup.order.some((item) => String(item?.identifier) === String(identifier))) {
+                orderGroup.order.push({ identifier, enabled: enabled !== false });
+            }
+        }
+    }
+
+    function removePresetPromptOrder(document, identifiers) {
+        const set = new Set([...identifiers].map(String));
+        if (!Array.isArray(document?.prompt_order)) return;
+        for (const orderGroup of document.prompt_order) {
+            if (Array.isArray(orderGroup?.order)) {
+                orderGroup.order = orderGroup.order.filter((item) => !set.has(String(item?.identifier)));
+            }
+        }
+    }
+
+    async function savePresetTransferDocument(manager, name, document) {
+        if (typeof manager.savePreset !== 'function') throw new Error('当前预设管理器不支持保存');
+        const next = deepClone(document);
+        await manager.savePreset(name, next, { skipUpdate: true });
+        const list = manager.getPresetList?.(presetTransferApi) || {};
+        const names = list.preset_names || [];
+        const index = Array.isArray(names) ? names.indexOf(name) : names[name];
+        if (index !== undefined && index !== -1 && Array.isArray(list.presets)) {
+            list.presets[index] = deepClone(next);
+        }
+        const verify = await loadPresetTransferDocument(manager, name);
+        presetEntryArrayInfo(verify);
+        return verify;
+    }
+
+    async function loadPresetTransfer({ force = false } = {}) {
+        if (presetTransferLoading) return;
+        presetTransferLoading = true;
+        presetTransferError = '';
+        renderPanel();
+        try {
+            const manager = getPresetTransferManager();
+            const names = presetTransferNames(manager);
+            if (!names.length) throw new Error('没有读取到可用预设');
+            const savedSource = force ? presetTransferSource : (presetTransferSource || settings.presetTransfer.source);
+            presetTransferSource = names.includes(savedSource) ? savedSource : names[0];
+            const targetCandidate = presetTransferTarget || settings.presetTransfer.target;
+            presetTransferTarget = names.includes(targetCandidate) && targetCandidate !== presetTransferSource
+                ? targetCandidate
+                : (names.find((name) => name !== presetTransferSource) || '');
+            presetTransferSourceDocument = await loadPresetTransferDocument(manager, presetTransferSource);
+            presetTransferSourceEntries = presetTransferRecords(presetTransferSourceDocument);
+            if (presetTransferTarget) {
+                presetTransferTargetDocument = await loadPresetTransferDocument(manager, presetTransferTarget);
+                presetTransferTargetEntries = presetTransferRecords(presetTransferTargetDocument);
+            } else {
+                presetTransferTargetDocument = null;
+                presetTransferTargetEntries = [];
+            }
+            presetTransferSelected = new Set();
+            presetTransferVisibleLimit = 120;
+            settings.presetTransfer.apiId = presetTransferApi;
+            settings.presetTransfer.source = presetTransferSource;
+            settings.presetTransfer.target = presetTransferTarget;
+            saveSettings();
+        } catch (error) {
+            presetTransferError = error.message || String(error);
+        } finally {
+            presetTransferLoading = false;
+            presetTransferLoadedOnce = true;
+            renderPanel();
+        }
+    }
+
+    async function choosePresetTransferSide(side, name) {
+        if (side === 'source') presetTransferSource = String(name || '');
+        else presetTransferTarget = String(name || '');
+        if (presetTransferSource && presetTransferSource === presetTransferTarget) {
+            presetTransferError = '来源和目标不能是同一个预设';
+            return renderPanel();
+        }
+        return loadPresetTransfer({ force: true });
+    }
+
+    async function transferPresetEntries(mode) {
+        const selected = presetTransferSourceEntries.filter((entry) => presetTransferSelected.has(entry.id));
+        if (!selected.length) return notify('请先勾选要处理的预设条目', 'warning');
+        if (!presetTransferTarget || presetTransferTarget === presetTransferSource) return notify('请选择不同的目标预设', 'warning');
+        presetTransferLoading = true;
+        renderPanel();
+        try {
+            const manager = getPresetTransferManager();
+            const sourceDocument = await loadPresetTransferDocument(manager, presetTransferSource);
+            const targetDocument = await loadPresetTransferDocument(manager, presetTransferTarget);
+            const sourceInfo = presetEntryArrayInfo(sourceDocument);
+            const targetInfo = presetEntryArrayInfo(targetDocument);
+            const selectedIds = new Set(selected.map((entry) => entry.id));
+            const existing = new Set(presetTransferRecords(targetDocument).map((entry) => entry.id));
+            for (const entry of selected) {
+                const raw = deepClone(entry.raw);
+                const originalId = String(raw.identifier ?? raw.id ?? raw.uid ?? entry.id);
+                const nextId = uniquePresetIdentifier(raw, existing);
+                if ('identifier' in raw || targetInfo.key === 'prompts') raw.identifier = nextId;
+                else if ('id' in raw) raw.id = nextId;
+                else raw.uid = nextId;
+                targetInfo.entries.push(raw);
+                addPresetPromptOrder(targetDocument, nextId, raw.enabled !== false);
+                if (nextId !== originalId && raw.name) raw.name = `${raw.name}（副本）`;
+            }
+            targetDocument[targetInfo.key] = targetInfo.entries;
+            await savePresetTransferDocument(manager, presetTransferTarget, targetDocument);
+            if (mode === 'move') {
+                sourceInfo.entries = sourceInfo.entries.filter((raw, index) => {
+                    const id = String(raw?.identifier ?? raw?.id ?? raw?.uid ?? `entry-${index}`);
+                    return !selectedIds.has(id);
+                });
+                sourceDocument[sourceInfo.key] = sourceInfo.entries;
+                removePresetPromptOrder(sourceDocument, selectedIds);
+                await savePresetTransferDocument(manager, presetTransferSource, sourceDocument);
+            }
+            notify(`已${mode === 'move' ? '移动' : '复制'} ${selected.length} 个预设条目`, 'success');
+            await loadPresetTransfer({ force: true });
+        } catch (error) {
+            presetTransferError = error.message || String(error);
+            notify(`预设条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}`, 'error');
+        } finally {
+            presetTransferLoading = false;
+            renderPanel();
+        }
+    }
+
+    async function deletePresetEntries() {
+        const selected = presetTransferSourceEntries.filter((entry) => presetTransferSelected.has(entry.id));
+        if (!selected.length || !host.confirm(`确定从预设“${presetTransferSource}”删除选中的 ${selected.length} 个条目吗？`)) return;
+        presetTransferLoading = true;
+        renderPanel();
+        try {
+            const manager = getPresetTransferManager();
+            const document = await loadPresetTransferDocument(manager, presetTransferSource);
+            const info = presetEntryArrayInfo(document);
+            const ids = new Set(selected.map((entry) => entry.id));
+            info.entries = info.entries.filter((raw, index) => !ids.has(String(raw?.identifier ?? raw?.id ?? raw?.uid ?? `entry-${index}`)));
+            document[info.key] = info.entries;
+            removePresetPromptOrder(document, ids);
+            await savePresetTransferDocument(manager, presetTransferSource, document);
+            notify(`已删除 ${selected.length} 个预设条目`, 'success');
+            await loadPresetTransfer({ force: true });
+        } catch (error) {
+            presetTransferError = error.message || String(error);
+            notify(`批量删除失败：${error.message}`, 'error');
+        } finally {
+            presetTransferLoading = false;
+            renderPanel();
+        }
+    }
+
+    function renderPresetTransferTab() {
+        if (!presetTransferLoadedOnce && !presetTransferLoading) host.setTimeout(() => loadPresetTransfer(), 0);
+        let names = [];
+        try { names = presetTransferNames(getPresetTransferManager()); } catch (_) {}
+        const sourceOptions = names.map((name) => `<option value="${escapeHTML(name)}"${name === presetTransferSource ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
+        const targetOptions = names.filter((name) => name !== presetTransferSource).map((name) => `<option value="${escapeHTML(name)}"${name === presetTransferTarget ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
+        const query = presetTransferSearch.trim().toLowerCase();
+        const source = presetTransferSourceEntries.filter((entry) => !query || `${entry.name}\n${entry.content}\n${entry.id}`.toLowerCase().includes(query));
+        const target = presetTransferTargetEntries.filter((entry) => !query || `${entry.name}\n${entry.content}\n${entry.id}`.toLowerCase().includes(query));
+        const visibleSource = source.slice(0, presetTransferVisibleLimit);
+        const visibleTarget = target.slice(0, presetTransferVisibleLimit);
+        const sourceList = source.length ? visibleSource.map((entry) => `<label class="ctb-preset-entry${presetTransferSelected.has(entry.id) ? ' is-selected' : ''}"><input type="checkbox" data-preset-entry-id="${escapeHTML(entry.id)}"${presetTransferSelected.has(entry.id) ? ' checked' : ''}><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.replace(/\s+/g, ' ').slice(0, 110) || (entry.marker ? '（内置标记）' : '（空内容）'))}</small></span></label>`).join('') + (source.length > visibleSource.length ? `<button type="button" class="ctb-list-more" data-action="more-preset-transfer-entries">再显示 ${Math.min(120, source.length - visibleSource.length)} 条（共 ${source.length} 条）</button>` : '') : '<div class="ctb-world-empty">来源预设没有符合条件的条目。</div>';
+        const targetList = target.length ? visibleTarget.map((entry) => `<div class="ctb-preset-entry is-target"><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.replace(/\s+/g, ' ').slice(0, 110) || (entry.marker ? '（内置标记）' : '（空内容）'))}</small></span></div>`).join('') + (target.length > visibleTarget.length ? `<button type="button" class="ctb-list-more" data-action="more-preset-transfer-entries">再显示 ${Math.min(120, target.length - visibleTarget.length)} 条（共 ${target.length} 条）</button>` : '') : '<div class="ctb-world-empty">目标预设没有符合条件的条目。</div>';
+        return `<section class="ctb-section"><div class="ctb-section-title">预设条目转移 ${infoButton('preset-transfer')}</div><div class="ctb-hint">仅处理 Chat Completion 预设里的提示词条目；不会带入快照、正则、导入导出或其他功能。</div></section>
+            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><input class="ctb-input" id="ctb-preset-transfer-search" placeholder="搜索条目" value="${escapeHTML(presetTransferSearch)}"><button type="button" class="ctb-button" data-action="filter-preset-transfer">筛选</button><button type="button" class="ctb-button" data-action="refresh-preset-transfer">刷新预设</button></div>${presetTransferError ? `<div class="ctb-readonly-note ctb-world-error">${escapeHTML(presetTransferError)}</div>` : ''}</section>
+            <section class="ctb-section ctb-preset-transfer-grid"><div><div class="ctb-section-title">来源预设 <span>${presetTransferSourceEntries.length} 条</span></div><select class="ctb-input" id="ctb-preset-transfer-source">${sourceOptions || '<option value="">没有预设</option>'}</select><div class="ctb-preset-entry-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : sourceList}</div></div><div><div class="ctb-section-title">目标预设 <span>${presetTransferTargetEntries.length} 条</span></div><select class="ctb-input" id="ctb-preset-transfer-target">${targetOptions || '<option value="">没有其他预设</option>'}</select><div class="ctb-preset-entry-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : targetList}</div></div></section>
+            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><span class="ctb-hint">已选 ${presetTransferSelected.size} 条</span><button type="button" class="ctb-button ctb-primary" data-action="copy-preset-entries"${presetTransferSelected.size && presetTransferTarget && !presetTransferLoading ? '' : ' disabled'}>复制到目标</button><button type="button" class="ctb-button" data-action="move-preset-entries"${presetTransferSelected.size && presetTransferTarget && !presetTransferLoading ? '' : ' disabled'}>移动到目标</button><button type="button" class="ctb-button ctb-danger" data-action="delete-preset-entries"${presetTransferSelected.size && !presetTransferLoading ? '' : ' disabled'}>批量删除</button></div></section>`;
+    }
+
     function renderPanel() {
         if (!root || root.hidden) return;
         const total = getRows().length;
-        const body = activeTab === 'export' ? renderExportTab() : activeTab === 'post-edit' ? renderPostEditTab() : activeTab === 'rewrite' ? renderRewriteTab() : renderSearchTab();
+        const modules = ensureActiveTab();
+        const renderers = {
+            search: renderSearchTab,
+            export: renderExportTab,
+            'post-edit': renderPostEditTab,
+            rewrite: renderRewriteTab,
+            theater: renderTheaterTab,
+            worldbook: renderWorldbookTab,
+            'preset-transfer': renderPresetTransferTab,
+        };
+        const body = activeTab && renderers[activeTab]
+            ? renderers[activeTab]()
+            : '<div class="ctb-results ctb-results-empty">所有功能都已在 Extensions 设置中关闭；菜单入口会继续保留。</div>';
+        const tabs = modules.map((module) => `<button type="button" class="ctb-tab${activeTab === module.tab ? ' is-active' : ''}" data-action="tab" data-tab="${module.tab}">${module.label}</button>`).join('');
         root.innerHTML = `<div class="ctb-card" role="dialog" aria-modal="true" aria-label="聊天工具箱">
             <header class="ctb-header"><div class="ctb-title"><i class="fa-solid fa-toolbox"></i> 聊天工具箱</div><div class="ctb-header-side"><span>${total} 条消息</span><button type="button" class="ctb-close" data-action="close" aria-label="关闭">×</button></div></header>
-            <nav class="ctb-tabs"><button type="button" class="ctb-tab${activeTab === 'search' ? ' is-active' : ''}" data-action="tab" data-tab="search">查找/替换</button><button type="button" class="ctb-tab${activeTab === 'export' ? ' is-active' : ''}" data-action="tab" data-tab="export">文本导出</button><button type="button" class="ctb-tab${activeTab === 'post-edit' ? ' is-active' : ''}" data-action="tab" data-tab="post-edit">词句修改</button><button type="button" class="ctb-tab${activeTab === 'rewrite' ? ' is-active' : ''}" data-action="tab" data-tab="rewrite">段落改写</button></nav>
+            ${tabs ? `<nav class="ctb-tabs" style="--ctb-tab-count:${Math.min(modules.length, 5)}">${tabs}</nav>` : ''}
             <main class="ctb-body">${body}${renderInfoPopup()}</main>
             ${renderTransientNotice()}
             ${renderConfirmDialog()}
@@ -2305,6 +3226,11 @@
         doc.getElementById(ROOT_ID)?.remove();
         doc.getElementById(FLOAT_ID)?.remove();
         doc.getElementById(ENTRY_ID)?.remove();
+        doc.getElementById(SETTINGS_ID)?.remove();
+        doc.getElementById('ctb-v020-style')?.remove();
+        doc.getElementById('ctb-v020-root')?.remove();
+        doc.getElementById('ctb-v020-float')?.remove();
+        doc.getElementById('ctb-v020-menu-entry')?.remove();
         // 旧版查找替换脚本可能没有成功执行 destroy，顺手清掉遗留节点，避免出现双悬浮按钮。
         doc.getElementById('chat-search-replace-style-v010')?.remove();
         doc.getElementById('chat-search-replace-panel-v010')?.remove();
@@ -2423,7 +3349,14 @@
             #${ROOT_ID} .ctb-notice-card.is-error{border-left:4px solid #c35a58;} #${ROOT_ID} .ctb-notice-card.is-warning{border-left:4px solid #b58b4d;} #${ROOT_ID} .ctb-notice-card.is-success{border-left:4px solid #7da287;}
             #${ROOT_ID} .ctb-notice-title{margin-bottom:7px;font-size:13px;font-weight:700;} #${ROOT_ID} .ctb-notice-message{margin-bottom:12px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;}
             #${ROOT_ID} .ctb-confirm-actions{justify-content:flex-end;}
+            #${ROOT_ID} .ctb-tabs{display:flex;overflow-x:auto;scrollbar-width:thin;} #${ROOT_ID} .ctb-tab{flex:0 0 calc(100% / var(--ctb-tab-count,4));min-width:92px;}
+            #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history summary{cursor:pointer;color:#5e6268;font-size:11px;} #${ROOT_ID} .ctb-theater-history pre{max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);}
+            #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:7px;margin-top:7px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-row{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border-bottom:1px solid #d5d7da;padding:5px 7px;} #${ROOT_ID} .ctb-manager-row:last-child{border-bottom:0;} #${ROOT_ID} .ctb-manager-row.is-active{background:#dfe8e2;} #${ROOT_ID} .ctb-manager-row>button{display:flex;min-width:0;flex-direction:column;align-items:flex-start;border:0;background:transparent;color:#50545a;text-align:left;cursor:pointer;} #${ROOT_ID} .ctb-manager-row strong,#${ROOT_ID} .ctb-manager-row small{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-manager-row small,#${ROOT_ID} .ctb-manager-row>span{color:#85898e;font-size:9px;} #${ROOT_ID} .ctb-manager-editor{display:grid;align-content:start;gap:6px;padding:8px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:sticky;bottom:-15px;justify-content:space-between;margin:10px -16px -15px;padding:8px 16px;border-top:1px solid #cdd0d4;background:#ececef;color:#697069;font-size:11px;}
+            #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:grid;grid-template-columns:16px minmax(0,1fr);align-items:start;gap:6px;padding:7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry.is-target{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
+            #${ROOT_ID} .ctb-list-more{display:block;width:100%;border:0;border-top:1px solid #d1d4d7;background:#e1e3e5;color:#697078;padding:7px;cursor:pointer;font:10px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-list-more:hover{background:#d8ddda;}
+            #${SETTINGS_ID}{margin:10px 0;border:1px solid var(--SmartThemeBorderColor,#777);border-radius:5px;background:rgba(255,255,255,.04);color:var(--SmartThemeBodyColor,inherit);} #${SETTINGS_ID}>summary{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer;font-weight:700;} #${SETTINGS_ID}>summary span{margin-left:auto;color:var(--SmartThemeEmColor,#999);font-size:11px;font-weight:400;} #${SETTINGS_ID} .ctb-extension-settings-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:4px 12px 12px;} #${SETTINGS_ID} .ctb-extension-settings-title,#${SETTINGS_ID} p{grid-column:1/-1;} #${SETTINGS_ID} .ctb-extension-settings-title{font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;} #${SETTINGS_ID} p{margin:4px 0 0;color:var(--SmartThemeEmColor,#999);font-size:11px;line-height:1.45;}
             @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-grid,#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
+            @media (max-width:560px){#${ROOT_ID} .ctb-manager-grid,#${ROOT_ID} .ctb-preset-transfer-grid{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:-12px;margin-right:-12px;padding-left:12px;padding-right:12px;}#${SETTINGS_ID} .ctb-extension-settings-body{grid-template-columns:1fr;}}
         `;
         doc.head.appendChild(style);
 
@@ -2489,6 +3422,17 @@
         else if (id === 'ctb-rewrite-context-tags') settings.rewrite.contextTags = target.value;
         else if (id === 'ctb-rewrite-global') settings.rewrite.globalInstruction = target.value;
         else if (id === 'ctb-rewrite-system') settings.rewrite.systemPrompt = target.value;
+        else if (id === 'ctb-theater-prompt') settings.theater.prompt = target.value;
+        else if (id === 'ctb-theater-preset-name') settings.theater.presetName = target.value;
+        else if (id === 'ctb-theater-context-floors') settings.theater.contextFloors = target.value;
+        else if (id === 'ctb-theater-context-tags') settings.theater.contextTags = target.value;
+        else if (id === 'ctb-worldbook-search') { worldbookSearch = target.value; return; }
+        else if (id === 'ctb-worldbook-comment' && worldbookDraft) { worldbookDraft.comment = target.value; worldbookDirty = true; return; }
+        else if (id === 'ctb-worldbook-keys' && worldbookDraft) { worldbookDraft.key = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); worldbookDirty = true; return; }
+        else if (id === 'ctb-worldbook-content' && worldbookDraft) { worldbookDraft.content = target.value; worldbookDirty = true; return; }
+        else if (id === 'ctb-worldbook-order' && worldbookDraft) { worldbookDraft.order = Number(target.value) || 0; worldbookDirty = true; return; }
+        else if (id === 'ctb-worldbook-depth' && worldbookDraft) { worldbookDraft.depth = Number(target.value) || 0; worldbookDirty = true; return; }
+        else if (id === 'ctb-preset-transfer-search') { presetTransferSearch = target.value; return; }
         else if (target.dataset.channelId) {
             const channel = channelEditor?.draft?.id === target.dataset.channelId ? channelEditor.draft : null;
             if (!channel) return;
@@ -2503,7 +3447,7 @@
             if (paragraph) paragraph.instruction = target.value;
             return;
         }
-        if (id?.startsWith('ctb-post-edit-') || id?.startsWith('ctb-rewrite-')) saveSettings();
+        if (id?.startsWith('ctb-post-edit-') || id?.startsWith('ctb-rewrite-') || id?.startsWith('ctb-theater-')) saveSettings();
     }
 
     async function handleChange(event) {
@@ -2523,8 +3467,61 @@
             setRewriteWorldEntrySelected(target.dataset.worldName, target.dataset.worldEntryUid, target.checked);
             return;
         }
+        else if (target.dataset.theaterWorldEntryUid !== undefined) {
+            setTheaterWorldEntrySelected(target.dataset.theaterWorldName, target.dataset.theaterWorldEntryUid, target.checked);
+            return;
+        }
+        else if (target.dataset.worldbookSelectUid !== undefined) {
+            const uid = String(target.dataset.worldbookSelectUid);
+            if (target.checked) worldbookSelected.add(uid);
+            else worldbookSelected.delete(uid);
+            renderPanel();
+            return;
+        }
+        else if (target.dataset.presetEntryId !== undefined) {
+            const idValue = String(target.dataset.presetEntryId);
+            if (target.checked) presetTransferSelected.add(idValue);
+            else presetTransferSelected.delete(idValue);
+            renderPanel();
+            return;
+        }
         else if (id === 'ctb-rewrite-world-book') {
             await chooseRewriteWorldBook(target.value);
+            return;
+        }
+        else if (id === 'ctb-theater-world-book') {
+            await chooseTheaterWorldBook(target.value);
+            return;
+        }
+        else if (id === 'ctb-worldbook-book') {
+            await chooseWorldbook(target.value);
+            return;
+        }
+        else if (id === 'ctb-worldbook-transfer-target') {
+            worldbookTransferTarget = target.value;
+            return;
+        }
+        else if (id === 'ctb-worldbook-position' && worldbookDraft) {
+            worldbookDraft.position = Number(target.value) || 0;
+            worldbookDirty = true;
+            return;
+        }
+        else if (id === 'ctb-worldbook-constant' && worldbookDraft) {
+            worldbookDraft.constant = target.checked;
+            worldbookDirty = true;
+            return;
+        }
+        else if (id === 'ctb-worldbook-disabled' && worldbookDraft) {
+            worldbookDraft.disable = target.checked;
+            worldbookDirty = true;
+            return;
+        }
+        else if (id === 'ctb-preset-transfer-source') {
+            await choosePresetTransferSide('source', target.value);
+            return;
+        }
+        else if (id === 'ctb-preset-transfer-target') {
+            await choosePresetTransferSide('target', target.value);
             return;
         }
         else if (id === 'ctb-postEdit-channel') {
@@ -2534,6 +3531,11 @@
             renderPanel();
         } else if (id === 'ctb-rewrite-channel') {
             settings.rewrite.channelId = target.value;
+            channelEditor = null;
+            saveSettings();
+            renderPanel();
+        } else if (id === 'ctb-theater-channel') {
+            settings.theater.channelId = target.value;
             channelEditor = null;
             saveSettings();
             renderPanel();
@@ -2554,6 +3556,27 @@
         } else if (id === 'ctb-rewrite-persona') {
             settings.rewrite.includePersona = target.checked;
             saveSettings();
+        } else if (id === 'ctb-theater-character') {
+            settings.theater.includeCharacter = target.checked;
+            saveSettings();
+        } else if (id === 'ctb-theater-persona') {
+            settings.theater.includePersona = target.checked;
+            saveSettings();
+        } else if (id === 'ctb-theater-preset') {
+            settings.theater.selectedPresetId = target.value;
+            const preset = settings.theater.presets.find((item) => item.id === target.value);
+            if (preset) {
+                settings.theater.presetName = preset.name || '';
+                settings.theater.prompt = preset.prompt || '';
+                settings.theater.contextFloors = preset.contextFloors ?? 6;
+                settings.theater.contextTags = preset.contextTags || '';
+                settings.theater.includeCharacter = preset.includeCharacter !== false;
+                settings.theater.includePersona = preset.includePersona !== false;
+                settings.theater.worldEntries = Array.isArray(preset.worldEntries) ? preset.worldEntries.map((item) => ({ world: String(item.world), uid: String(item.uid) })) : [];
+                settings.theater.channelId = preset.channelId || 'main';
+            } else settings.theater.presetName = '';
+            saveSettings();
+            renderPanel();
         } else if (target.dataset.channelId && id.endsWith('-channel-model')) {
             const channel = channelEditor?.draft?.id === target.dataset.channelId ? channelEditor.draft : null;
             if (channel) channel.model = target.value;
@@ -2604,10 +3627,11 @@
             case 'cancel-channel': return cancelChannelEditor();
             case 'delete-channel': {
                 const index = settings.ai.channels.findIndex((channel) => channel.id === data.channelId);
-                if (index < 0 || !host.confirm('确定删除这个生成渠道吗？词句修改和逐段改写中引用它的设置都会改为跟随酒馆主接口。')) return;
+                if (index < 0 || !host.confirm('确定删除这个生成渠道吗？引用它的 AI 功能都会改为跟随酒馆主接口。')) return;
                 settings.ai.channels.splice(index, 1);
                 if (settings.postEdit.channelId === data.channelId) settings.postEdit.channelId = 'main';
                 if (settings.rewrite.channelId === data.channelId) settings.rewrite.channelId = 'main';
+                if (settings.theater.channelId === data.channelId) settings.theater.channelId = 'main';
                 channelEditor = null;
                 saveSettings();
                 return renderPanel();
@@ -2658,6 +3682,43 @@
             }
             case 'rewrite-all': rewriteReview.forEach((review) => { review.decision = data.decision; }); return renderPanel();
             case 'apply-rewrite': return applyRewrite();
+            case 'toggle-theater-world-picker':
+                theaterWorldPickerOpen = !theaterWorldPickerOpen;
+                if (theaterWorldPickerOpen) return loadTheaterWorldBooks();
+                return renderPanel();
+            case 'refresh-theater-world-books': return loadTheaterWorldBooks({ force: true });
+            case 'close-theater-world-picker': theaterWorldPickerOpen = false; return renderPanel();
+            case 'clear-theater-world-selection': settings.theater.worldEntries = []; saveSettings(); return renderPanel();
+            case 'select-theater-world-all': return setTheaterWorldBookSelection(true);
+            case 'clear-theater-world-book': return setTheaterWorldBookSelection(false);
+            case 'save-theater-preset': return saveTheaterPreset();
+            case 'delete-theater-preset': return deleteTheaterPreset();
+            case 'run-theater': return runTheater();
+            case 'preview-theater-prompt': return previewTheaterPrompt();
+            case 'close-theater-preview': theaterPromptPreview = ''; return renderPanel();
+            case 'use-theater-history': return loadTheaterHistory(data.historyIndex);
+            case 'refresh-worldbook': return loadWorldbookManager({ force: true, book: worldbookBook });
+            case 'create-worldbook': return createWorldbookBook();
+            case 'rename-worldbook': return renameWorldbookBook();
+            case 'delete-worldbook': return deleteWorldbookBook();
+            case 'new-worldbook-entry': return createWorldbookEntry();
+            case 'filter-worldbook': worldbookVisibleLimit = 120; return renderPanel();
+            case 'more-worldbook-entries': worldbookVisibleLimit += 120; return renderPanel();
+            case 'edit-worldbook-entry': return editWorldbookEntry(data.worldbookUid);
+            case 'apply-worldbook-entry': return applyWorldbookDraft();
+            case 'sort-worldbook-priority':
+                worldbookEntries.sort((left, right) => Number(right.raw?.order || 0) - Number(left.raw?.order || 0) || worldbookRecordLabel(left).localeCompare(worldbookRecordLabel(right)));
+                return renderPanel();
+            case 'save-worldbook': return saveCurrentWorldbook();
+            case 'copy-worldbook-entries': return transferWorldbookEntries('copy');
+            case 'move-worldbook-entries': return transferWorldbookEntries('move');
+            case 'delete-worldbook-entries': return deleteSelectedWorldbookEntries();
+            case 'refresh-preset-transfer': return loadPresetTransfer({ force: true });
+            case 'filter-preset-transfer': presetTransferVisibleLimit = 120; return renderPanel();
+            case 'more-preset-transfer-entries': presetTransferVisibleLimit += 120; return renderPanel();
+            case 'copy-preset-entries': return transferPresetEntries('copy');
+            case 'move-preset-entries': return transferPresetEntries('move');
+            case 'delete-preset-entries': return deletePresetEntries();
             default: return undefined;
         }
     }
@@ -2679,6 +3740,49 @@
             if (menu) return menu;
         }
         return null;
+    }
+
+    function findExtensionsSettingsRoot() {
+        const selectors = [
+            '#extensions_settings2 .inline-drawer-content',
+            '#extensions_settings2',
+            '#extensions_settings .inline-drawer-content',
+            '#extensions_settings',
+            '.extensions_settings',
+        ];
+        for (const selector of selectors) {
+            const node = doc.querySelector(selector);
+            if (node && !node.closest(`#${ROOT_ID}`)) return node;
+        }
+        return null;
+    }
+
+    function injectExtensionSettings() {
+        if (destroyed || !doc.body) return false;
+        const target = findExtensionsSettingsRoot();
+        if (!target) return false;
+        let panel = doc.getElementById(SETTINGS_ID);
+        if (panel && panel.parentElement === target) return true;
+        if (!panel) {
+            panel = doc.createElement('details');
+            panel.id = SETTINGS_ID;
+            panel.className = 'ctb-extension-settings';
+            panel.open = false;
+            panel.addEventListener('change', (event) => {
+                const input = event.target.closest('[data-ctb-module]');
+                if (!input) return;
+                const key = input.dataset.ctbModule;
+                if (!MODULES.some((module) => module.key === key)) return;
+                settings.modules[key] = Boolean(input.checked);
+                saveSettings();
+                ensureActiveTab();
+                renderPanel();
+                injectExtensionSettings();
+            });
+        }
+        panel.innerHTML = `<summary><i class="fa-solid fa-toolbox"></i> 聊天工具箱 <span>v${VERSION}</span></summary><div class="ctb-extension-settings-body"><div class="ctb-extension-settings-title">功能开关</div>${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"${settings.modules?.[module.key] !== false ? ' checked' : ''}> <span>${module.label}</span></label>`).join('')}<p>关闭后只隐藏对应功能页；三条杠菜单中的“聊天工具箱”入口始终保留。</p></div>`;
+        if (panel.parentElement !== target) target.appendChild(panel);
+        return true;
     }
 
     function injectMenuEntry() {
@@ -2715,6 +3819,7 @@
         doc.getElementById(ROOT_ID)?.remove();
         doc.getElementById(FLOAT_ID)?.remove();
         doc.getElementById(ENTRY_ID)?.remove();
+        doc.getElementById(SETTINGS_ID)?.remove();
         if (host[INSTANCE_KEY] === destroy) delete host[INSTANCE_KEY];
     }
 
@@ -2723,12 +3828,22 @@
         const context = getContext();
         if ((!context || !context.extensionSettings) && initAttempts++ < 30) return host.setTimeout(init, 100);
         settings = loadSettings();
+        theaterHistory = Array.isArray(settings.theater?.history) ? settings.theater.history : [];
+        presetTransferApi = settings.presetTransfer?.apiId || 'openai';
+        presetTransferSource = settings.presetTransfer?.source || '';
+        presetTransferTarget = settings.presetTransfer?.target || '';
         saveSettings();
         createUI();
         injectMenuEntry();
+        injectExtensionSettings();
         host.setTimeout(injectMenuEntry, 800);
+        host.setTimeout(injectExtensionSettings, 900);
         host.setTimeout(injectMenuEntry, 2200);
-        menuObserver = new MutationObserver(() => injectMenuEntry());
+        host.setTimeout(injectExtensionSettings, 2300);
+        menuObserver = new MutationObserver(() => {
+            injectMenuEntry();
+            injectExtensionSettings();
+        });
         menuObserver.observe(doc.body, { childList: true, subtree: true });
         registerSlashCommand();
         host.addEventListener('pagehide', destroy, { once: true });
