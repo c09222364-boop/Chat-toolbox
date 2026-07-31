@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.8.0
+// @version      0.9.0
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -10,15 +10,17 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.8.0';
-    const PREFIX = 'ctb-v080';
+    const VERSION = '0.9.0';
+    const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
     const FLOAT_ID = `${PREFIX}-float`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
     const SETTINGS_ID = `${PREFIX}-extension-settings`;
-    const INSTANCE_KEY = '__ChatToolbox_v080__';
-    const LEGACY_INSTANCE_KEY = '__ChatToolbox_v020__';
+    const INSTANCE_KEY = '__ChatToolbox_v090__';
+    const COMMAND_HANDLER_KEY = '__ChatToolboxCommandHandler_v090__';
+    const COMMAND_REGISTERED_KEY = '__ChatToolboxCommandRegistered_v090__';
+    const LEGACY_INSTANCE_KEYS = ['__ChatToolbox_v080__', '__ChatToolbox_v020__'];
     const STORAGE_KEY = 'chat-toolbox-v020-settings';
     const MAX_RESULTS = 2000;
 
@@ -31,15 +33,27 @@
         }
     } catch (_) {}
 
-    // 让从旧版查找替换脚本直接升级的用户不会同时留下旧的悬浮图标。
+    // 让从旧版脚本直接升级的用户不会同时留下旧的节点。
     try { host.__ChatSearchReplace_v010__?.(); } catch (_) {}
-    try { host[LEGACY_INSTANCE_KEY]?.(); } catch (_) {}
+    for (const legacyKey of LEGACY_INSTANCE_KEYS) {
+        try { host[legacyKey]?.(); } catch (_) {}
+    }
     try { host[INSTANCE_KEY]?.(); } catch (_) {}
 
     let root = null;
     let menuObserver = null;
+    let injectionTimer = null;
+    let onPageHide = null;
+    let onUnload = null;
+    let commandHandler = null;
     let destroyed = false;
     let activeTab = 'search';
+    const panelScrollState = new Map();
+    let panelTabsScrollLeft = 0;
+    let theaterHistoryView = 'recent';
+    let theaterReader = null;
+    let theaterRenderSequence = 0;
+    const theaterRenderCache = new Map();
     let results = [];
     let currentResultIndex = -1;
     let infoMessage = null;
@@ -74,6 +88,7 @@
     const rewriteWorldEntryCache = new Map();
     let theaterLoading = false;
     let theaterResult = '';
+    let theaterCurrentId = '';
     let theaterHistory = [];
     let theaterWorldPickerOpen = false;
     let theaterWorldLoading = false;
@@ -93,8 +108,17 @@
     let worldbookSelected = new Set();
     let worldbookEditingUid = '';
     let worldbookDraft = null;
+    let worldbookDraftDirty = false;
     let worldbookDirty = false;
     let worldbookTransferTarget = '';
+    let worldbookTransferTargetEntries = [];
+    let worldbookTransferTargetLoading = false;
+    let worldbookTransferRequestId = 0;
+    let worldbookTransferAnchor = { kind: 'bottom', anchorUid: '' };
+    let worldbookSortMode = 'priority';
+    let worldbookSortModalOpen = false;
+    let worldbookSortModalOrder = [];
+    let worldbookDragUid = '';
     let presetTransferLoading = false;
     let presetTransferLoadedOnce = false;
     let presetTransferApi = 'openai';
@@ -108,6 +132,9 @@
     let presetTransferSearch = '';
     let presetTransferVisibleLimit = 120;
     let presetTransferError = '';
+    let presetTransferAnchor = { kind: 'bottom', anchorId: '' };
+    let presetTransferDraft = null;
+    let presetCompareOpen = false;
     let initAttempts = 0;
     let transientNotice = null;
     let pendingConfirm = null;
@@ -146,9 +173,11 @@
         'rewrite-context': '发送顺序固定为：角色卡 → 用户设定 → 你手动勾选的世界书具体条目 → 所选楼层之前最近 N 楼。这里只发送明确勾选的条目，不会自动混入整本世界书或其他已触发条目。',
         'rewrite-floor-tag': '楼层决定要改写哪一条 AI 回复；正文标签只截取该楼层对应标签内的文字，标签本身与其余内容不会交给模型改写。',
         'channel-main': '“跟随酒馆主接口”不需要重复填写地址和密钥；自定义渠道通过酒馆的 OpenAI 兼容代理请求。',
+        'system-cache': '这里的提示词只保存在聊天工具箱的插件设置缓存中，不会写入聊天记录；留空时使用内置默认提示词。',
         'theater-scope': '小剧场只在插件里独立生成和保存最近结果，不会插入聊天楼层，也不会改动原聊天。',
         'worldbook-save': '世界书编辑采用先在界面修改、再一次保存的方式。移动条目时会先保存目标世界书，确认成功后才从来源删除。',
-        'preset-transfer': '这里只处理预设中的提示词条目：复制会保留来源，移动会在目标保存成功后删除来源；不会修改其他预设参数。',
+        'worldbook-sort': '优先级显示按位置分组：角色定义、作者注释、深度、示例消息、出口；同组按 order 升序，再按 UID。分组排序只在优先级视图中修改 order，不会改位置、深度或条目内容；手动视图请用拖拽调整 displayIndex。',
+        'preset-transfer': '预设转移分为单预设编辑和双预设对比。单预设可以编辑、复制、移动、删除；双预设可以选择来源、目标和插入锚点。复制/移动只处理提示词条目及主 prompt_order，不会修改其他预设参数。',
     });
 
     function defaults() {
@@ -200,14 +229,17 @@
                 selectedPresetId: '',
                 presets: [],
                 history: [],
+                favorites: [],
             },
             worldbook: {
                 currentBook: '',
+                sortMode: 'priority',
             },
             presetTransfer: {
                 apiId: 'openai',
                 source: '',
                 target: '',
+                mode: 'single',
             },
         };
     }
@@ -271,7 +303,8 @@
                     ...base.theater,
                     ...(stored.theater && typeof stored.theater === 'object' ? stored.theater : {}),
                     presets: Array.isArray(stored.theater?.presets) ? stored.theater.presets : [],
-                    history: Array.isArray(stored.theater?.history) ? stored.theater.history.slice(0, 20) : [],
+                    history: [],
+                    favorites: Array.isArray(stored.theater?.favorites) ? stored.theater.favorites.slice(0, 50) : [],
                     worldEntries: Array.isArray(stored.theater?.worldEntries)
                         ? stored.theater.worldEntries
                             .filter((item) => item && item.world !== undefined && item.uid !== undefined)
@@ -281,10 +314,14 @@
                 worldbook: {
                     ...base.worldbook,
                     ...(stored.worldbook && typeof stored.worldbook === 'object' ? stored.worldbook : {}),
+                    sortMode: ['priority', 'manual'].includes(stored.worldbook?.sortMode)
+                        ? stored.worldbook.sortMode
+                        : base.worldbook.sortMode,
                 },
                 presetTransfer: {
                     ...base.presetTransfer,
                     ...(stored.presetTransfer && typeof stored.presetTransfer === 'object' ? stored.presetTransfer : {}),
+                    mode: stored.presetTransfer?.mode === 'dual' ? 'dual' : 'single',
                 },
             };
             if (stored.rewrite?.contextFloors === undefined && stored.rewrite?.contextRounds !== undefined) {
@@ -641,7 +678,7 @@
         return false;
     }
 
-    async function verifySavedEntries(entries) {
+    async function verifySavedEntries(entries, { timeoutMs = 6000 } = {}) {
         try {
             const context = getContext();
             let endpoint;
@@ -658,7 +695,7 @@
                 body = { ch_name: character?.name || '', file_name: fileName, avatar_url: avatar };
             }
             const controller = typeof host.AbortController === 'function' ? new host.AbortController() : null;
-            const timeout = controller ? host.setTimeout(() => controller.abort(), 6000) : null;
+            const timeout = controller ? host.setTimeout(() => controller.abort(), Math.max(500, Number(timeoutMs) || 6000)) : null;
             let response;
             try {
                 response = await (host.fetch || fetch)(endpoint, {
@@ -939,9 +976,9 @@
             updateSearchSaveStatus();
             const saved = await saveChat();
             if (!saved) throw new Error('酒馆没有返回可用的保存结果');
-            searchSaveState.phase = '正在从聊天文件回读并核验（最多 6 秒）…';
+            searchSaveState.phase = '正在快速核验保存结果（最多 1.5 秒）…';
             updateSearchSaveStatus();
-            const verified = await verifySavedEntries(entries);
+            const verified = await verifySavedEntries(entries, { timeoutMs: 1500 });
             if (verified === false) throw new Error('聊天文件回读结果与暂存稿不一致，可能是酒馆保存超时');
             const count = entries.length;
             dirtyChanges.clear();
@@ -2241,7 +2278,7 @@
                 </div>
                 <div class="ctb-channel-editor-actions"><button type="button" class="ctb-button ctb-primary" data-action="save-channel">保存渠道</button><button type="button" class="ctb-button" data-action="cancel-channel">取消</button>${editor.isNew ? '' : `<button type="button" class="ctb-button ctb-danger" data-action="delete-channel" data-channel-id="${escapeHTML(editing.id)}">删除渠道</button>`}</div>
             </div>` : '';
-        const summary = current ? `<div class="ctb-channel-summary"><div><strong>${escapeHTML(current.name || '未命名渠道')}</strong><small>${escapeHTML([current.model || '未选择模型', (() => { try { return new URL(normalizeProxyUrl(current.url)).host; } catch (_) { return current.url || '未填写地址'; } })()].join(' · '))}</small></div><button type="button" class="ctb-button" data-action="edit-channel" data-feature="${feature}" data-channel-id="${escapeHTML(current.id)}"><i class="fa-solid fa-pen"></i> 编辑</button></div>` : '<div class="ctb-hint">使用酒馆当前生成渠道与主接口设置。</div>';
+        const summary = current ? `<div class="ctb-channel-summary"><div><strong>${escapeHTML(current.name || '未命名渠道')}</strong><small>${escapeHTML([current.model || '未选择模型', (() => { try { return new URL(normalizeProxyUrl(current.url)).host; } catch (_) { return current.url || '未填写地址'; } })()].join(' · '))}</small></div><button type="button" class="ctb-button" data-action="edit-channel" data-feature="${feature}" data-channel-id="${escapeHTML(current.id)}"><i class="fa-solid fa-pen"></i> 编辑</button></div>` : '';
         return `
             <div class="ctb-inline ctb-channel-picker">
                 <select class="ctb-input" id="ctb-${feature}-channel">${options}</select>
@@ -2280,11 +2317,11 @@
                 <div class="ctb-inline"><input class="ctb-input" id="ctb-post-edit-floor" type="number" min="0" placeholder="楼层号（留空=最新 AI）" value="${escapeHTML(config.floor || '')}"><input class="ctb-input" id="ctb-post-edit-tag" placeholder="content" value="${escapeHTML(config.tag || 'content')}"><button type="button" class="ctb-button" data-action="prepare-post-edit">读取楼层</button></div>
             </section>
             <section class="ctb-section">
-                <div class="ctb-section-title">生成渠道</div>
+                <div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>
                 ${renderChannelSettings('postEdit')}
             </section>
             <section class="ctb-section">
-                <div class="ctb-section-title">内置 system 提示词 <span>可修改并保存在插件缓存</span></div>
+                <div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div>
                 <textarea class="ctb-input ctb-textarea ctb-system-prompt" id="ctb-post-edit-system" placeholder="控制模型输出格式和修改边界">${escapeHTML(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultPostEditSystemPrompt())}</textarea>
             </section>
             <section class="ctb-section">
@@ -2314,7 +2351,7 @@
         const entries = rewriteWorldEntryCache.get(rewriteWorldBook) || [];
         const summary = selections.length
             ? `<div class="ctb-world-selected-summary">${selections.map((item) => `<span title="${escapeHTML(worldEntryDisplayLabel(item))}">${escapeHTML(worldEntryDisplayLabel(item))}</span>`).join('')}</div>`
-            : '<div class="ctb-hint">尚未选择条目；不会向模型发送任何世界书内容。</div>';
+            : '';
         const bookOptions = rewriteWorldBooks.map((name) => `<option value="${escapeHTML(name)}"${name === rewriteWorldBook ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
         const entryList = rewriteWorldLoading
             ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>'
@@ -2375,18 +2412,17 @@
         return `
             <section class="ctb-section">
                 <div class="ctb-section-title">精确到段落的 AI 改写 ${infoButton('rewrite-scope')}</div>
-                <div class="ctb-hint">先生成段落补丁，再逐段决定是否采用；审核阶段不会改动聊天。</div>
             </section>
             <section class="ctb-section">
                 <div class="ctb-section-title">楼层与正文范围 ${infoButton('rewrite-floor-tag')}</div>
                 <div class="ctb-inline"><input class="ctb-input" id="ctb-rewrite-floor" type="number" min="0" placeholder="楼层号（留空=最新 AI）" value="${escapeHTML(config.floor || '')}"><input class="ctb-input" id="ctb-rewrite-tag" placeholder="content" value="${escapeHTML(config.tag || 'content')}"><button type="button" class="ctb-button" data-action="prepare-rewrite">读取楼层</button></div>
             </section>
             <section class="ctb-section">
-                <div class="ctb-section-title">生成渠道</div>
+                <div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>
                 ${renderChannelSettings('rewrite')}
             </section>
             <section class="ctb-section">
-                <div class="ctb-section-title">内置 system 提示词 <span>可修改并保存在插件缓存</span></div>
+                <div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div>
                 <textarea class="ctb-input ctb-textarea ctb-system-prompt" id="ctb-rewrite-system" placeholder="控制段落改写的输出格式和边界">${escapeHTML(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultRewriteSystemPrompt())}</textarea>
             </section>
             <section class="ctb-section">
@@ -2593,17 +2629,172 @@
             const messages = await buildTheaterMessages();
             const output = await callAiText('theater', messages);
             theaterResult = String(output || '').trim();
-            const item = { id: `theater-result-${Date.now().toString(36)}`, prompt: settings.theater.prompt, output: theaterResult, time: new Date().toLocaleString() };
+            theaterCurrentId = `theater-result-${Date.now().toString(36)}`;
+            const item = { id: theaterCurrentId, prompt: settings.theater.prompt, output: theaterResult, time: new Date().toLocaleString() };
             theaterHistory = [item, ...(theaterHistory || [])].slice(0, 20);
-            settings.theater.history = theaterHistory;
-            saveSettings();
-            notify('小剧场生成完成；内容只保存在插件缓存中', 'success');
+            // 最近记录只存在当前页面会话；只有点击星标才写入插件设置。
+            notify('小剧场生成完成；未收藏的记录会在刷新后清除', 'success');
         } catch (error) {
             notify(`小剧场生成失败：${error.message}`, 'error');
         } finally {
             theaterLoading = false;
             renderPanel();
         }
+    }
+
+    function theaterFavorites() {
+        if (!Array.isArray(settings.theater.favorites)) settings.theater.favorites = [];
+        return settings.theater.favorites;
+    }
+
+    function isTheaterFavorite(id) {
+        return theaterFavorites().some((item) => String(item.id) === String(id));
+    }
+
+    function formatTheaterOutput(value) {
+        const text = String(value || '');
+        const formatter = getContext().messageFormatting || host.messageFormatting;
+        let html = '';
+        if (typeof formatter === 'function') {
+            try {
+                html = String(formatter(text, '小剧场', false, false, -1, {}, false) || '');
+            } catch (_) {}
+        }
+        if (!html) html = escapeHTML(text).replace(/\n/g, '<br>');
+        const template = doc.createElement('template');
+        template.innerHTML = html;
+        template.content.querySelectorAll('script,style,link,iframe,object,embed,base,meta,form,input,button,select,textarea,dialog,audio,video,svg,math').forEach((node) => node.remove());
+        template.content.querySelectorAll('*').forEach((node) => {
+            [...node.attributes].forEach((attribute) => {
+                const name = attribute.name.toLowerCase();
+                const attributeValue = String(attribute.value || '').trim();
+                if (['autofocus', 'autoplay', 'contenteditable', 'tabindex'].includes(name)
+                    || name.startsWith('on')
+                    || ((name === 'href' || name === 'src' || name === 'xlink:href')
+                        && /^(?:javascript|data:text\/html|blob):/i.test(attributeValue))) {
+                    node.removeAttribute(attribute.name);
+                } else if (((name === 'src' || name === 'poster') && /^https?:/i.test(attributeValue)) || name === 'srcset') {
+                    node.removeAttribute(attribute.name);
+                } else if (name === 'style') {
+                    const safeStyle = attributeValue
+                        .replace(/url\(\s*[^)]*\)/gi, 'none')
+                        .replace(/expression\s*\([^)]*\)/gi, '')
+                        .replace(/position\s*:\s*(?:fixed|sticky)\s*;?/gi, '');
+                    node.setAttribute('style', safeStyle);
+                }
+            });
+        });
+        return template.innerHTML;
+    }
+
+    function cleanTheaterRichHtml(value) {
+        let source = String(value || '').trim();
+        const fenced = source.match(/^```(?:html)?\s*([\s\S]*?)\s*```$/i);
+        if (fenced) source = fenced[1];
+        const rich = /<[a-z][a-z0-9:-]*(?:\s[^>]*)?>/i.test(source);
+        if (!rich) return { rich: false, html: formatTheaterOutput(source) };
+        try {
+            const Parser = host.DOMParser || globalThis.DOMParser;
+            if (typeof Parser !== 'function') throw new Error('当前浏览器不支持 HTML 解析');
+            const parsed = new Parser().parseFromString(source, 'text/html');
+            parsed.querySelectorAll('script,link,iframe,object,embed,base,meta,form,input,button,select,textarea,dialog,audio,video,svg,math').forEach((node) => node.remove());
+            parsed.querySelectorAll('*').forEach((node) => {
+                [...node.attributes].forEach((attribute) => {
+                    const name = attribute.name.toLowerCase();
+                    const attributeValue = String(attribute.value || '').trim();
+                    if (['autofocus', 'autoplay', 'contenteditable', 'tabindex'].includes(name)
+                        || name.startsWith('on')
+                        || ((name === 'href' || name === 'src' || name === 'xlink:href')
+                            && /^(?:javascript|data:text\/html|blob):/i.test(attributeValue))) {
+                        node.removeAttribute(attribute.name);
+                    } else if (((name === 'src' || name === 'poster') && /^https?:/i.test(attributeValue)) || name === 'srcset') {
+                        node.removeAttribute(attribute.name);
+                    } else if (name === 'style') {
+                        const safeStyle = attributeValue
+                            .replace(/url\(\s*[^)]*\)/gi, 'none')
+                            .replace(/expression\s*\([^)]*\)/gi, '')
+                            .replace(/position\s*:\s*(?:fixed|sticky)\s*;?/gi, '');
+                        node.setAttribute('style', safeStyle);
+                    }
+                });
+            });
+            parsed.querySelectorAll('style').forEach((node) => {
+                node.textContent = String(node.textContent || '')
+                    .replace(/@import[\s\S]*?;/gi, '')
+                    .replace(/url\(\s*[^)]*\)/gi, 'none')
+                    .replace(/([^{}]+)\{/g, (match, selector) => `${selector.replace(/\b(?:html|body)\b|:root/gi, ':host')}{`);
+            });
+            const styles = [...parsed.head.querySelectorAll('style')].map((node) => node.outerHTML).join('');
+            return { rich: true, html: `${styles}${parsed.body.innerHTML}` };
+        } catch (_) {
+            return { rich: false, html: formatTheaterOutput(source) };
+        }
+    }
+
+    function theaterOutputSlot(value, extraClass = '') {
+        const key = `theater-render-${++theaterRenderSequence}`;
+        theaterRenderCache.set(key, String(value || ''));
+        return `<div class="ctb-theater-render${extraClass ? ` ${extraClass}` : ''}" data-ctb-theater-render="${key}"></div>`;
+    }
+
+    function theaterPlainPreview(value, limit = 420) {
+        // Recent history is a navigation list, not the full reader.  Keeping
+        // it as escaped plain text avoids parsing and attaching a ShadowRoot
+        // for every long historical result on every panel repaint.
+        let text = String(value || '')
+            .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (text.length > limit) text = `${text.slice(0, limit)}…`;
+        return escapeHTML(text || '（空结果；点击“放大阅读”查看原始内容）');
+    }
+
+    function hydrateTheaterOutputs() {
+        if (!root) return;
+        root.querySelectorAll('[data-ctb-theater-render]').forEach((container) => {
+            const value = theaterRenderCache.get(container.dataset.ctbTheaterRender) || '';
+            try {
+                const rendered = cleanTheaterRichHtml(value);
+                if (!rendered.rich) {
+                    container.innerHTML = rendered.html;
+                    return;
+                }
+                if (typeof container.attachShadow !== 'function') {
+                    container.textContent = value;
+                    return;
+                }
+                const shadow = container.shadowRoot || container.attachShadow({ mode: 'open' });
+                shadow.innerHTML = `<style>
+                    :host{display:block;contain:layout paint;color:inherit;font:inherit;line-height:1.55;overflow:auto}
+                    *,*::before,*::after{box-sizing:border-box}
+                    img,video,canvas{max-width:100%;height:auto}
+                    table{max-width:100%;border-collapse:collapse}
+                    pre{overflow:auto;white-space:pre-wrap;word-break:break-word}
+                    a{color:#5b8366}
+                </style><div class="ctb-theater-document">${rendered.html}</div>`;
+            } catch (error) {
+                console.warn('[聊天工具箱] 小剧场渲染失败，已回退纯文本', error);
+                container.textContent = value;
+            }
+        });
+    }
+
+    function theaterRecordById(id, source = 'recent') {
+        const list = source === 'favorite' ? theaterFavorites() : theaterHistory;
+        return list.find((item) => String(item.id) === String(id)) || null;
+    }
+
+    function renderTheaterReader() {
+        if (!theaterReader) return '';
+        return `<div class="ctb-reader-overlay" role="dialog" aria-modal="true">
+            <div class="ctb-reader-card">
+                <div class="ctb-reader-header"><span>${escapeHTML(theaterReader.title || '小剧场阅读')}</span><button type="button" class="ctb-close" data-action="close-theater-reader" aria-label="关闭">×</button></div>
+                <article class="ctb-reader-content" data-ctb-scroll-key="theater-reader">${theaterOutputSlot(theaterReader.output || '', 'is-reader')}</article>
+            </div>
+        </div>`;
     }
 
     function renderTheaterWorldPicker() {
@@ -2624,14 +2815,33 @@
     function renderTheaterTab() {
         const config = settings.theater;
         const presetOptions = ['<option value="">选择小剧场预设…</option>'].concat((config.presets || []).map((preset) => `<option value="${escapeHTML(preset.id)}"${config.selectedPresetId === preset.id ? ' selected' : ''}>${escapeHTML(preset.name)}</option>`)).join('');
-        const history = (theaterHistory || []).map((item, index) => `<details class="ctb-theater-history"><summary>${escapeHTML(item.time || '')} · ${escapeHTML(item.prompt || '').slice(0, 70)}</summary><pre>${escapeHTML(item.output || '')}</pre><button type="button" class="ctb-button" data-action="use-theater-history" data-history-index="${index}">载入结果</button></details>`).join('');
-        return `<section class="ctb-section"><div class="ctb-section-title">独立小剧场 ${infoButton('theater-scope')}</div><div class="ctb-hint">只在这里查看 IF 线、角色想法和幕后片段，不会写入聊天楼层。</div></section>
-            <section class="ctb-section"><div class="ctb-section-title">生成渠道</div>${renderChannelSettings('theater')}</section>
+        const recent = theaterHistory || [];
+        const favorites = theaterFavorites();
+        const visibleHistory = theaterHistoryView === 'favorites' ? favorites : recent;
+        const history = visibleHistory.map((item) => {
+            const favorite = isTheaterFavorite(item.id);
+            const source = theaterHistoryView === 'favorites' ? 'favorite' : 'recent';
+            return `<article class="ctb-theater-history">
+                <div class="ctb-theater-history-head"><span>${escapeHTML(item.time || '')} · ${escapeHTML(item.prompt || '').slice(0, 70)}</span><span>${favorite ? '★' : ''}</span></div>
+                <div class="ctb-theater-history-body">${theaterPlainPreview(item.output || '')}</div>
+                <div class="ctb-inline ctb-theater-history-actions">
+                    <button type="button" class="ctb-button" data-action="open-theater-reader" data-theater-source="${source}" data-theater-id="${escapeHTML(item.id)}">放大阅读</button>
+                    <button type="button" class="ctb-button" data-action="use-theater-history" data-theater-source="${source}" data-theater-id="${escapeHTML(item.id)}">载入</button>
+                    <button type="button" class="ctb-button${favorite ? ' ctb-primary-soft' : ''}" data-action="toggle-theater-favorite" data-theater-source="${source}" data-theater-id="${escapeHTML(item.id)}">${favorite ? '取消收藏' : '☆ 收藏'}</button>
+                    <button type="button" class="ctb-button ctb-danger" data-action="delete-theater-history" data-theater-source="${source}" data-theater-id="${escapeHTML(item.id)}">删除</button>
+                </div>
+            </article>`;
+        }).join('');
+        return `<section class="ctb-section"><div class="ctb-section-title">独立小剧场 ${infoButton('theater-scope')}</div></section>
+            <section class="ctb-section"><div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>${renderChannelSettings('theater')}</section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场预设</div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-preset">${presetOptions}</select><input class="ctb-input" id="ctb-theater-preset-name" placeholder="预设名称" value="${escapeHTML(config.presetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-preset"${config.selectedPresetId ? '' : ' disabled'}>删除</button></div></section>
             <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="例如：如果这一刻没有人打断，角色会怎么想？">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterLoading ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterLoading ? '生成中…' : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div></section>
-            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果</div><pre class="ctb-theater-result">${escapeHTML(theaterResult)}</pre></section>` : ''}
-            ${theaterHistory.length ? `<section class="ctb-section"><div class="ctb-section-title">最近结果 <span>最多保留 20 条</span></div>${history}</section>` : ''}${theaterPromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览</span><button type="button" class="ctb-review-expand" data-action="close-theater-preview">×</button></div><pre>${escapeHTML(theaterPromptPreview)}</pre></section>` : ''}`;
+            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
+            <section class="ctb-section"><div class="ctb-section-title">记录 <span>${theaterHistoryView === 'favorites' ? '收藏夹' : '本次会话'}</span></div>
+                <div class="ctb-inline ctb-theater-history-tabs"><button type="button" class="ctb-scope${theaterHistoryView === 'recent' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="recent">最近</button><button type="button" class="ctb-scope${theaterHistoryView === 'favorites' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="favorites">★ 收藏夹</button></div>
+                <div class="ctb-theater-history-list" data-ctb-scroll-key="theater-history-list">${history || '<div class="ctb-results ctb-results-empty">这里还没有记录。</div>'}</div>
+            </section>${theaterPromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览</span><button type="button" class="ctb-review-expand" data-action="close-theater-preview">×</button></div><pre>${escapeHTML(theaterPromptPreview)}</pre></section>` : ''}`;
     }
 
     let theaterPromptPreview = '';
@@ -2645,11 +2855,41 @@
         renderPanel();
     }
 
-    function loadTheaterHistory(index) {
-        const item = theaterHistory[Number(index)];
+    function loadTheaterHistory(id, source = 'recent') {
+        const item = theaterRecordById(id, source);
         if (!item) return;
         settings.theater.prompt = item.prompt || '';
         theaterResult = item.output || '';
+        theaterCurrentId = item.id;
+        renderPanel();
+    }
+
+    function toggleTheaterFavorite(id, source = 'recent') {
+        const favorites = theaterFavorites();
+        const index = favorites.findIndex((item) => String(item.id) === String(id));
+        if (index >= 0) {
+            favorites.splice(index, 1);
+        } else {
+            const item = theaterRecordById(id, source);
+            if (!item) return;
+            favorites.unshift(deepClone(item));
+            if (favorites.length > 50) favorites.length = 50;
+        }
+        saveSettings();
+        renderPanel();
+    }
+
+    function deleteTheaterHistory(id, source = 'recent') {
+        if (source === 'favorite') {
+            settings.theater.favorites = theaterFavorites().filter((item) => String(item.id) !== String(id));
+            saveSettings();
+        } else {
+            theaterHistory = theaterHistory.filter((item) => String(item.id) !== String(id));
+            if (String(theaterCurrentId) === String(id)) {
+                theaterCurrentId = '';
+                theaterResult = '';
+            }
+        }
         renderPanel();
     }
 
@@ -2659,11 +2899,14 @@
         }
     }
 
-    async function getWorldBookNames() {
+    async function getWorldBookNames(force = false) {
         const context = getContext();
-        try { await context.updateWorldInfoList?.(); } catch (_) {}
         const direct = context.world_names || context.worldNames || host.world_names || host.worldNames;
-        if (Array.isArray(direct) && direct.length) return [...new Set(direct.map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+        if (!force && Array.isArray(direct) && direct.length) return [...new Set(direct.map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+        // 只有缓存确实不存在时才刷新列表；打开管理页不应触发酒馆全局世界书刷新。
+        try { await context.updateWorldInfoList?.(); } catch (_) {}
+        const refreshed = context.world_names || context.worldNames || host.world_names || host.worldNames;
+        if (Array.isArray(refreshed) && refreshed.length) return [...new Set(refreshed.map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
         const data = await stProxyJson('/api/settings/get', {});
         return [...new Set((Array.isArray(data?.world_names) ? data.world_names : []).map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     }
@@ -2677,32 +2920,111 @@
         return deepClone(await stProxyJson('/api/worldinfo/get', { name }));
     }
 
-    async function saveWorldInfoDocument(name, data, createNew = false) {
+    async function saveWorldInfoDocument(name, data, options = {}) {
+        const normalized = typeof options === 'boolean' ? { immediate: options } : (options || {});
+        const immediate = normalized.immediate !== false;
+        const refreshList = normalized.refreshList === true;
+        const verifyAfterSave = normalized.verify === true;
         const context = getContext();
         if (typeof context.saveWorldInfo !== 'function') throw new Error('当前酒馆版本没有公开世界书保存接口');
-        await context.saveWorldInfo(name, deepClone(data), Boolean(createNew));
-        try { await context.updateWorldInfoList?.(); } catch (_) {}
-        const verify = await loadWorldInfoDocument(name);
+        const saved = await context.saveWorldInfo(name, deepClone(data), Boolean(immediate));
+        if (refreshList) {
+            try { await context.updateWorldInfoList?.(); } catch (_) {}
+        }
+        // 普通编辑保存直接采用刚提交的数据，避免每次都额外等待一次
+        // /api/worldinfo/get。跨书移动、重命名等会删除来源数据的操作仍显式
+        // 开启 verify，确保目标真实写入后再继续。
+        if (!verifyAfterSave) {
+            const result = saved && typeof saved === 'object' ? saved : data;
+            if (!result || typeof result.entries !== 'object') throw new Error('世界书保存结果无效');
+            return deepClone(result);
+        }
+        let verify;
+        try {
+            // loadWorldInfo 可能直接命中酒馆内存缓存；用服务端接口做一次真实回读。
+            verify = await stProxyJson('/api/worldinfo/get', { name });
+        } catch (_) {
+            verify = await loadWorldInfoDocument(name);
+        }
         if (!verify || typeof verify.entries !== 'object') throw new Error('保存后无法回读世界书');
         return verify;
     }
 
+    /* Worldbook manager: numeric UID, native priority, manual order and safe transfers. */
+    const WORLDBOOK_POSITIONS_V2 = Object.freeze([
+        { value: 0, label: '角色定义前' },
+        { value: 1, label: '角色定义后' },
+        { value: 2, label: '作者注释前' },
+        { value: 3, label: '作者注释后' },
+        { value: 4, label: '深度（Depth）' },
+        { value: 5, label: '示例消息前' },
+        { value: 6, label: '示例消息后' },
+        { value: 7, label: '命名出口' },
+    ]);
+
+    function worldbookIntegerV2(value, fallback = 0) {
+        const number = Number(value);
+        return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
+    }
+
+    function worldbookDisplayIndexV2(raw, fallback) {
+        const candidates = [raw?.displayIndex, raw?.extensions?.displayIndex, raw?.extensions?.display_index];
+        const value = candidates.find((candidate) => Number.isFinite(Number(candidate)));
+        return value === undefined ? fallback : Number(value);
+    }
+
+    async function loadFreshWorldInfoDocumentV2(name) {
+        try {
+            return deepClone(await stProxyJson('/api/worldinfo/get', { name }));
+        } catch (_) {
+            return loadWorldInfoDocument(name);
+        }
+    }
+
     function worldbookRecords(data) {
-        return Object.entries(data?.entries || {}).map(([key, raw]) => {
+        const source = Object.entries(data?.entries || {});
+        const reserved = new Set();
+        source.forEach(([key, raw]) => {
+            const candidate = Number(raw?.uid ?? key);
+            if (Number.isSafeInteger(candidate) && candidate >= 0) reserved.add(candidate);
+        });
+        const claimed = new Set();
+        let nextUid = 0;
+        const allocate = () => {
+            while (reserved.has(nextUid) || claimed.has(nextUid)) nextUid += 1;
+            const uid = nextUid++;
+            claimed.add(uid);
+            return uid;
+        };
+        return source.map(([key, raw], index) => {
             const value = raw && typeof raw === 'object' ? deepClone(raw) : {};
-            const uid = String(value.uid ?? key);
-            if (value.uid === undefined) value.uid = uid;
-            return { uid, sourceKey: String(key), raw: value };
+            const candidate = Number(value.uid ?? key);
+            const uid = Number.isSafeInteger(candidate) && candidate >= 0 && !claimed.has(candidate)
+                ? candidate
+                : allocate();
+            claimed.add(uid);
+            value.uid = uid;
+            const displayIndex = worldbookDisplayIndexV2(value, index);
+            value.displayIndex = displayIndex;
+            return { uid: String(uid), sourceKey: String(key), raw: value, displayIndex };
         });
     }
 
     function serializeWorldbookRecords(records) {
         const entries = {};
-        for (const record of records) {
-            const raw = deepClone(record.raw || {});
-            const uid = String(raw.uid ?? record.uid);
-            raw.uid = raw.uid ?? uid;
-            entries[uid] = raw;
+        for (const record of records || []) {
+            const raw = deepClone(record?.raw || {});
+            const uid = worldbookIntegerV2(raw.uid ?? record?.uid, 0);
+            const displayIndex = Number.isFinite(Number(record?.displayIndex))
+                ? Number(record.displayIndex)
+                : worldbookDisplayIndexV2(raw, 0);
+            raw.uid = uid;
+            raw.displayIndex = displayIndex;
+            if (raw.extensions && typeof raw.extensions === 'object') {
+                if (Object.prototype.hasOwnProperty.call(raw.extensions, 'displayIndex')) raw.extensions.displayIndex = displayIndex;
+                if (Object.prototype.hasOwnProperty.call(raw.extensions, 'display_index')) raw.extensions.display_index = displayIndex;
+            }
+            entries[String(uid)] = raw;
         }
         return entries;
     }
@@ -2714,7 +3036,183 @@
     }
 
     function worldbookRecordPreview(record) {
-        return String(record?.raw?.content || '').replace(/\s+/g, ' ').trim().slice(0, 130);
+        return String(record?.raw?.content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    }
+
+    function worldbookRecordSearchText(record) {
+        const raw = record?.raw || {};
+        return [
+            worldbookRecordLabel(record),
+            record?.uid,
+            ...(Array.isArray(raw.key) ? raw.key : []),
+            ...(Array.isArray(raw.keysecondary) ? raw.keysecondary : []),
+            raw.content || '',
+            raw.group || '',
+        ].join('\n').toLowerCase();
+    }
+
+    function worldbookUidNumber(record) {
+        const value = Number(record?.raw?.uid ?? record?.uid);
+        return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
+    }
+
+    function worldbookPositionLabelV2(raw) {
+        return WORLDBOOK_POSITIONS_V2.find((item) => item.value === Number(raw?.position ?? 0))?.label || '未知位置';
+    }
+
+    function worldbookAuthorNoteDepthV2() {
+        const context = getContext();
+        const value = context?.chatMetadata?.note_depth
+            ?? context?.extensionSettings?.note?.defaultDepth
+            ?? 4;
+        const depth = Number(value);
+        return Number.isFinite(depth) ? depth : 4;
+    }
+
+    // This mirrors WorldbookEditor's getEntrySortScore: position is the
+    // primary group, @Depth/author-note use the current depth, then order ASC
+    // and numeric UID provide deterministic ordering within a group.
+    function worldbookPriorityScoreV2(raw) {
+        const position = Number.isInteger(Number(raw?.position)) ? Number(raw.position) : 1;
+        if (position === 0) return 100000;
+        if (position === 1) return 90000;
+        if (position === 5) return 80000;
+        if (position === 6) return 70000;
+        if (position === 4) return Number(raw?.depth ?? 4);
+        if (position === 2) return worldbookAuthorNoteDepthV2() + 0.6;
+        if (position === 3) return worldbookAuthorNoteDepthV2() + 0.4;
+        return -9999;
+    }
+
+    function worldbookGroupKeyV2(record) {
+        const position = Number.isInteger(Number(record?.raw?.position)) ? Number(record.raw.position) : 1;
+        return position === 4 ? `position-${position}-depth-${Number(record?.raw?.depth ?? 4)}` : `position-${position}`;
+    }
+
+    function worldbookGroupLabelV2(record) {
+        const position = Number.isInteger(Number(record?.raw?.position)) ? Number(record.raw.position) : 1;
+        if (position === 4) return `深度（Depth ${Number(record?.raw?.depth ?? 4)}）`;
+        return worldbookPositionLabelV2({ position });
+    }
+
+    function sortWorldbookRecords(records, mode = worldbookSortMode) {
+        const list = Array.isArray(records) ? records.slice() : [];
+        if (mode === 'manual') {
+            return list.sort((a, b) => Number(a.displayIndex ?? 0) - Number(b.displayIndex ?? 0)
+                || worldbookUidNumber(a) - worldbookUidNumber(b));
+        }
+        return list.sort((a, b) => worldbookPriorityScoreV2(b.raw) - worldbookPriorityScoreV2(a.raw)
+            || Number(a.raw?.order ?? 0) - Number(b.raw?.order ?? 0)
+            || worldbookUidNumber(a) - worldbookUidNumber(b));
+    }
+
+    function normalizeWorldbookDisplayIndexesV2(records) {
+        sortWorldbookRecords(records, 'manual').forEach((record, index) => {
+            record.displayIndex = index;
+            record.raw.displayIndex = index;
+            if (record.raw.extensions && typeof record.raw.extensions === 'object') {
+                if (Object.prototype.hasOwnProperty.call(record.raw.extensions, 'displayIndex')) record.raw.extensions.displayIndex = index;
+                if (Object.prototype.hasOwnProperty.call(record.raw.extensions, 'display_index')) record.raw.extensions.display_index = index;
+            }
+        });
+        return records;
+    }
+
+    function currentWorldbookView() {
+        return sortWorldbookRecords(worldbookEntries, worldbookSortMode);
+    }
+
+    function markWorldbookDirtyV2() {
+        worldbookDirty = true;
+    }
+
+    function markWorldbookDraftDirtyV2() {
+        worldbookDraftDirty = true;
+        if (!root) return;
+        const draftStatus = root.querySelector('[data-worldbook-draft-status]');
+        if (draftStatus) draftStatus.textContent = '当前条目有未暂存修改';
+        const saveStatus = root.querySelector('[data-worldbook-save-status]');
+        if (saveStatus) saveStatus.textContent = '有未保存的修改';
+    }
+
+    function syncWorldbookSelectionUI() {
+        if (!root) return;
+        root.querySelectorAll('[data-worldbook-row-uid]').forEach((row) => {
+            row.classList.toggle('is-selected', worldbookSelected.has(String(row.dataset.worldbookRowUid)));
+        });
+        const count = root.querySelector('[data-worldbook-selected-count]');
+        if (count) count.textContent = `已选 ${worldbookSelected.size} 条`;
+        root.querySelectorAll('[data-worldbook-needs-selection]').forEach((button) => {
+            button.disabled = worldbookSelected.size === 0;
+        });
+    }
+
+    function applyWorldbookVisualOrderToPriority() {
+        const ordered = currentWorldbookView();
+        const counters = new Map();
+        ordered.forEach((record) => {
+            const key = worldbookGroupKeyV2(record);
+            const next = (counters.get(key) || 0) + 1;
+            counters.set(key, next);
+            record.raw.order = next;
+        });
+        worldbookEntries = ordered;
+        markWorldbookDirtyV2();
+        renderPanel();
+    }
+
+    function applyWorldbookVisualOrderToDisplayIndex() {
+        const ordered = currentWorldbookView();
+        normalizeWorldbookDisplayIndexesV2(ordered);
+        worldbookEntries = ordered;
+        markWorldbookDirtyV2();
+        renderPanel();
+    }
+
+    function reorderWorldbookEntryV2(dragUid, targetUid) {
+        if (worldbookSortMode !== 'manual' || !dragUid || !targetUid || String(dragUid) === String(targetUid)) return;
+        const ordered = sortWorldbookRecords(worldbookEntries, 'manual');
+        const from = ordered.findIndex((record) => record.uid === String(dragUid));
+        const to = ordered.findIndex((record) => record.uid === String(targetUid));
+        if (from < 0 || to < 0) return;
+        const [moved] = ordered.splice(from, 1);
+        ordered.splice(to, 0, moved);
+        normalizeWorldbookDisplayIndexesV2(ordered);
+        worldbookEntries = ordered;
+        markWorldbookDirtyV2();
+        renderPanel();
+    }
+
+    async function loadWorldbookTransferTargetV2(name, { render = true } = {}) {
+        const target = String(name || '');
+        const requestId = ++worldbookTransferRequestId;
+        if (!target || target === worldbookBook) {
+            worldbookTransferTargetEntries = [];
+            worldbookTransferAnchor = { kind: 'bottom', anchorUid: '' };
+            if (render) renderPanel();
+            return;
+        }
+        worldbookTransferTargetLoading = true;
+        if (render) renderPanel();
+        const sourceBook = worldbookBook;
+        try {
+            const document = await loadFreshWorldInfoDocumentV2(target);
+            if (requestId !== worldbookTransferRequestId || sourceBook !== worldbookBook || target !== worldbookTransferTarget) return;
+            worldbookTransferTargetEntries = sortWorldbookRecords(worldbookRecords(document), 'manual');
+            if (['before', 'after'].includes(worldbookTransferAnchor.kind)
+                && !worldbookTransferTargetEntries.some((record) => record.uid === String(worldbookTransferAnchor.anchorUid))) {
+                worldbookTransferAnchor = { kind: 'bottom', anchorUid: '' };
+            }
+        } catch (error) {
+            if (requestId !== worldbookTransferRequestId) return;
+            worldbookTransferTargetEntries = [];
+            notify(`读取目标世界书失败：${error.message}`, 'warning');
+        } finally {
+            if (requestId === worldbookTransferRequestId) {
+                worldbookTransferTargetLoading = false;
+                if (render) renderPanel();
+            }
+        }
     }
 
     async function loadWorldbookManager({ force = false, book = '' } = {}) {
@@ -2722,13 +3220,16 @@
         worldbookLoading = true;
         renderPanel();
         try {
-            if (force || !worldbookBooks.length) worldbookBooks = await getWorldBookNames();
+            if (force || !worldbookBooks.length) worldbookBooks = await getWorldBookNames(force);
             const preferred = String(book || worldbookBook || settings.worldbook.currentBook || '');
             worldbookBook = worldbookBooks.includes(preferred) ? preferred : (worldbookBooks[0] || '');
             settings.worldbook.currentBook = worldbookBook;
+            worldbookSortMode = ['priority', 'manual'].includes(settings.worldbook.sortMode) ? settings.worldbook.sortMode : 'priority';
             if (worldbookBook) {
-                worldbookDocument = await loadWorldInfoDocument(worldbookBook);
-                worldbookEntries = worldbookRecords(worldbookDocument);
+                worldbookDocument = force
+                    ? await loadFreshWorldInfoDocumentV2(worldbookBook)
+                    : await loadWorldInfoDocument(worldbookBook);
+                worldbookEntries = sortWorldbookRecords(worldbookRecords(worldbookDocument), worldbookSortMode);
             } else {
                 worldbookDocument = null;
                 worldbookEntries = [];
@@ -2737,9 +3238,15 @@
             worldbookVisibleLimit = 120;
             worldbookEditingUid = '';
             worldbookDraft = null;
+            worldbookDraftDirty = false;
             worldbookDirty = false;
             worldbookTransferTarget = worldbookBooks.find((name) => name !== worldbookBook) || '';
+            worldbookTransferAnchor = { kind: 'bottom', anchorUid: '' };
+            worldbookTransferTargetEntries = [];
+            worldbookSortModalOpen = false;
+            worldbookSortModalOrder = [];
             saveSettings();
+            if (worldbookTransferTarget) host.setTimeout(() => loadWorldbookTransferTargetV2(worldbookTransferTarget), 0);
         } catch (error) {
             notify(`读取世界书失败：${error.message}`, 'error');
         } finally {
@@ -2749,28 +3256,50 @@
         }
     }
 
+    function canDiscardWorldbookChangesV2() {
+        if (worldbookDraftDirty && !host.confirm('当前条目有未暂存修改，切换将丢弃这些修改。继续吗？')) return false;
+        if (worldbookDirty && !host.confirm('当前世界书有尚未保存的修改，切换将丢弃这些修改。继续吗？')) return false;
+        return true;
+    }
+
     async function chooseWorldbook(name) {
-        if (worldbookDirty && !host.confirm('当前世界书有尚未保存的修改。放弃修改并切换吗？')) {
-            return renderPanel();
-        }
+        if (!canDiscardWorldbookChangesV2()) return renderPanel();
         return loadWorldbookManager({ force: false, book: name });
     }
 
     function editWorldbookEntry(uid) {
         const record = worldbookEntries.find((item) => item.uid === String(uid));
         if (!record) return;
+        if (worldbookDraftDirty) {
+            if (!host.confirm('当前条目有未暂存修改。先暂存后切换条目吗？')) return;
+            applyWorldbookDraft({ quiet: true });
+        }
         worldbookEditingUid = record.uid;
         worldbookDraft = deepClone(record.raw);
+        worldbookDraftDirty = false;
+        renderPanel();
+    }
+
+    function discardWorldbookDraftV2() {
+        if (!worldbookEditingUid) return;
+        const record = worldbookEntries.find((item) => item.uid === String(worldbookEditingUid));
+        worldbookDraft = record ? deepClone(record.raw) : null;
+        worldbookDraftDirty = false;
         renderPanel();
     }
 
     function applyWorldbookDraft({ quiet = false } = {}) {
         if (!worldbookDraft || !worldbookEditingUid) return false;
-        const record = worldbookEntries.find((item) => item.uid === worldbookEditingUid);
+        const record = worldbookEntries.find((item) => item.uid === String(worldbookEditingUid));
         if (!record) return false;
+        const uid = worldbookIntegerV2(record.raw?.uid ?? record.uid, 0);
         record.raw = deepClone(worldbookDraft);
-        record.raw.uid = record.raw.uid ?? record.uid;
-        worldbookDirty = true;
+        record.raw.uid = uid;
+        record.uid = String(uid);
+        record.displayIndex = worldbookDisplayIndexV2(record.raw, record.displayIndex ?? 0);
+        worldbookDraft = deepClone(record.raw);
+        worldbookDraftDirty = false;
+        markWorldbookDirtyV2();
         if (!quiet) {
             renderPanel();
             notify('条目修改已暂存；请点击“保存世界书”写入文件', 'success');
@@ -2779,38 +3308,51 @@
     }
 
     function createWorldbookEntry() {
-        const uid = `ctb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+        if (!worldbookBook) return;
+        if (worldbookDraftDirty) {
+            if (!host.confirm('当前条目有未暂存修改。先暂存后新建吗？')) return;
+            applyWorldbookDraft({ quiet: true });
+        }
+        const used = new Set(worldbookEntries.map((record) => worldbookUidNumber(record)).filter((value) => Number.isSafeInteger(value)));
+        const uid = nextWorldbookUid(used);
+        normalizeWorldbookDisplayIndexesV2(worldbookEntries);
+        const displayIndex = worldbookEntries.length;
         const raw = {
-            uid,
-            comment: '新条目',
-            key: [],
-            keysecondary: [],
-            content: '',
-            constant: false,
-            selective: true,
-            order: 100,
-            position: 0,
-            disable: false,
-            depth: 4,
+            uid, comment: '新条目', key: [], keysecondary: [], content: '',
+            constant: false, selective: true, selectiveLogic: 0,
+            order: 1, position: 0, disable: false,
+            depth: 4, probability: 100, useProbability: true, group: '', displayIndex,
         };
-        worldbookEntries.unshift({ uid, sourceKey: uid, raw });
-        worldbookEditingUid = uid;
+        const maxOrder = worldbookEntries
+            .filter((record) => worldbookGroupKeyV2(record) === worldbookGroupKeyV2({ raw }))
+            .reduce((max, record) => Math.max(max, Number(record.raw?.order) || 0), 0);
+        raw.order = maxOrder + 1;
+        worldbookEntries.push({ uid: String(uid), sourceKey: String(uid), raw, displayIndex });
+        worldbookEditingUid = String(uid);
         worldbookDraft = deepClone(raw);
-        worldbookDirty = true;
+        worldbookDraftDirty = false;
+        markWorldbookDirtyV2();
         renderPanel();
     }
 
     async function saveCurrentWorldbook() {
         if (!worldbookBook || worldbookSaving) return;
-        applyWorldbookDraft({ quiet: true });
+        if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         worldbookSaving = true;
         renderPanel();
         try {
             const next = { ...(worldbookDocument || {}), entries: serializeWorldbookRecords(worldbookEntries) };
-            const verified = await saveWorldInfoDocument(worldbookBook, next, false);
+            const verified = await saveWorldInfoDocument(worldbookBook, next, { immediate: true, refreshList: false });
+            const editingUid = worldbookEditingUid;
             worldbookDocument = verified;
-            worldbookEntries = worldbookRecords(verified);
+            worldbookEntries = sortWorldbookRecords(worldbookRecords(verified), worldbookSortMode);
             worldbookDirty = false;
+            worldbookDraftDirty = false;
+            if (editingUid) {
+                const record = worldbookEntries.find((item) => item.uid === String(editingUid));
+                worldbookDraft = record ? deepClone(record.raw) : null;
+                worldbookEditingUid = record ? record.uid : '';
+            }
             rewriteWorldEntryCache.delete(worldbookBook);
             theaterWorldEntryCache.delete(worldbookBook);
             notify(`世界书“${worldbookBook}”已保存，共 ${worldbookEntries.length} 条`, 'success');
@@ -2823,11 +3365,12 @@
     }
 
     async function createWorldbookBook() {
+        if ((worldbookDraftDirty || worldbookDirty) && !canDiscardWorldbookChangesV2()) return;
         const name = String(host.prompt('新世界书名称：') || '').trim();
         if (!name) return;
         if (worldbookBooks.includes(name)) return notify('已经存在同名世界书', 'warning');
         try {
-            await saveWorldInfoDocument(name, { entries: {} }, true);
+            await saveWorldInfoDocument(name, { entries: {} }, { immediate: true, refreshList: true });
             worldbookBooks = [];
             await loadWorldbookManager({ force: true, book: name });
             notify(`世界书“${name}”已创建`, 'success');
@@ -2856,9 +3399,9 @@
         if (!name || name === oldName) return;
         if (worldbookBooks.includes(name)) return notify('已经存在同名世界书', 'warning');
         try {
-            applyWorldbookDraft({ quiet: true });
+            if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
             const next = { ...(worldbookDocument || {}), entries: serializeWorldbookRecords(worldbookEntries) };
-            await saveWorldInfoDocument(name, next, true);
+            await saveWorldInfoDocument(name, next, { immediate: true, refreshList: true, verify: true });
             await stProxyJson('/api/worldinfo/delete', { name: oldName });
             worldbookBooks = [];
             await loadWorldbookManager({ force: true, book: name });
@@ -2871,85 +3414,294 @@
     async function deleteSelectedWorldbookEntries() {
         const ids = [...worldbookSelected];
         if (!ids.length || !host.confirm(`确定删除选中的 ${ids.length} 个世界书条目并保存吗？`)) return;
+        if (worldbookDraftDirty && !ids.includes(String(worldbookEditingUid))) applyWorldbookDraft({ quiet: true });
         worldbookEntries = worldbookEntries.filter((record) => !worldbookSelected.has(record.uid));
+        normalizeWorldbookDisplayIndexesV2(worldbookEntries);
         worldbookSelected = new Set();
-        if (ids.includes(worldbookEditingUid)) {
+        if (ids.includes(String(worldbookEditingUid))) {
             worldbookEditingUid = '';
             worldbookDraft = null;
+            worldbookDraftDirty = false;
         }
-        worldbookDirty = true;
+        markWorldbookDirtyV2();
         await saveCurrentWorldbook();
     }
 
     function nextWorldbookUid(existing) {
-        let uid;
-        do { uid = `ctb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`; } while (existing.has(uid));
+        const used = new Set([...existing].map((value) => Number(value)).filter((value) => Number.isSafeInteger(value) && value >= 0));
+        let uid = 0;
+        while (used.has(uid)) uid += 1;
         existing.add(uid);
         return uid;
     }
 
+    function worldbookTransferInsertionIndexV2(records) {
+        const kind = worldbookTransferAnchor.kind;
+        if (kind === 'top') return 0;
+        if (kind === 'before' || kind === 'after') {
+            const index = records.findIndex((record) => record.uid === String(worldbookTransferAnchor.anchorUid));
+            if (index >= 0) return kind === 'before' ? index : index + 1;
+        }
+        return records.length;
+    }
+
     async function transferWorldbookEntries(mode) {
-        const selected = worldbookEntries.filter((record) => worldbookSelected.has(record.uid));
+        const selected = currentWorldbookView().filter((record) => worldbookSelected.has(record.uid));
         const targetName = String(worldbookTransferTarget || '');
         if (!selected.length) return notify('请先勾选要转移的世界书条目', 'warning');
         if (!targetName || targetName === worldbookBook) return notify('请选择另一本目标世界书', 'warning');
-        if (worldbookDirty) return notify('请先保存当前世界书，再执行跨书转移', 'warning');
+        if (worldbookDraftDirty || worldbookDirty) return notify('请先保存当前世界书，再执行跨书转移', 'warning');
         worldbookSaving = true;
         renderPanel();
+        let targetSaved = false;
+        let targetDocument = null;
         try {
-            const targetDocument = await loadWorldInfoDocument(targetName);
-            const targetRecords = worldbookRecords(targetDocument);
-            const existing = new Set(targetRecords.map((record) => record.uid));
-            for (const source of selected) {
+            targetDocument = await loadFreshWorldInfoDocumentV2(targetName);
+            const targetRecords = sortWorldbookRecords(worldbookRecords(targetDocument), 'manual');
+            const used = new Set(targetRecords.map((record) => worldbookUidNumber(record)));
+            const imported = selected.map((source) => {
                 const raw = deepClone(source.raw);
-                let uid = String(raw.uid ?? source.uid);
-                if (existing.has(uid)) {
-                    uid = nextWorldbookUid(existing);
-                    raw.uid = uid;
-                } else existing.add(uid);
-                targetRecords.push({ uid, sourceKey: uid, raw });
-            }
+                const uid = nextWorldbookUid(used);
+                raw.uid = uid;
+                raw.displayIndex = 0;
+                return { uid: String(uid), sourceKey: String(uid), raw, displayIndex: 0 };
+            });
+            const insertionIndex = worldbookTransferInsertionIndexV2(targetRecords);
+            targetRecords.splice(insertionIndex, 0, ...imported);
+            normalizeWorldbookDisplayIndexesV2(targetRecords);
             const targetNext = { ...targetDocument, entries: serializeWorldbookRecords(targetRecords) };
-            await saveWorldInfoDocument(targetName, targetNext, false);
+            const targetVerified = await saveWorldInfoDocument(targetName, targetNext, { immediate: true, refreshList: false, verify: true });
+            targetSaved = true;
+            worldbookTransferTargetEntries = sortWorldbookRecords(worldbookRecords(targetVerified), 'manual');
             if (mode === 'move') {
-                const sourceNextRecords = worldbookEntries.filter((record) => !worldbookSelected.has(record.uid));
+                const sourceNextRecords = sortWorldbookRecords(worldbookEntries.filter((record) => !worldbookSelected.has(record.uid)), 'manual');
+                normalizeWorldbookDisplayIndexesV2(sourceNextRecords);
                 const sourceNext = { ...worldbookDocument, entries: serializeWorldbookRecords(sourceNextRecords) };
-                const sourceVerified = await saveWorldInfoDocument(worldbookBook, sourceNext, false);
-                worldbookDocument = sourceVerified;
-                worldbookEntries = worldbookRecords(sourceVerified);
+                try {
+                    const sourceVerified = await saveWorldInfoDocument(worldbookBook, sourceNext, { immediate: true, refreshList: false, verify: true });
+                    worldbookDocument = sourceVerified;
+                    worldbookEntries = sortWorldbookRecords(worldbookRecords(sourceVerified), worldbookSortMode);
+                } catch (sourceError) {
+                    try { await saveWorldInfoDocument(targetName, targetDocument, { immediate: true, refreshList: false, verify: true }); } catch (_) {}
+                    throw sourceError;
+                }
             }
             worldbookSelected = new Set();
+            worldbookDirty = false;
+            worldbookDraftDirty = false;
+            if (mode === 'move' && selected.some((record) => record.uid === String(worldbookEditingUid))) {
+                worldbookEditingUid = '';
+                worldbookDraft = null;
+            }
             rewriteWorldEntryCache.delete(targetName);
             theaterWorldEntryCache.delete(targetName);
+            rewriteWorldEntryCache.delete(worldbookBook);
+            theaterWorldEntryCache.delete(worldbookBook);
             notify(`已${mode === 'move' ? '移动' : '复制'} ${selected.length} 个条目到“${targetName}”`, 'success');
         } catch (error) {
-            notify(`世界书条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}`, 'error');
+            if (targetSaved && mode === 'move') notify(`来源世界书未能删除，已尝试回滚目标：${error.message}`, 'error');
+            else notify(`世界书条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}`, 'error');
         } finally {
             worldbookSaving = false;
             renderPanel();
         }
     }
 
+    function openWorldbookSortModalV2() {
+        if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
+        if (worldbookSortMode !== 'priority') {
+            return notify('分组排序只调整优先级 order；请先切换到“显示：优先级顺序”', 'warning');
+        }
+        worldbookSortModalOrder = sortWorldbookRecords(worldbookEntries, 'priority').map((record) => record.uid);
+        worldbookSortModalOpen = true;
+        renderPanel();
+    }
+
+    function moveWorldbookSortModalEntryV2(uid, delta) {
+        if (!worldbookSortModalOpen) return;
+        const index = worldbookSortModalOrder.indexOf(String(uid));
+        const targetIndex = index + Number(delta);
+        if (index < 0 || targetIndex < 0 || targetIndex >= worldbookSortModalOrder.length) return;
+        const recordsByUid = new Map(worldbookEntries.map((record) => [record.uid, record]));
+        const current = recordsByUid.get(String(uid));
+        const target = recordsByUid.get(worldbookSortModalOrder[targetIndex]);
+        if (!current || !target || worldbookGroupKeyV2(current) !== worldbookGroupKeyV2(target)) return;
+        [worldbookSortModalOrder[index], worldbookSortModalOrder[targetIndex]] = [worldbookSortModalOrder[targetIndex], worldbookSortModalOrder[index]];
+        renderPanel();
+    }
+
+    function saveWorldbookSortModalV2() {
+        if (!worldbookSortModalOpen) return;
+        const recordsByUid = new Map(worldbookEntries.map((record) => [record.uid, record]));
+        const ordered = worldbookSortModalOrder.map((uid) => recordsByUid.get(uid)).filter(Boolean);
+        if (ordered.length !== worldbookEntries.length) {
+            worldbookSortModalOpen = false;
+            worldbookSortModalOrder = [];
+            return notify('排序草稿与当前条目不一致，请重新打开排序面板', 'warning');
+        }
+        const counters = new Map();
+        ordered.forEach((record) => {
+            const key = worldbookGroupKeyV2(record);
+            const next = (counters.get(key) || 0) + 1;
+            counters.set(key, next);
+            record.raw.order = next;
+        });
+        worldbookEntries = ordered;
+        worldbookSortModalOpen = false;
+        worldbookSortModalOrder = [];
+        markWorldbookDirtyV2();
+        renderPanel();
+        notify('分组排序已暂存，请点击“保存世界书”写入文件', 'success');
+    }
+
+    function cancelWorldbookSortModalV2() {
+        worldbookSortModalOpen = false;
+        worldbookSortModalOrder = [];
+        renderPanel();
+    }
+
+    function renderWorldbookSortModalV2() {
+        if (!worldbookSortModalOpen) return '';
+        const recordsByUid = new Map(worldbookEntries.map((record) => [record.uid, record]));
+        const groups = [];
+        const groupMap = new Map();
+        worldbookSortModalOrder.forEach((uid) => {
+            const record = recordsByUid.get(uid);
+            if (!record) return;
+            const key = worldbookGroupKeyV2(record);
+            let group = groupMap.get(key);
+            if (!group) {
+                group = { key, label: worldbookGroupLabelV2(record), records: [] };
+                groupMap.set(key, group);
+                groups.push(group);
+            }
+            group.records.push(record);
+        });
+        const body = groups.map((group) => `<section class="ctb-worldbook-sort-group">
+            <header><span>${escapeHTML(group.label)}</span><small>${group.records.length} 条</small></header>
+            <div>${group.records.map((record) => {
+                const index = worldbookSortModalOrder.indexOf(record.uid);
+                const canUp = index > 0 && worldbookSortModalOrder[index - 1] && recordsByUid.has(worldbookSortModalOrder[index - 1])
+                    && worldbookGroupKeyV2(recordsByUid.get(worldbookSortModalOrder[index - 1])) === group.key;
+                const canDown = index >= 0 && index < worldbookSortModalOrder.length - 1 && recordsByUid.has(worldbookSortModalOrder[index + 1])
+                    && worldbookGroupKeyV2(recordsByUid.get(worldbookSortModalOrder[index + 1])) === group.key;
+                return `<div class="ctb-worldbook-sort-item"><span class="ctb-worldbook-sort-order">${escapeHTML(record.raw?.order ?? 0)}</span><span class="ctb-worldbook-sort-name">${escapeHTML(worldbookRecordLabel(record))}<small>UID ${escapeHTML(record.uid)}</small></span><button type="button" class="ctb-icon-button" data-action="move-worldbook-sort-entry" data-worldbook-uid="${escapeHTML(record.uid)}" data-worldbook-sort-delta="-1"${canUp ? '' : ' disabled'} aria-label="上移">↑</button><button type="button" class="ctb-icon-button" data-action="move-worldbook-sort-entry" data-worldbook-uid="${escapeHTML(record.uid)}" data-worldbook-sort-delta="1"${canDown ? '' : ' disabled'} aria-label="下移">↓</button></div>`;
+            }).join('')}</div>
+        </section>`).join('');
+        return `<div class="ctb-worldbook-sort-overlay"><div class="ctb-worldbook-sort-modal" role="dialog" aria-modal="true"><div class="ctb-worldbook-sort-head"><span>分组排序 <small>位置 → 深度 → order（升序）→ UID</small></span><button type="button" class="ctb-icon-button" data-action="cancel-worldbook-sort" aria-label="关闭">×</button></div><div class="ctb-worldbook-sort-body" data-ctb-scroll-key="worldbook-sort-modal">${body || '<div class="ctb-world-empty">没有可排序的条目</div>'}</div><div class="ctb-worldbook-sort-foot"><button type="button" class="ctb-button" data-action="cancel-worldbook-sort">取消</button><button type="button" class="ctb-button ctb-primary" data-action="save-worldbook-sort">暂存排序</button></div></div></div>`;
+    }
+
+    function renderWorldbookRowsV2(records) {
+        let previousGroup = '';
+        return records.map((record) => {
+            const raw = record.raw || {};
+            const selected = worldbookSelected.has(record.uid);
+            const draggable = worldbookSortMode === 'manual';
+            const groupKey = worldbookGroupKeyV2(record);
+            const groupHeader = worldbookSortMode === 'priority' && groupKey !== previousGroup
+                ? `<div class="ctb-worldbook-group-header"><span>${escapeHTML(worldbookGroupLabelV2(record))}</span><small>${records.filter((item) => worldbookGroupKeyV2(item) === groupKey).length} 条</small></div>`
+                : '';
+            previousGroup = groupKey;
+            return `${groupHeader}<div class="ctb-manager-row${record.uid === String(worldbookEditingUid) ? ' is-active' : ''}${selected ? ' is-selected' : ''}${raw.disable ? ' is-disabled' : ''}" data-worldbook-row-uid="${escapeHTML(record.uid)}">
+                <span class="ctb-worldbook-drag${draggable ? '' : ' is-disabled'}" data-worldbook-drag-uid="${escapeHTML(record.uid)}"${draggable ? ' draggable="true"' : ''} title="${draggable ? '拖动调整手动顺序' : '切换到手动顺序后可拖动'}">⋮⋮</span>
+                <input type="checkbox" data-worldbook-select-uid="${escapeHTML(record.uid)}"${selected ? ' checked' : ''} aria-label="选择条目">
+                <button type="button" data-action="edit-worldbook-entry" data-worldbook-uid="${escapeHTML(record.uid)}">
+                    <span class="ctb-worldbook-name">${escapeHTML(worldbookRecordLabel(record))}</span>
+                    <small>${escapeHTML(worldbookRecordPreview(record) || '（空条目）')}</small>
+                </button>
+                <span class="ctb-worldbook-meta">#${escapeHTML(record.uid)} · ${escapeHTML(worldbookPositionLabelV2(raw))}<br>优先 ${escapeHTML(raw.order ?? 0)}</span>
+            </div>`;
+        }).join('');
+    }
+
     function renderWorldbookTab() {
         if (!worldbookLoadedOnce && !worldbookLoading) host.setTimeout(() => loadWorldbookManager(), 0);
-        const filtered = worldbookEntries.filter((record) => {
-            const query = worldbookSearch.trim().toLowerCase();
-            if (!query) return true;
-            const raw = record.raw || {};
-            return [worldbookRecordLabel(record), record.uid, ...(Array.isArray(raw.key) ? raw.key : []), raw.content || ''].join('\n').toLowerCase().includes(query);
-        });
+        const query = worldbookSearch.trim().toLowerCase();
+        const filtered = currentWorldbookView().filter((record) => !query || worldbookRecordSearchText(record).includes(query));
         const visible = filtered.slice(0, worldbookVisibleLimit);
         const books = worldbookBooks.map((name) => `<option value="${escapeHTML(name)}"${name === worldbookBook ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
         const targets = worldbookBooks.filter((name) => name !== worldbookBook).map((name) => `<option value="${escapeHTML(name)}"${name === worldbookTransferTarget ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
-        const list = worldbookLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>' : filtered.length
-            ? `<div class="ctb-manager-list">${visible.map((record) => `<div class="ctb-manager-row${record.uid === worldbookEditingUid ? ' is-active' : ''}"><input type="checkbox" data-worldbook-select-uid="${escapeHTML(record.uid)}"${worldbookSelected.has(record.uid) ? ' checked' : ''}><button type="button" data-action="edit-worldbook-entry" data-worldbook-uid="${escapeHTML(record.uid)}"><strong>${escapeHTML(worldbookRecordLabel(record))}</strong><small>${escapeHTML(worldbookRecordPreview(record) || '（空条目）')}</small></button><span>优先级 ${escapeHTML(record.raw?.order ?? 0)}</span></div>`).join('')}${filtered.length > visible.length ? `<button type="button" class="ctb-list-more" data-action="more-worldbook-entries">再显示 ${Math.min(120, filtered.length - visible.length)} 条（共 ${filtered.length} 条）</button>` : ''}</div>`
-            : '<div class="ctb-world-empty">没有符合条件的条目。</div>';
+        const anchorKind = worldbookTransferAnchor.kind;
+        const targetAnchorOptions = worldbookTransferTargetEntries.map((record) => `<option value="${escapeHTML(record.uid)}"${record.uid === String(worldbookTransferAnchor.anchorUid) ? ' selected' : ''}>${escapeHTML(worldbookRecordLabel(record))} · UID ${escapeHTML(record.uid)}</option>`).join('');
+        const positionOptions = WORLDBOOK_POSITIONS_V2.map((item) => `<option value="${item.value}"${Number(worldbookDraft?.position ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
+        const list = worldbookLoading
+            ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>'
+            : filtered.length
+                ? `<div class="ctb-manager-list" data-ctb-scroll-key="worldbook-list">${renderWorldbookRowsV2(visible)}${filtered.length > visible.length ? `<button type="button" class="ctb-list-more" data-action="more-worldbook-entries">再显示 ${Math.min(120, filtered.length - visible.length)} 条（共 ${filtered.length} 条）</button>` : ''}</div>`
+                : '<div class="ctb-world-empty">没有符合条件的条目。</div>';
         const draft = worldbookDraft;
-        const editor = draft ? `<div class="ctb-manager-editor"><div class="ctb-section-title">编辑条目 <span>UID ${escapeHTML(worldbookEditingUid)}</span></div><input class="ctb-input" id="ctb-worldbook-comment" placeholder="条目名称/备注" value="${escapeHTML(draft.comment || '')}"><input class="ctb-input" id="ctb-worldbook-keys" placeholder="关键词，用逗号分隔" value="${escapeHTML((Array.isArray(draft.key) ? draft.key : []).join(', '))}"><textarea class="ctb-input ctb-textarea ctb-manager-content" id="ctb-worldbook-content" placeholder="世界书内容">${escapeHTML(draft.content || '')}</textarea><div class="ctb-inline ctb-manager-fields"><label class="ctb-mini-field">优先级 <input class="ctb-input" id="ctb-worldbook-order" type="number" value="${escapeHTML(draft.order ?? 100)}"></label><label class="ctb-mini-field">深度 <input class="ctb-input" id="ctb-worldbook-depth" type="number" min="0" value="${escapeHTML(draft.depth ?? 4)}"></label><select class="ctb-input" id="ctb-worldbook-position">${[['0','角色定义前'],['1','角色定义后'],['2','示例前'],['3','示例后'],['4','深度']].map(([value,label]) => `<option value="${value}"${String(draft.position ?? 0) === value ? ' selected' : ''}>${label}</option>`).join('')}</select><label class="ctb-check"><input id="ctb-worldbook-constant" type="checkbox"${draft.constant ? ' checked' : ''}> 常驻</label><label class="ctb-check"><input id="ctb-worldbook-disabled" type="checkbox"${draft.disable ? ' checked' : ''}> 禁用</label></div><div class="ctb-inline ctb-manager-actions"><button type="button" class="ctb-button ctb-primary" data-action="apply-worldbook-entry">暂存条目</button></div></div>` : '<div class="ctb-world-empty">点击条目开始编辑。</div>';
-        return `<section class="ctb-section"><div class="ctb-section-title">世界书管理 ${infoButton('worldbook-save')}</div><div class="ctb-inline ctb-manager-toolbar"><select class="ctb-input" id="ctb-worldbook-book">${books || '<option value="">没有世界书</option>'}</select><button type="button" class="ctb-button" data-action="refresh-worldbook">刷新</button><button type="button" class="ctb-button" data-action="create-worldbook">新建书</button><button type="button" class="ctb-button" data-action="rename-worldbook"${worldbookBook ? '' : ' disabled'}>重命名</button><button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook"${worldbookBook ? '' : ' disabled'}>删除书</button></div></section>
-            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><input class="ctb-input" id="ctb-worldbook-search" placeholder="搜索条目名称、关键词或内容" value="${escapeHTML(worldbookSearch)}"><button type="button" class="ctb-button" data-action="filter-worldbook">筛选</button><button type="button" class="ctb-button" data-action="new-worldbook-entry"${worldbookBook ? '' : ' disabled'}>新条目</button><button type="button" class="ctb-button" data-action="sort-worldbook-priority">按优先级排序</button></div><div class="ctb-manager-grid"><div>${list}</div>${editor}</div></section>
-            <section class="ctb-section"><div class="ctb-section-title">批量条目操作 <span>已选 ${worldbookSelected.size} 条</span></div><div class="ctb-inline ctb-manager-toolbar"><select class="ctb-input" id="ctb-worldbook-transfer-target">${targets || '<option value="">没有其他世界书</option>'}</select><button type="button" class="ctb-button" data-action="copy-worldbook-entries"${worldbookSelected.size ? '' : ' disabled'}>复制到目标</button><button type="button" class="ctb-button" data-action="move-worldbook-entries"${worldbookSelected.size ? '' : ' disabled'}>移动到目标</button><button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook-entries"${worldbookSelected.size ? '' : ' disabled'}>批量删除</button></div></section>
-            <div class="ctb-inline ctb-manager-savebar"><span>${worldbookDirty ? '有尚未保存的修改' : '当前世界书已同步'}</span><button type="button" class="ctb-button ctb-save" data-action="save-worldbook"${worldbookBook && !worldbookSaving ? '' : ' disabled'}>${worldbookSaving ? '保存中…' : '保存世界书'}</button></div>`;
+        const editor = draft
+            ? `<div class="ctb-manager-editor">
+                <div class="ctb-section-title"><span>编辑条目 <em>UID ${escapeHTML(worldbookEditingUid)}</em></span><span data-worldbook-draft-status>${worldbookDraftDirty ? '当前条目有未暂存修改' : '已载入'}</span></div>
+                <input class="ctb-input" id="ctb-worldbook-comment" placeholder="条目名称/备注" value="${escapeHTML(draft.comment || '')}">
+                <input class="ctb-input" id="ctb-worldbook-keys" placeholder="关键词，用逗号分隔" value="${escapeHTML((Array.isArray(draft.key) ? draft.key : []).join(', '))}">
+                <input class="ctb-input" id="ctb-worldbook-keysecondary" placeholder="次要关键词（可选）" value="${escapeHTML((Array.isArray(draft.keysecondary) ? draft.keysecondary : []).join(', '))}">
+                <textarea class="ctb-input ctb-textarea ctb-manager-content" id="ctb-worldbook-content" placeholder="世界书内容">${escapeHTML(draft.content || '')}</textarea>
+                <div class="ctb-inline ctb-manager-fields">
+                    <label class="ctb-mini-field">优先级 <input class="ctb-input" id="ctb-worldbook-order" type="number" value="${escapeHTML(draft.order ?? 100)}"></label>
+                    <label class="ctb-mini-field">深度 <input class="ctb-input" id="ctb-worldbook-depth" type="number" min="0" value="${escapeHTML(draft.depth ?? 4)}"></label>
+                    <label class="ctb-mini-field">概率 <input class="ctb-input" id="ctb-worldbook-probability" type="number" min="0" max="100" value="${escapeHTML(draft.probability ?? 100)}"></label>
+                    <select class="ctb-input" id="ctb-worldbook-position">${positionOptions}</select>
+                    <input class="ctb-input ctb-worldbook-group" id="ctb-worldbook-group" placeholder="分组（可选）" value="${escapeHTML(draft.group || '')}">
+                    ${Number(draft.position) === 7 ? `<input class="ctb-input ctb-worldbook-outlet" id="ctb-worldbook-outlet" placeholder="出口名称（可选）" value="${escapeHTML(draft.outletName || '')}">` : ''}
+                </div>
+                <div class="ctb-inline ctb-manager-checks">
+                    <label class="ctb-check"><input id="ctb-worldbook-constant" type="checkbox"${draft.constant ? ' checked' : ''}> 常驻</label>
+                    <label class="ctb-check"><input id="ctb-worldbook-selective" type="checkbox"${draft.selective !== false ? ' checked' : ''}> 选择性</label>
+                    <label class="ctb-check"><input id="ctb-worldbook-disabled" type="checkbox"${draft.disable ? ' checked' : ''}> 禁用</label>
+                    <label class="ctb-check"><input id="ctb-worldbook-ignore-budget" type="checkbox"${draft.ignoreBudget ? ' checked' : ''}> 忽略预算</label>
+                </div>
+                <div class="ctb-inline ctb-manager-actions">
+                    <button type="button" class="ctb-button" data-action="discard-worldbook-entry">放弃本条修改</button>
+                    <button type="button" class="ctb-button ctb-primary" data-action="apply-worldbook-entry">暂存条目</button>
+                </div>
+            </div>`
+            : '<div class="ctb-world-empty">点击条目开始编辑。</div>';
+        const anchorSelect = ['before', 'after'].includes(anchorKind)
+            ? `<select class="ctb-input ctb-worldbook-anchor-uid" id="ctb-worldbook-transfer-anchor"${worldbookTransferTargetEntries.length ? '' : ' disabled'}>${targetAnchorOptions || '<option value="">目标暂无条目</option>'}</select>`
+            : '';
+        return `<section class="ctb-section">
+                <div class="ctb-section-title">世界书管理 ${infoButton('worldbook-save')}</div>
+                <div class="ctb-inline ctb-manager-toolbar">
+                    <select class="ctb-input" id="ctb-worldbook-book">${books || '<option value="">没有世界书</option>'}</select>
+                    <button type="button" class="ctb-button" data-action="refresh-worldbook">刷新</button>
+                    <button type="button" class="ctb-button" data-action="create-worldbook">新建书</button>
+                    <button type="button" class="ctb-button" data-action="rename-worldbook"${worldbookBook ? '' : ' disabled'}>重命名</button>
+                    <button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook"${worldbookBook ? '' : ' disabled'}>删除书</button>
+                </div>
+            </section>
+            <section class="ctb-section">
+                <div class="ctb-inline ctb-manager-toolbar">
+                    <input class="ctb-input" id="ctb-worldbook-search" placeholder="搜索条目名称、关键词或内容" value="${escapeHTML(worldbookSearch)}">
+                    <button type="button" class="ctb-button" data-action="filter-worldbook">筛选</button>
+                    <button type="button" class="ctb-button" data-action="new-worldbook-entry"${worldbookBook ? '' : ' disabled'}>新条目</button>
+                    <select class="ctb-input ctb-worldbook-sort" id="ctb-worldbook-sort-mode">
+                        <option value="priority"${worldbookSortMode === 'priority' ? ' selected' : ''}>显示：优先级顺序</option>
+                        <option value="manual"${worldbookSortMode === 'manual' ? ' selected' : ''}>显示：手动顺序</option>
+                    </select>
+                    <button type="button" class="ctb-button" data-action="open-worldbook-sort"${worldbookEntries.length && worldbookSortMode === 'priority' ? '' : ' disabled'}>分组排序</button>${infoButton('worldbook-sort', '', true)}
+                    <button type="button" class="ctb-button" data-action="commit-worldbook-priority"${worldbookEntries.length ? '' : ' disabled'}>按显示顺序写入优先级</button>
+                </div>
+                <div class="ctb-manager-grid"><div>${list}</div>${editor}</div>
+            </section>
+            <section class="ctb-section">
+                <div class="ctb-section-title">批量条目操作 <span data-worldbook-selected-count>已选 ${worldbookSelected.size} 条</span></div>
+                <div class="ctb-inline ctb-manager-toolbar">
+                    <select class="ctb-input" id="ctb-worldbook-transfer-target">${targets || '<option value="">没有其他世界书</option>'}</select>
+                    <select class="ctb-input ctb-worldbook-anchor-kind" id="ctb-worldbook-transfer-anchor-kind">
+                        <option value="top"${anchorKind === 'top' ? ' selected' : ''}>插入到目标最上方</option>
+                        <option value="before"${anchorKind === 'before' ? ' selected' : ''}>插入到指定条目前</option>
+                        <option value="after"${anchorKind === 'after' ? ' selected' : ''}>插入到指定条目后</option>
+                        <option value="bottom"${anchorKind === 'bottom' ? ' selected' : ''}>插入到目标最下方</option>
+                    </select>
+                    ${anchorSelect}
+                    <button type="button" class="ctb-button" data-action="copy-worldbook-entries" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>复制到目标</button>
+                    <button type="button" class="ctb-button" data-action="move-worldbook-entries" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>移动到目标</button>
+                    <button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook-entries" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>批量删除</button>
+                </div>
+                <div class="ctb-worldbook-transfer-hint">${worldbookTransferTargetLoading ? '正在读取目标条目…' : (worldbookTransferTarget ? `目标：${escapeHTML(worldbookTransferTarget)} · ${worldbookTransferTargetEntries.length} 条` : '选择目标世界书后可指定插入位置')}</div>
+            </section>
+            <div class="ctb-inline ctb-manager-savebar"><span data-worldbook-save-status>${worldbookDraftDirty ? '有未暂存修改' : (worldbookDirty ? '有尚未保存的修改' : '当前世界书已同步')}</span><button type="button" class="ctb-button ctb-save" data-action="save-worldbook"${worldbookBook && !worldbookSaving ? '' : ' disabled'}>${worldbookSaving ? '保存中…' : '保存世界书'}</button></div>${renderWorldbookSortModalV2()}`;
     }
 
     function getPresetTransferManager() {
@@ -2984,35 +3736,131 @@
         return deepClone(data);
     }
 
+    /*
+     * 预设条目模型
+     *
+     * SillyTavern 的 Chat Completion 预设有两个容易混淆的数组：
+     *   prompts: 条目实体
+     *   prompt_order: 多组发送顺序，其中 character_id=100001 才是主顺序。
+     *
+     * 旧版把新条目追加到每一组 prompt_order，导致顺序错乱；这里所有插入、
+     * 移动都只操作主顺序，删除时再清理其它组中已经失效的引用。
+     */
+    function presetTransferMode() {
+        return settings?.presetTransfer?.mode === 'dual' ? 'dual' : 'single';
+    }
+
     function presetEntryArrayInfo(document) {
         if (Array.isArray(document?.prompts)) return { key: 'prompts', entries: document.prompts };
         if (Array.isArray(document?.entries)) return { key: 'entries', entries: document.entries };
         throw new Error('所选预设没有可转移的提示词条目');
     }
 
+    function presetRawIdentifier(raw, index = 0) {
+        if (raw && typeof raw === 'object') {
+            const value = raw.identifier ?? raw.id ?? raw.uid;
+            if (value !== undefined && value !== null && String(value)) return String(value);
+        }
+        return `entry-${index}`;
+    }
+
+    function presetMainPromptOrder(document, create = false) {
+        if (!Array.isArray(document?.prompt_order)) {
+            if (!create) return null;
+            document.prompt_order = [];
+        }
+        let group = document.prompt_order.find((item) => Number(item?.character_id) === 100001);
+        if (!group && create) {
+            group = { character_id: 100001, order: [] };
+            document.prompt_order.unshift(group);
+        }
+        if (group && !Array.isArray(group.order)) group.order = [];
+        return group || null;
+    }
+
+    function presetSetRawIdentifier(raw, id, key = 'prompts') {
+        if (!raw || typeof raw !== 'object') return;
+        if (key === 'prompts' || Object.prototype.hasOwnProperty.call(raw, 'identifier') || !('id' in raw && !('uid' in raw))) {
+            raw.identifier = String(id);
+            if (key !== 'prompts' && Object.prototype.hasOwnProperty.call(raw, 'id')) delete raw.id;
+            return;
+        }
+        if (Object.prototype.hasOwnProperty.call(raw, 'id')) raw.id = String(id);
+        else raw.uid = String(id);
+    }
+
+    function presetEntryDisplayContent(raw) {
+        if (!raw || typeof raw !== 'object') return String(raw ?? '');
+        const value = raw.content ?? raw.prompt ?? raw.text ?? '';
+        return typeof value === 'string' ? value : JSON.stringify(value);
+    }
+
+    function presetEntryDisplayName(raw, index = 0) {
+        if (!raw || typeof raw !== 'object') return `条目 ${index + 1}`;
+        return String(raw.name || raw.comment || raw.title || raw.identifier || raw.id || `条目 ${index + 1}`);
+    }
+
     function presetTransferRecords(document) {
         const { entries } = presetEntryArrayInfo(document);
-        return entries.map((raw, index) => {
-            const value = raw && typeof raw === 'object' ? deepClone(raw) : { content: String(raw ?? '') };
-            const id = String(value.identifier ?? value.id ?? value.uid ?? `entry-${index}`);
-            return {
-                id,
-                index,
-                raw: value,
-                name: String(value.name || value.comment || value.identifier || `条目 ${index + 1}`),
-                content: String(value.content ?? value.system_prompt ?? value.prompt ?? ''),
-                marker: Boolean(value.marker),
-            };
+        const byId = new Map();
+        entries.forEach((raw, index) => {
+            const value = raw && typeof raw === 'object' ? raw : { content: String(raw ?? '') };
+            const id = presetRawIdentifier(value, index);
+            // Malformed presets occasionally contain duplicate identifiers. Keep the
+            // first one addressable and give the later row a deterministic display id.
+            if (!byId.has(id)) byId.set(id, { raw: value, index });
+            else byId.set(`${id}#${index}`, { raw: value, index });
         });
+        const records = [];
+        const seen = new Set();
+        const main = presetMainPromptOrder(document, false);
+        const append = (raw, index, id, orderItem, inserted) => {
+            const safeId = String(id);
+            const content = presetEntryDisplayContent(raw);
+            records.push({
+                id: safeId,
+                index,
+                orderIndex: orderItem?.__ctbOrderIndex ?? -1,
+                raw: deepClone(raw),
+                name: presetEntryDisplayName(raw, index),
+                content,
+                marker: Boolean(raw?.marker),
+                systemPrompt: Boolean(raw?.system_prompt),
+                enabled: orderItem ? orderItem.enabled !== false : raw?.enabled !== false,
+                inserted: Boolean(inserted),
+                locked: Boolean(raw?.marker),
+            });
+        };
+        if (main?.order?.length) {
+            main.order.forEach((orderItem, orderIndex) => {
+                const id = String(orderItem?.identifier ?? orderItem?.id ?? orderItem?.uid ?? '');
+                if (!id || seen.has(id)) return;
+                const found = byId.get(id);
+                if (!found) return;
+                const order = { ...orderItem, __ctbOrderIndex: orderIndex };
+                append(found.raw, found.index, id, order, true);
+                seen.add(id);
+            });
+        }
+        // Entries not present in the main order remain editable, but are shown after
+        // the effective order so they can be deliberately inserted at an anchor.
+        entries.forEach((raw, index) => {
+            const id = presetRawIdentifier(raw, index);
+            if (seen.has(id)) return;
+            append(raw, index, id, null, false);
+            seen.add(id);
+        });
+        return records;
     }
 
     function uniquePresetIdentifier(raw, existing) {
-        let id = String(raw.identifier ?? raw.id ?? raw.uid ?? `ctb-prompt-${Date.now().toString(36)}`);
+        const original = presetRawIdentifier(raw, 0);
+        let id = original || `ctb-prompt-${Date.now().toString(36)}`;
         if (!existing.has(id)) {
             existing.add(id);
             return id;
         }
-        const base = id.replace(/-\d+$/, '');
+        const base = id.replace(/-copy-\d+$/, '').replace(/-\d+$/, '') || 'ctb-prompt';
         let counter = 2;
         while (existing.has(`${base}-copy-${counter}`)) counter += 1;
         id = `${base}-copy-${counter}`;
@@ -3020,14 +3868,53 @@
         return id;
     }
 
-    function addPresetPromptOrder(document, identifier, enabled = true) {
-        if (!Array.isArray(document?.prompt_order)) return;
-        for (const orderGroup of document.prompt_order) {
-            if (!Array.isArray(orderGroup?.order)) continue;
-            if (!orderGroup.order.some((item) => String(item?.identifier) === String(identifier))) {
-                orderGroup.order.push({ identifier, enabled: enabled !== false });
-            }
+    function uniquePresetName(raw, existingNames) {
+        const original = presetEntryDisplayName(raw, 0) || '未命名条目';
+        if (!existingNames.has(original)) {
+            existingNames.add(original);
+            return original;
         }
+        let counter = 2;
+        let name = `${original}（副本）`;
+        while (existingNames.has(name)) name = `${original}（副本 ${counter++}）`;
+        existingNames.add(name);
+        return name;
+    }
+
+    function presetOrderIdentifier(item) {
+        return String(item?.identifier ?? item?.id ?? item?.uid ?? '');
+    }
+
+    function addPresetPromptOrder(document, identifier, enabled = true, anchor = { kind: 'bottom', anchorId: '' }) {
+        const group = presetMainPromptOrder(document, true);
+        if (!group) return;
+        const id = String(identifier);
+        group.order = group.order.filter((item) => presetOrderIdentifier(item) !== id);
+        const item = { identifier: id, enabled: enabled !== false };
+        let index = group.order.length;
+        if (anchor?.kind === 'top') index = 0;
+        else if (anchor?.kind === 'after' && anchor.anchorId) {
+            const anchorIndex = group.order.findIndex((entry) => presetOrderIdentifier(entry) === String(anchor.anchorId));
+            if (anchorIndex >= 0) index = anchorIndex + 1;
+        }
+        group.order.splice(index, 0, item);
+    }
+
+    function addPresetPromptOrders(document, items, anchor = { kind: 'bottom', anchorId: '' }) {
+        const group = presetMainPromptOrder(document, true);
+        if (!group) return;
+        const ids = new Set(items.map((item) => String(item.identifier)));
+        group.order = group.order.filter((item) => !ids.has(presetOrderIdentifier(item)));
+        let index = group.order.length;
+        if (anchor?.kind === 'top') index = 0;
+        else if (anchor?.kind === 'after' && anchor.anchorId) {
+            const anchorIndex = group.order.findIndex((entry) => presetOrderIdentifier(entry) === String(anchor.anchorId));
+            if (anchorIndex >= 0) index = anchorIndex + 1;
+        }
+        group.order.splice(index, 0, ...items.map((item) => ({
+            identifier: String(item.identifier),
+            enabled: item.enabled !== false,
+        })));
     }
 
     function removePresetPromptOrder(document, identifiers) {
@@ -3035,9 +3922,46 @@
         if (!Array.isArray(document?.prompt_order)) return;
         for (const orderGroup of document.prompt_order) {
             if (Array.isArray(orderGroup?.order)) {
-                orderGroup.order = orderGroup.order.filter((item) => !set.has(String(item?.identifier)));
+                orderGroup.order = orderGroup.order.filter((item) => !set.has(presetOrderIdentifier(item)));
             }
         }
+    }
+
+    function presetAnchorForOperation() {
+        const anchor = presetTransferAnchor || { kind: 'bottom', anchorId: '' };
+        if (anchor.kind === 'after' && !anchor.anchorId) return { kind: 'bottom', anchorId: '' };
+        if (anchor.kind === 'after' && presetTransferSelected.has(String(anchor.anchorId))) {
+            return { kind: 'bottom', anchorId: '' };
+        }
+        return { kind: anchor.kind, anchorId: String(anchor.anchorId || '') };
+    }
+
+    function presetSelectedRecords() {
+        const selected = presetTransferSourceEntries.filter((entry) => presetTransferSelected.has(String(entry.id)));
+        // Marker rows are structural entries, not user-transferable prompts.
+        return selected.filter((entry) => !entry.locked);
+    }
+
+    function presetInsertIndex(order, anchor) {
+        if (anchor?.kind === 'top') return 0;
+        if (anchor?.kind === 'after' && anchor.anchorId) {
+            const index = order.findIndex((item) => presetOrderIdentifier(item) === String(anchor.anchorId));
+            if (index >= 0) return index + 1;
+        }
+        return order.length;
+    }
+
+    function verifyPresetOperation(document, ids, { requireOrder = true } = {}) {
+        const expected = new Set([...ids].map(String));
+        const records = presetTransferRecords(document);
+        const actual = new Set(records.map((entry) => String(entry.id)));
+        for (const id of expected) if (!actual.has(id)) throw new Error(`保存校验失败：条目 ${id} 不存在`);
+        if (requireOrder) {
+            const order = presetMainPromptOrder(document, false)?.order || [];
+            const orderIds = new Set(order.map(presetOrderIdentifier));
+            for (const id of expected) if (!orderIds.has(id)) throw new Error(`保存校验失败：条目 ${id} 未进入主发送顺序`);
+        }
+        return document;
     }
 
     async function savePresetTransferDocument(manager, name, document) {
@@ -3056,7 +3980,7 @@
     }
 
     async function loadPresetTransfer({ force = false } = {}) {
-        if (presetTransferLoading) return;
+        if (presetTransferLoading && !force) return;
         presetTransferLoading = true;
         presetTransferError = '';
         renderPanel();
@@ -3066,10 +3990,14 @@
             if (!names.length) throw new Error('没有读取到可用预设');
             const savedSource = force ? presetTransferSource : (presetTransferSource || settings.presetTransfer.source);
             presetTransferSource = names.includes(savedSource) ? savedSource : names[0];
-            const targetCandidate = presetTransferTarget || settings.presetTransfer.target;
-            presetTransferTarget = names.includes(targetCandidate) && targetCandidate !== presetTransferSource
-                ? targetCandidate
-                : (names.find((name) => name !== presetTransferSource) || '');
+            if (presetTransferMode() === 'single') {
+                presetTransferTarget = '';
+            } else {
+                const targetCandidate = presetTransferTarget || settings.presetTransfer.target;
+                presetTransferTarget = names.includes(targetCandidate) && targetCandidate !== presetTransferSource
+                    ? targetCandidate
+                    : (names.find((name) => name !== presetTransferSource) || '');
+            }
             presetTransferSourceDocument = await loadPresetTransferDocument(manager, presetTransferSource);
             presetTransferSourceEntries = presetTransferRecords(presetTransferSourceDocument);
             if (presetTransferTarget) {
@@ -3080,6 +4008,8 @@
                 presetTransferTargetEntries = [];
             }
             presetTransferSelected = new Set();
+            presetTransferAnchor = { kind: 'bottom', anchorId: '' };
+            presetTransferDraft = null;
             presetTransferVisibleLimit = 120;
             settings.presetTransfer.apiId = presetTransferApi;
             settings.presetTransfer.source = presetTransferSource;
@@ -3095,8 +4025,14 @@
     }
 
     async function choosePresetTransferSide(side, name) {
-        if (side === 'source') presetTransferSource = String(name || '');
-        else presetTransferTarget = String(name || '');
+        const next = String(name || '');
+        if (side === 'source') {
+            const previousSource = presetTransferSource;
+            presetTransferSource = next;
+            if (presetTransferSource && presetTransferSource === presetTransferTarget) {
+                presetTransferTarget = previousSource && previousSource !== presetTransferSource ? previousSource : '';
+            }
+        } else presetTransferTarget = next;
         if (presetTransferSource && presetTransferSource === presetTransferTarget) {
             presetTransferError = '来源和目标不能是同一个预设';
             return renderPanel();
@@ -3104,47 +4040,130 @@
         return loadPresetTransfer({ force: true });
     }
 
+    async function swapPresetTransferSides() {
+        if (presetTransferMode() !== 'dual' || !presetTransferTarget) return;
+        const source = presetTransferSource;
+        presetTransferSource = presetTransferTarget;
+        presetTransferTarget = source;
+        presetTransferSelected = new Set();
+        presetTransferAnchor = { kind: 'bottom', anchorId: '' };
+        presetTransferDraft = null;
+        return loadPresetTransfer({ force: true });
+    }
+
+    async function setPresetTransferMode(mode) {
+        const next = mode === 'dual' ? 'dual' : 'single';
+        settings.presetTransfer.mode = next;
+        presetTransferSelected = new Set();
+        presetTransferAnchor = { kind: 'bottom', anchorId: '' };
+        presetTransferDraft = null;
+        if (next === 'single') presetTransferTarget = '';
+        saveSettings();
+        await loadPresetTransfer({ force: true });
+    }
+
+    function clonePresetEntriesIntoDocument(targetDocument, targetInfo, selected, anchor, { renameCopies = false } = {}) {
+        const existingIds = new Set(presetTransferRecords(targetDocument).map((entry) => String(entry.id)));
+        const existingNames = new Set(presetTransferRecords(targetDocument).map((entry) => String(entry.name)));
+        const clones = [];
+        for (const entry of selected) {
+            const raw = deepClone(entry.raw);
+            const id = uniquePresetIdentifier(raw, existingIds);
+            presetSetRawIdentifier(raw, id, targetInfo.key);
+            if (renameCopies) raw.name = uniquePresetName(raw, existingNames);
+            targetInfo.entries.push(raw);
+            clones.push({ identifier: id, enabled: entry.enabled !== false });
+        }
+        targetDocument[targetInfo.key] = targetInfo.entries;
+        addPresetPromptOrders(targetDocument, clones, anchor);
+        return clones.map((item) => String(item.identifier));
+    }
+
+    async function duplicatePresetEntriesInternal(selected) {
+        const manager = getPresetTransferManager();
+        const document = await loadPresetTransferDocument(manager, presetTransferSource);
+        const info = presetEntryArrayInfo(document);
+        const ids = clonePresetEntriesIntoDocument(document, info, selected, presetAnchorForOperation(), { renameCopies: true });
+        const verify = await savePresetTransferDocument(manager, presetTransferSource, document);
+        verifyPresetOperation(verify, ids);
+        return ids;
+    }
+
+    async function reorderPresetEntriesInternal(selected) {
+        const manager = getPresetTransferManager();
+        const document = await loadPresetTransferDocument(manager, presetTransferSource);
+        const group = presetMainPromptOrder(document, true);
+        const selectedIds = new Set(selected.map((entry) => String(entry.id)));
+        const selectedOrder = group.order.filter((item) => selectedIds.has(presetOrderIdentifier(item)));
+        // Uninserted entries can also be moved: use their current enabled state.
+        for (const entry of selected) {
+            if (!selectedOrder.some((item) => presetOrderIdentifier(item) === String(entry.id))) {
+                selectedOrder.push({ identifier: String(entry.id), enabled: entry.enabled !== false });
+            }
+        }
+        group.order = group.order.filter((item) => !selectedIds.has(presetOrderIdentifier(item)));
+        const index = presetInsertIndex(group.order, presetAnchorForOperation());
+        group.order.splice(index, 0, ...selectedOrder.map((item) => ({
+            identifier: presetOrderIdentifier(item),
+            enabled: item.enabled !== false,
+        })));
+        const verify = await savePresetTransferDocument(manager, presetTransferSource, document);
+        verifyPresetOperation(verify, selectedIds);
+        return selectedIds;
+    }
+
     async function transferPresetEntries(mode) {
-        const selected = presetTransferSourceEntries.filter((entry) => presetTransferSelected.has(entry.id));
+        const selected = presetSelectedRecords();
         if (!selected.length) return notify('请先勾选要处理的预设条目', 'warning');
+        if (presetTransferMode() === 'single') {
+            presetTransferLoading = true;
+            renderPanel();
+            try {
+                if (mode === 'copy') await duplicatePresetEntriesInternal(selected);
+                else await reorderPresetEntriesInternal(selected);
+                notify(`已在当前预设${mode === 'copy' ? '复制' : '移动'} ${selected.length} 个条目`, 'success');
+                await loadPresetTransfer({ force: true });
+            } catch (error) {
+                presetTransferError = error.message || String(error);
+                notify(`预设条目${mode === 'copy' ? '复制' : '移动'}失败：${error.message}`, 'error');
+            } finally {
+                presetTransferLoading = false;
+                renderPanel();
+            }
+            return;
+        }
         if (!presetTransferTarget || presetTransferTarget === presetTransferSource) return notify('请选择不同的目标预设', 'warning');
         presetTransferLoading = true;
         renderPanel();
+        let targetCommitted = false;
         try {
             const manager = getPresetTransferManager();
             const sourceDocument = await loadPresetTransferDocument(manager, presetTransferSource);
             const targetDocument = await loadPresetTransferDocument(manager, presetTransferTarget);
             const sourceInfo = presetEntryArrayInfo(sourceDocument);
             const targetInfo = presetEntryArrayInfo(targetDocument);
-            const selectedIds = new Set(selected.map((entry) => entry.id));
-            const existing = new Set(presetTransferRecords(targetDocument).map((entry) => entry.id));
-            for (const entry of selected) {
-                const raw = deepClone(entry.raw);
-                const originalId = String(raw.identifier ?? raw.id ?? raw.uid ?? entry.id);
-                const nextId = uniquePresetIdentifier(raw, existing);
-                if ('identifier' in raw || targetInfo.key === 'prompts') raw.identifier = nextId;
-                else if ('id' in raw) raw.id = nextId;
-                else raw.uid = nextId;
-                targetInfo.entries.push(raw);
-                addPresetPromptOrder(targetDocument, nextId, raw.enabled !== false);
-                if (nextId !== originalId && raw.name) raw.name = `${raw.name}（副本）`;
-            }
-            targetDocument[targetInfo.key] = targetInfo.entries;
-            await savePresetTransferDocument(manager, presetTransferTarget, targetDocument);
+            const selectedIds = new Set(selected.map((entry) => String(entry.id)));
+            const createdIds = clonePresetEntriesIntoDocument(targetDocument, targetInfo, selected, presetAnchorForOperation());
+            const targetVerify = await savePresetTransferDocument(manager, presetTransferTarget, targetDocument);
+            verifyPresetOperation(targetVerify, createdIds);
+            targetCommitted = true;
             if (mode === 'move') {
                 sourceInfo.entries = sourceInfo.entries.filter((raw, index) => {
-                    const id = String(raw?.identifier ?? raw?.id ?? raw?.uid ?? `entry-${index}`);
+                    const id = presetRawIdentifier(raw, index);
                     return !selectedIds.has(id);
                 });
                 sourceDocument[sourceInfo.key] = sourceInfo.entries;
                 removePresetPromptOrder(sourceDocument, selectedIds);
-                await savePresetTransferDocument(manager, presetTransferSource, sourceDocument);
+                const sourceVerify = await savePresetTransferDocument(manager, presetTransferSource, sourceDocument);
+                const remaining = new Set(presetTransferRecords(sourceVerify).map((entry) => String(entry.id)));
+                for (const id of selectedIds) if (remaining.has(id)) throw new Error(`来源预设仍保留条目 ${id}`);
             }
             notify(`已${mode === 'move' ? '移动' : '复制'} ${selected.length} 个预设条目`, 'success');
             await loadPresetTransfer({ force: true });
         } catch (error) {
             presetTransferError = error.message || String(error);
-            notify(`预设条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}`, 'error');
+            const suffix = targetCommitted && mode === 'move' ? '（目标已保存，来源未删除）' : '';
+            notify(`预设条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}${suffix}`, 'error');
         } finally {
             presetTransferLoading = false;
             renderPanel();
@@ -3152,7 +4171,7 @@
     }
 
     async function deletePresetEntries() {
-        const selected = presetTransferSourceEntries.filter((entry) => presetTransferSelected.has(entry.id));
+        const selected = presetSelectedRecords();
         if (!selected.length || !host.confirm(`确定从预设“${presetTransferSource}”删除选中的 ${selected.length} 个条目吗？`)) return;
         presetTransferLoading = true;
         renderPanel();
@@ -3161,7 +4180,7 @@
             const document = await loadPresetTransferDocument(manager, presetTransferSource);
             const info = presetEntryArrayInfo(document);
             const ids = new Set(selected.map((entry) => entry.id));
-            info.entries = info.entries.filter((raw, index) => !ids.has(String(raw?.identifier ?? raw?.id ?? raw?.uid ?? `entry-${index}`)));
+            info.entries = info.entries.filter((raw, index) => !ids.has(presetRawIdentifier(raw, index)));
             document[info.key] = info.entries;
             removePresetPromptOrder(document, ids);
             await savePresetTransferDocument(manager, presetTransferSource, document);
@@ -3176,10 +4195,107 @@
         }
     }
 
+    function startPresetEntryEdit(id) {
+        const entry = presetTransferSourceEntries.find((item) => String(item.id) === String(id));
+        if (!entry || entry.locked) return notify('内置标记不能直接编辑', 'warning');
+        presetTransferDraft = {
+            id: String(entry.id),
+            raw: deepClone(entry.raw),
+            enabled: entry.enabled !== false,
+        };
+        renderPanel();
+    }
+
+    async function savePresetEntryDraft() {
+        if (!presetTransferDraft) return;
+        const draft = presetTransferDraft;
+        const manager = getPresetTransferManager();
+        const document = await loadPresetTransferDocument(manager, presetTransferSource);
+        const info = presetEntryArrayInfo(document);
+        const index = info.entries.findIndex((raw, rawIndex) => presetRawIdentifier(raw, rawIndex) === draft.id);
+        if (index < 0) throw new Error('条目已不存在，无法保存');
+        const current = info.entries[index];
+        const next = deepClone(draft.raw);
+        // Keep any fields added by newer ST versions that the editor does not expose.
+        info.entries[index] = { ...(current && typeof current === 'object' ? current : {}), ...next };
+        document[info.key] = info.entries;
+        const group = presetMainPromptOrder(document, false);
+        if (group) {
+            const orderItem = group.order.find((item) => presetOrderIdentifier(item) === draft.id);
+            if (orderItem) orderItem.enabled = draft.enabled !== false;
+            else if (draft.enabled !== false) addPresetPromptOrder(document, draft.id, true, { kind: 'bottom', anchorId: '' });
+        } else if (draft.enabled !== false) {
+            addPresetPromptOrder(document, draft.id, true, { kind: 'bottom', anchorId: '' });
+        }
+        const verify = await savePresetTransferDocument(manager, presetTransferSource, document);
+        verifyPresetOperation(verify, [draft.id], { requireOrder: false });
+        presetTransferDraft = null;
+    }
+
+    async function commitPresetEntryDraft() {
+        if (!presetTransferDraft) return;
+        presetTransferLoading = true;
+        renderPanel();
+        try {
+            await savePresetEntryDraft();
+            notify('预设条目已保存', 'success');
+            await loadPresetTransfer({ force: true });
+        } catch (error) {
+            presetTransferError = error.message || String(error);
+            notify(`保存预设条目失败：${error.message}`, 'error');
+        } finally {
+            presetTransferLoading = false;
+            renderPanel();
+        }
+    }
+
+    function updatePresetTransferSelectionUi() {
+        const rootEl = root;
+        if (!rootEl) return;
+        const count = presetTransferSelected.size;
+        if (presetTransferAnchor?.kind === 'after' && presetTransferSelected.has(String(presetTransferAnchor.anchorId))) {
+            presetTransferAnchor = { kind: 'bottom', anchorId: '' };
+        }
+        rootEl.querySelectorAll('[data-preset-selection-count]').forEach((node) => { node.textContent = String(count); });
+        rootEl.querySelectorAll('[data-preset-bulk-action]').forEach((button) => {
+            const action = button.dataset.presetBulkAction;
+            let disabled = count === 0;
+            if (action === 'edit') disabled = count !== 1;
+            if (button.dataset.ctbNeedsTarget === 'true') disabled = disabled || !presetTransferTarget;
+            button.disabled = disabled || presetTransferLoading;
+        });
+        rootEl.querySelectorAll('[data-preset-anchor-id]').forEach((button) => {
+            button.disabled = presetTransferSelected.has(String(button.dataset.presetAnchorId));
+            const kind = button.dataset.presetAnchorKind;
+            const id = kind === 'after' ? String(button.dataset.presetAnchorId || '') : '';
+            button.classList.toggle('is-active', kind === presetTransferAnchor.kind && id === String(presetTransferAnchor.anchorId || ''));
+        });
+        rootEl.querySelectorAll('input[data-preset-entry-id]').forEach((input) => {
+            const id = String(input.dataset.presetEntryId);
+            input.checked = presetTransferSelected.has(id);
+            input.closest('.ctb-preset-entry')?.classList.toggle('is-selected', input.checked);
+        });
+    }
+
+    function presetCompareSummary(source, target) {
+        const left = new Map(source.filter((entry) => !entry.locked).map((entry) => [entry.name, entry]));
+        const right = new Map(target.filter((entry) => !entry.locked).map((entry) => [entry.name, entry]));
+        const rows = [];
+        left.forEach((entry, name) => {
+            if (!right.has(name)) rows.push({ kind: '仅来源', name, left: entry, right: null });
+            else if (presetEntryDisplayContent(entry) !== presetEntryDisplayContent(right.get(name))) {
+                rows.push({ kind: '内容不同', name, left: entry, right: right.get(name) });
+            }
+        });
+        right.forEach((entry, name) => { if (!left.has(name)) rows.push({ kind: '仅目标', name, left: null, right: entry }); });
+        return rows;
+    }
+
     function renderPresetTransferTab() {
         if (!presetTransferLoadedOnce && !presetTransferLoading) host.setTimeout(() => loadPresetTransfer(), 0);
         let names = [];
         try { names = presetTransferNames(getPresetTransferManager()); } catch (_) {}
+        const mode = presetTransferMode();
         const sourceOptions = names.map((name) => `<option value="${escapeHTML(name)}"${name === presetTransferSource ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
         const targetOptions = names.filter((name) => name !== presetTransferSource).map((name) => `<option value="${escapeHTML(name)}"${name === presetTransferTarget ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
         const query = presetTransferSearch.trim().toLowerCase();
@@ -3187,16 +4303,111 @@
         const target = presetTransferTargetEntries.filter((entry) => !query || `${entry.name}\n${entry.content}\n${entry.id}`.toLowerCase().includes(query));
         const visibleSource = source.slice(0, presetTransferVisibleLimit);
         const visibleTarget = target.slice(0, presetTransferVisibleLimit);
-        const sourceList = source.length ? visibleSource.map((entry) => `<label class="ctb-preset-entry${presetTransferSelected.has(entry.id) ? ' is-selected' : ''}"><input type="checkbox" data-preset-entry-id="${escapeHTML(entry.id)}"${presetTransferSelected.has(entry.id) ? ' checked' : ''}><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.replace(/\s+/g, ' ').slice(0, 110) || (entry.marker ? '（内置标记）' : '（空内容）'))}</small></span></label>`).join('') + (source.length > visibleSource.length ? `<button type="button" class="ctb-list-more" data-action="more-preset-transfer-entries">再显示 ${Math.min(120, source.length - visibleSource.length)} 条（共 ${source.length} 条）</button>` : '') : '<div class="ctb-world-empty">来源预设没有符合条件的条目。</div>';
-        const targetList = target.length ? visibleTarget.map((entry) => `<div class="ctb-preset-entry is-target"><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.replace(/\s+/g, ' ').slice(0, 110) || (entry.marker ? '（内置标记）' : '（空内容）'))}</small></span></div>`).join('') + (target.length > visibleTarget.length ? `<button type="button" class="ctb-list-more" data-action="more-preset-transfer-entries">再显示 ${Math.min(120, target.length - visibleTarget.length)} 条（共 ${target.length} 条）</button>` : '') : '<div class="ctb-world-empty">目标预设没有符合条件的条目。</div>';
-        return `<section class="ctb-section"><div class="ctb-section-title">预设条目转移 ${infoButton('preset-transfer')}</div><div class="ctb-hint">仅处理 Chat Completion 预设里的提示词条目；不会带入快照、正则、导入导出或其他功能。</div></section>
-            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><input class="ctb-input" id="ctb-preset-transfer-search" placeholder="搜索条目" value="${escapeHTML(presetTransferSearch)}"><button type="button" class="ctb-button" data-action="filter-preset-transfer">筛选</button><button type="button" class="ctb-button" data-action="refresh-preset-transfer">刷新预设</button></div>${presetTransferError ? `<div class="ctb-readonly-note ctb-world-error">${escapeHTML(presetTransferError)}</div>` : ''}</section>
-            <section class="ctb-section ctb-preset-transfer-grid"><div><div class="ctb-section-title">来源预设 <span>${presetTransferSourceEntries.length} 条</span></div><select class="ctb-input" id="ctb-preset-transfer-source">${sourceOptions || '<option value="">没有预设</option>'}</select><div class="ctb-preset-entry-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : sourceList}</div></div><div><div class="ctb-section-title">目标预设 <span>${presetTransferTargetEntries.length} 条</span></div><select class="ctb-input" id="ctb-preset-transfer-target">${targetOptions || '<option value="">没有其他预设</option>'}</select><div class="ctb-preset-entry-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : targetList}</div></div></section>
-            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><span class="ctb-hint">已选 ${presetTransferSelected.size} 条</span><button type="button" class="ctb-button ctb-primary" data-action="copy-preset-entries"${presetTransferSelected.size && presetTransferTarget && !presetTransferLoading ? '' : ' disabled'}>复制到目标</button><button type="button" class="ctb-button" data-action="move-preset-entries"${presetTransferSelected.size && presetTransferTarget && !presetTransferLoading ? '' : ' disabled'}>移动到目标</button><button type="button" class="ctb-button ctb-danger" data-action="delete-preset-entries"${presetTransferSelected.size && !presetTransferLoading ? '' : ' disabled'}>批量删除</button></div></section>`;
+        const entryText = (entry) => escapeHTML(entry.content.replace(/\s+/g, ' ').slice(0, 140) || (entry.marker ? '（内置标记）' : '（空内容）'));
+        const anchorButton = (kind, id = '', label = '') => {
+            const active = presetTransferAnchor?.kind === kind && String(presetTransferAnchor?.anchorId || '') === String(id || '');
+            const selectedAnchor = id && presetTransferSelected.has(String(id));
+            return `<button type="button" class="ctb-button ctb-preset-anchor${active ? ' is-active' : ''}" data-action="set-preset-anchor" data-preset-anchor-kind="${kind}" data-preset-anchor-id="${escapeHTML(id)}"${selectedAnchor ? ' disabled' : ''}>${label || (kind === 'top' ? '插到最前' : kind === 'bottom' ? '插到最后' : '插在此后')}</button>`;
+        };
+        const renderRows = (rows, side, { selectable = false, anchorable = false } = {}) => {
+            if (!rows.length) return '<div class="ctb-world-empty">没有符合条件的条目。</div>';
+            const top = anchorable ? anchorButton('top', '', '插到最前') : '';
+            const body = rows.slice(0, presetTransferVisibleLimit).map((entry) => {
+                const checked = presetTransferSelected.has(String(entry.id));
+                const checkbox = selectable ? `<input type="checkbox" data-preset-entry-id="${escapeHTML(entry.id)}"${checked ? ' checked' : ''}${entry.locked ? ' disabled' : ''}>` : '';
+                const edit = mode === 'single' && side === 'source' && !entry.locked
+                    ? `<button type="button" class="ctb-button ctb-preset-edit-entry" data-action="edit-preset-entry" data-preset-entry-id="${escapeHTML(entry.id)}">编辑</button>` : '';
+                const anchor = anchorable && !entry.locked ? anchorButton('after', entry.id, '在此后') : '';
+                return `<div class="ctb-preset-entry${checked ? ' is-selected' : ''}${entry.locked ? ' is-locked' : ''}"><div class="ctb-preset-entry-head">${checkbox}<button type="button" class="ctb-preset-entry-title" data-action="${edit ? 'edit-preset-entry' : 'noop'}" data-preset-entry-id="${escapeHTML(entry.id)}">${escapeHTML(entry.name)}</button><span class="ctb-preset-entry-status">${entry.inserted ? (entry.enabled ? '启用' : '停用') : '未加入主顺序'}</span></div><div class="ctb-preset-entry-preview">${entryText(entry)}</div><div class="ctb-preset-entry-actions">${edit}${anchor}</div></div>`;
+            }).join('');
+            const more = rows.length > presetTransferVisibleLimit ? `<button type="button" class="ctb-list-more" data-action="more-preset-transfer-entries">再显示 ${Math.min(120, rows.length - presetTransferVisibleLimit)} 条（共 ${rows.length} 条）</button>` : '';
+            return `${top}${body}${more}${anchorable ? anchorButton('bottom', '', '插到最后') : ''}`;
+        };
+        const sourceList = renderRows(source, 'source', { selectable: true, anchorable: mode === 'single' });
+        const targetList = renderRows(target, 'target', { selectable: false, anchorable: true });
+        const draft = presetTransferDraft;
+        const editor = mode === 'single' ? `<div class="ctb-preset-editor"><div class="ctb-section-title">内部编辑</div>${draft ? `<label class="ctb-field"><span>名称</span><input class="ctb-input" id="ctb-preset-draft-name" value="${escapeHTML(draft.raw?.name || draft.raw?.comment || '')}"></label><label class="ctb-field"><span>角色</span><select class="ctb-input" id="ctb-preset-draft-role"><option value="system"${draft.raw?.role === 'system' ? ' selected' : ''}>system</option><option value="user"${draft.raw?.role === 'user' ? ' selected' : ''}>user</option><option value="assistant"${draft.raw?.role === 'assistant' ? ' selected' : ''}>assistant</option></select></label><label class="ctb-field"><span>内容</span><textarea class="ctb-input ctb-preset-draft-content" id="ctb-preset-draft-content">${escapeHTML(presetEntryDisplayContent(draft.raw))}</textarea></label><label class="ctb-check"><input type="checkbox" id="ctb-preset-draft-enabled"${draft.enabled !== false ? ' checked' : ''}>加入主发送顺序并启用</label><div class="ctb-inline"><button type="button" class="ctb-button ctb-primary" data-action="save-preset-edit">保存条目</button><button type="button" class="ctb-button" data-action="cancel-preset-edit">取消</button></div>` : '<div class="ctb-readonly-note">选择一条普通提示词后点击“编辑”。</div>'}</div>` : '';
+        const compareRows = mode === 'dual' ? presetCompareSummary(source, target) : [];
+        const comparePreview = (entry) => entry ? escapeHTML(presetEntryDisplayContent(entry).replace(/\s+/g, ' ').slice(0, 280) || '（空内容）') : '—';
+        const compare = mode === 'dual' && presetCompareOpen ? `<div class="ctb-preset-compare-list">${compareRows.length ? compareRows.slice(0, 120).map((row) => `<div class="ctb-preset-compare-row"><div class="ctb-preset-compare-title"><span>${escapeHTML(row.kind)}</span><strong>${escapeHTML(row.name)}</strong></div><div class="ctb-preset-compare-side"><small>来源</small><p>${comparePreview(row.left)}</p></div><div class="ctb-preset-compare-side"><small>目标</small><p>${comparePreview(row.right)}</p></div></div>`).join('') : '<div class="ctb-readonly-note">两个预设没有名称相同但内容不同的条目。</div>'}</div>` : '';
+        const dualControls = mode === 'dual' ? `<button type="button" class="ctb-button ctb-primary" data-preset-bulk-action="copy" data-ctb-needs-target="true" data-action="copy-preset-entries"${presetTransferSelected.size && presetTransferTarget && !presetTransferLoading ? '' : ' disabled'}>复制到目标</button><button type="button" class="ctb-button" data-preset-bulk-action="move" data-ctb-needs-target="true" data-action="move-preset-entries"${presetTransferSelected.size && presetTransferTarget && !presetTransferLoading ? '' : ' disabled'}>移动到目标</button>` : `<button type="button" class="ctb-button" data-preset-bulk-action="edit" data-action="edit-selected-preset-entry"${presetTransferSelected.size === 1 && !presetTransferLoading ? '' : ' disabled'}>编辑选中</button><button type="button" class="ctb-button ctb-primary" data-preset-bulk-action="copy" data-action="copy-preset-entries"${presetTransferSelected.size && !presetTransferLoading ? '' : ' disabled'}>复制到锚点</button><button type="button" class="ctb-button" data-preset-bulk-action="move" data-action="move-preset-entries"${presetTransferSelected.size && !presetTransferLoading ? '' : ' disabled'}>移动到锚点</button>`;
+        return `<section class="ctb-section"><div class="ctb-section-title">预设条目转移 ${infoButton('preset-transfer')}</div></section>
+            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><button type="button" class="ctb-button${mode === 'single' ? ' ctb-primary' : ''}" data-action="set-preset-transfer-mode" data-mode="single">单预设编辑</button><button type="button" class="ctb-button${mode === 'dual' ? ' ctb-primary' : ''}" data-action="set-preset-transfer-mode" data-mode="dual">双预设对比/转移</button>${mode === 'dual' ? '<button type="button" class="ctb-button" data-action="swap-preset-sides">交换左右</button>' : ''}<input class="ctb-input" id="ctb-preset-transfer-search" placeholder="搜索条目" value="${escapeHTML(presetTransferSearch)}"><button type="button" class="ctb-button" data-action="filter-preset-transfer">筛选</button><button type="button" class="ctb-button" data-action="refresh-preset-transfer">刷新预设</button>${mode === 'dual' ? `<button type="button" class="ctb-button" data-action="toggle-preset-compare">${presetCompareOpen ? '隐藏差异' : `比较差异${compareRows.length ? `（${compareRows.length}）` : ''}`}</button>` : ''}</div>${presetTransferError ? `<div class="ctb-readonly-note ctb-world-error">${escapeHTML(presetTransferError)}</div>` : ''}</section>
+            <section class="ctb-section ctb-preset-transfer-grid${mode === 'single' ? ' is-single' : ''}"><div><div class="ctb-section-title">${mode === 'single' ? '当前预设' : '来源预设'} <span>${presetTransferSourceEntries.length} 条</span></div><select class="ctb-input" id="ctb-preset-transfer-source">${sourceOptions || '<option value="">没有预设</option>'}</select><div class="ctb-preset-entry-list" data-ctb-scroll-key="preset-source-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : sourceList}</div>${editor}</div>${mode === 'dual' ? `<div><div class="ctb-section-title">目标预设 <span>${presetTransferTargetEntries.length} 条</span></div><select class="ctb-input" id="ctb-preset-transfer-target">${targetOptions || '<option value="">没有其他预设</option>'}</select><div class="ctb-preset-entry-list" data-ctb-scroll-key="preset-target-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : targetList}</div></div>` : ''}</section>${compare}
+            <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><span>已选 <span data-preset-selection-count>${presetTransferSelected.size}</span> 条</span>${dualControls}<button type="button" class="ctb-button ctb-danger" data-preset-bulk-action="delete" data-action="delete-preset-entries"${presetTransferSelected.size && !presetTransferLoading ? '' : ' disabled'}>批量删除</button></div></section>`;
     }
 
-    function renderPanel() {
+    function rememberPanelScroll(tab = activeTab) {
         if (!root || root.hidden) return;
+        const body = root.querySelector('.ctb-body');
+        const tabs = root.querySelector('.ctb-tabs');
+        if (tabs) panelTabsScrollLeft = tabs.scrollLeft;
+        const nodes = {};
+        root.querySelectorAll('[data-ctb-scroll-key]').forEach((node) => {
+            nodes[node.dataset.ctbScrollKey] = { top: node.scrollTop, left: node.scrollLeft };
+        });
+        panelScrollState.set(tab, {
+            bodyTop: body?.scrollTop || 0,
+            bodyLeft: body?.scrollLeft || 0,
+            tabsLeft: tabs?.scrollLeft || 0,
+            nodes,
+        });
+    }
+
+    function restorePanelScroll(tab = activeTab) {
+        const state = panelScrollState.get(tab);
+        if (!root) return;
+        const apply = () => {
+            const body = root.querySelector('.ctb-body');
+            const tabs = root.querySelector('.ctb-tabs');
+            if (state && body) { body.scrollTop = state.bodyTop; body.scrollLeft = state.bodyLeft; }
+            if (tabs) {
+                tabs.scrollLeft = panelTabsScrollLeft;
+                const active = tabs.querySelector('.ctb-tab.is-active');
+                if (active) {
+                    const left = active.offsetLeft;
+                    const right = left + active.offsetWidth;
+                    const viewportLeft = tabs.scrollLeft;
+                    const viewportRight = viewportLeft + tabs.clientWidth;
+                    if (left < viewportLeft) tabs.scrollLeft = left;
+                    else if (right > viewportRight) tabs.scrollLeft = right - tabs.clientWidth;
+                    panelTabsScrollLeft = tabs.scrollLeft;
+                }
+            }
+            if (state) {
+                root.querySelectorAll('[data-ctb-scroll-key]').forEach((node) => {
+                    const saved = state.nodes?.[node.dataset.ctbScrollKey];
+                    if (saved) { node.scrollTop = saved.top; node.scrollLeft = saved.left; }
+                });
+            }
+        };
+        apply();
+        (host.requestAnimationFrame || ((callback) => host.setTimeout(callback, 0)))(apply);
+        host.setTimeout(apply, 60);
+    }
+
+    function updateSelectionUi(kind) {
+        if (!root) return;
+        const isPreset = kind === 'preset';
+        const selected = isPreset ? presetTransferSelected : worldbookSelected;
+        const count = selected.size;
+        root.querySelectorAll(`[data-${kind}-selection-count]`).forEach((node) => {
+            node.textContent = `已选 ${count} 条`;
+        });
+        root.querySelectorAll(`[data-${kind}-bulk-action]`).forEach((node) => {
+            const needsTarget = node.dataset.ctbNeedsTarget === 'true';
+            node.disabled = !count || (needsTarget && !presetTransferTarget);
+        });
+    }
+
+    function renderPanel({ remember = true } = {}) {
+        if (!root || root.hidden) return;
+        // When switching tabs the old DOM still occupies the root. Remembering
+        // it under the *new* tab would overwrite that tab's own scroll state
+        // and make the tab click appear to jump back to the top.
+        if (remember) rememberPanelScroll(activeTab);
+        theaterRenderCache.clear();
+        theaterRenderSequence = 0;
         const total = getRows().length;
         const modules = ensureActiveTab();
         const renderers = {
@@ -3218,7 +4429,25 @@
             <main class="ctb-body">${body}${renderInfoPopup()}</main>
             ${renderTransientNotice()}
             ${renderConfirmDialog()}
-        </div>`;
+        </div>${renderTheaterReader()}`;
+        hydrateTheaterOutputs();
+        restorePanelScroll(activeTab);
+        if (theaterReader) {
+            (host.requestAnimationFrame || ((callback) => host.setTimeout(callback, 0)))(() => {
+                root?.querySelector('.ctb-reader-header .ctb-close')?.focus?.({ preventScroll: true });
+            });
+        }
+    }
+
+    function handleGlobalKeydown(event) {
+        if (event.key !== 'Escape' || !theaterReader || destroyed) return;
+        // The reader close button receives focus after opening, but mobile
+        // keyboards and host dialogs can move focus outside the toolbox.  A
+        // document-level capture listener keeps Escape reliable in both cases.
+        event.preventDefault();
+        event.stopPropagation();
+        theaterReader = null;
+        renderPanel();
     }
 
     function createUI() {
@@ -3227,10 +4456,22 @@
         doc.getElementById(FLOAT_ID)?.remove();
         doc.getElementById(ENTRY_ID)?.remove();
         doc.getElementById(SETTINGS_ID)?.remove();
+        doc.getElementById('ctb-v080-style')?.remove();
+        doc.getElementById('ctb-v080-root')?.remove();
+        doc.getElementById('ctb-v080-float')?.remove();
+        doc.getElementById('ctb-v080-menu-entry')?.remove();
+        doc.querySelectorAll('[id$="-extension-settings"]').forEach((node) => {
+            if (node !== doc.getElementById(SETTINGS_ID) && node.id.startsWith('ctb-v')) node.remove();
+        });
         doc.getElementById('ctb-v020-style')?.remove();
         doc.getElementById('ctb-v020-root')?.remove();
         doc.getElementById('ctb-v020-float')?.remove();
         doc.getElementById('ctb-v020-menu-entry')?.remove();
+        doc.getElementById('ctb-v080-extension-settings')?.remove();
+        doc.getElementById('ctb-v080-style')?.remove();
+        doc.getElementById('ctb-v080-root')?.remove();
+        doc.getElementById('ctb-v080-float')?.remove();
+        doc.getElementById('ctb-v080-menu-entry')?.remove();
         // 旧版查找替换脚本可能没有成功执行 destroy，顺手清掉遗留节点，避免出现双悬浮按钮。
         doc.getElementById('chat-search-replace-style-v010')?.remove();
         doc.getElementById('chat-search-replace-panel-v010')?.remove();
@@ -3350,13 +4591,18 @@
             #${ROOT_ID} .ctb-notice-title{margin-bottom:7px;font-size:13px;font-weight:700;} #${ROOT_ID} .ctb-notice-message{margin-bottom:12px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;}
             #${ROOT_ID} .ctb-confirm-actions{justify-content:flex-end;}
             #${ROOT_ID} .ctb-tabs{display:flex;overflow-x:auto;scrollbar-width:thin;} #${ROOT_ID} .ctb-tab{flex:0 0 calc(100% / var(--ctb-tab-count,4));min-width:92px;}
-            #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history summary{cursor:pointer;color:#5e6268;font-size:11px;} #${ROOT_ID} .ctb-theater-history pre{max-height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);}
+            #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-theater-render{display:block;min-height:1.2em;color:inherit;font:inherit;line-height:1.55;} #${ROOT_ID} .ctb-theater-history-list{max-height:365px;overflow:auto;padding-right:2px;scrollbar-width:thin;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;color:#6e7278;font-size:10px;} #${ROOT_ID} .ctb-theater-history-body{max-height:120px;overflow:hidden;color:#4e5257;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history-actions{justify-content:flex-end;flex-wrap:wrap;margin-top:6px;} #${ROOT_ID} .ctb-theater-history-tabs{margin:5px 0 7px;} #${ROOT_ID} .ctb-reader-overlay{position:fixed;inset:0;z-index:2147483150;display:grid;place-items:center;padding:10px;background:rgba(18,21,27,.5);} #${ROOT_ID} .ctb-reader-card{width:min(1100px,calc(100vw - 20px));height:calc(100vh - 20px);height:calc(100dvh - 20px);max-height:900px;display:flex;flex-direction:column;overflow:hidden;border:1px solid #bfc3c8;border-radius:4px;background:#f5f5f7;box-shadow:0 18px 48px rgba(0,0,0,.38);} #${ROOT_ID} .ctb-reader-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #d3d5d9;background:#fafafd;color:#4c5056;font-size:12px;font-weight:700;} #${ROOT_ID} .ctb-reader-content{flex:1;min-height:0;overflow:auto;padding:15px;background:#f0f0f2;color:#42464c;font:12px/1.65 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-reader-content .ctb-theater-render{min-height:100%;} 
             #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:7px;margin-top:7px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-row{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border-bottom:1px solid #d5d7da;padding:5px 7px;} #${ROOT_ID} .ctb-manager-row:last-child{border-bottom:0;} #${ROOT_ID} .ctb-manager-row.is-active{background:#dfe8e2;} #${ROOT_ID} .ctb-manager-row>button{display:flex;min-width:0;flex-direction:column;align-items:flex-start;border:0;background:transparent;color:#50545a;text-align:left;cursor:pointer;} #${ROOT_ID} .ctb-manager-row strong,#${ROOT_ID} .ctb-manager-row small{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-manager-row small,#${ROOT_ID} .ctb-manager-row>span{color:#85898e;font-size:9px;} #${ROOT_ID} .ctb-manager-editor{display:grid;align-content:start;gap:6px;padding:8px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:sticky;bottom:-15px;justify-content:space-between;margin:10px -16px -15px;padding:8px 16px;border-top:1px solid #cdd0d4;background:#ececef;color:#697069;font-size:11px;}
-            #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:grid;grid-template-columns:16px minmax(0,1fr);align-items:start;gap:6px;padding:7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry.is-target{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
+            #${ROOT_ID} .ctb-manager-row{grid-template-columns:18px 18px minmax(0,1fr) auto;min-height:38px;} #${ROOT_ID} .ctb-manager-row.is-selected{background:#e0e9e3;} #${ROOT_ID} .ctb-manager-row.is-disabled{opacity:.58;} #${ROOT_ID} .ctb-manager-row.is-dragging{opacity:.45;} #${ROOT_ID} .ctb-manager-row>button{gap:2px;padding:0;} #${ROOT_ID} .ctb-manager-row .ctb-worldbook-name{max-width:100%;overflow:hidden;color:#50545a;font-size:11px;font-weight:500;line-height:1.25;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-manager-row small{max-width:100%;overflow:hidden;color:#85898e;font-size:9px;font-weight:400;line-height:1.25;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-worldbook-meta{color:#85898e;font-size:9px;line-height:1.35;text-align:right;white-space:nowrap;} #${ROOT_ID} .ctb-worldbook-drag{display:inline-flex;align-items:center;justify-content:center;color:#8a8f94;font-size:13px;letter-spacing:-3px;cursor:grab;user-select:none;} #${ROOT_ID} .ctb-worldbook-drag:active{cursor:grabbing;} #${ROOT_ID} .ctb-worldbook-drag.is-disabled{opacity:.35;cursor:default;} #${ROOT_ID} .ctb-manager-editor .ctb-section-title{justify-content:space-between;gap:6px;font-size:12px;} #${ROOT_ID} .ctb-manager-editor .ctb-section-title em{font-size:9px;font-style:normal;font-weight:400;color:#85898e;} #${ROOT_ID} .ctb-manager-editor .ctb-section-title>span:last-child{font-size:9px;font-weight:400;color:#8b8f92;} #${ROOT_ID} .ctb-manager-checks{flex-wrap:wrap;gap:5px 10px;} #${ROOT_ID} .ctb-worldbook-group{min-width:120px;flex:1;} #${ROOT_ID} .ctb-worldbook-outlet{min-width:140px;flex:1;} #${ROOT_ID} .ctb-worldbook-anchor-kind{min-width:145px;} #${ROOT_ID} .ctb-worldbook-anchor-uid{min-width:150px;} #${ROOT_ID} .ctb-worldbook-transfer-hint{margin-top:5px;color:#85898e;font-size:9px;line-height:1.4;}
+            #${ROOT_ID} .ctb-worldbook-group-header{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:4px 7px;border-bottom:1px solid #d0d4d7;background:#e2e4e6;color:#676c72;font-size:9px;font-weight:600;letter-spacing:.02em;} #${ROOT_ID} .ctb-worldbook-group-header small{color:#8a8e93;font-size:8px;font-weight:400;}
+            #${ROOT_ID} .ctb-worldbook-sort-overlay{position:fixed;inset:0;z-index:2147483140;display:grid;place-items:center;padding:12px;background:rgba(18,21,27,.42);} #${ROOT_ID} .ctb-worldbook-sort-modal{width:min(620px,calc(100vw - 24px));max-height:min(82dvh,680px);display:flex;flex-direction:column;overflow:hidden;border:1px solid #c6cbd0;border-radius:4px;background:#f5f5f7;box-shadow:0 18px 45px rgba(0,0,0,.3);} #${ROOT_ID} .ctb-worldbook-sort-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;border-bottom:1px solid #d3d6da;color:#4e5359;font-size:12px;font-weight:600;} #${ROOT_ID} .ctb-worldbook-sort-head small{margin-left:5px;color:#858a90;font-size:9px;font-weight:400;} #${ROOT_ID} .ctb-worldbook-sort-body{min-height:0;overflow:auto;padding:8px;background:#ececef;} #${ROOT_ID} .ctb-worldbook-sort-group{margin-bottom:7px;border:1px solid #cfd3d7;border-radius:3px;background:#f2f2f4;} #${ROOT_ID} .ctb-worldbook-sort-group:last-child{margin-bottom:0;} #${ROOT_ID} .ctb-worldbook-sort-group>header{display:flex;justify-content:space-between;padding:5px 7px;border-bottom:1px solid #d6d8dc;color:#656a70;font-size:10px;font-weight:600;} #${ROOT_ID} .ctb-worldbook-sort-group>header small{color:#8a8e93;font-size:9px;font-weight:400;} #${ROOT_ID} .ctb-worldbook-sort-item{display:grid;grid-template-columns:30px minmax(0,1fr) 28px 28px;align-items:center;gap:5px;padding:4px 6px;border-bottom:1px solid #dfe1e4;color:#555a60;font-size:10px;} #${ROOT_ID} .ctb-worldbook-sort-item:last-child{border-bottom:0;} #${ROOT_ID} .ctb-worldbook-sort-order{color:#8a8e93;text-align:center;font-variant-numeric:tabular-nums;} #${ROOT_ID} .ctb-worldbook-sort-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-worldbook-sort-name small{display:inline-block;margin-left:6px;color:#8b8f94;font-size:8px;} #${ROOT_ID} .ctb-worldbook-sort-foot{display:flex;justify-content:flex-end;gap:6px;padding:8px 10px;border-top:1px solid #d3d6da;background:#f7f7f9;}
+            #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:grid;grid-template-columns:16px minmax(0,1fr);align-items:start;gap:6px;padding:7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry.is-target{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
+            #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;} #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.62;} #${ROOT_ID} .ctb-preset-entry-head{display:flex;align-items:center;gap:6px;min-width:0;} #${ROOT_ID} .ctb-preset-entry-head>input{flex:0 0 auto;margin:0;} #${ROOT_ID} .ctb-preset-entry-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:#50545a;font:11px/1.35 var(--mainFontFamily,Arial,sans-serif);font-weight:500;text-align:left;cursor:pointer;} #${ROOT_ID} .ctb-preset-entry-preview{margin:2px 0 0 20px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#85898e;font-size:9px;line-height:1.35;} #${ROOT_ID} .ctb-preset-entry-status{display:block!important;flex-direction:initial!important;margin-left:auto;flex:0 0 auto;color:#85898e;font-size:9px;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry-actions{display:flex;justify-content:flex-end;gap:4px;margin-top:3px;} #${ROOT_ID} .ctb-preset-entry-actions .ctb-button{padding:2px 6px;font-size:9px;} #${ROOT_ID} .ctb-preset-anchor{padding:3px 6px;font-size:9px;} #${ROOT_ID} .ctb-preset-anchor.is-active{border-color:#7da287;background:#dfe8e2;color:#466b51;} #${ROOT_ID} .ctb-preset-editor{display:grid;align-content:start;gap:5px;margin-top:7px;padding:7px;border:1px solid #cfd2d6;background:#ececef;} #${ROOT_ID} .ctb-preset-editor .ctb-field{display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:5px;font-size:10px;} #${ROOT_ID} .ctb-preset-editor .ctb-field>span{color:#697078;} #${ROOT_ID} .ctb-preset-draft-content{min-height:150px;height:150px;resize:vertical;line-height:1.45;} #${ROOT_ID} .ctb-preset-compare-list{max-height:260px;overflow:auto;margin:0 12px 7px;border:1px solid #cfd2d6;background:#ececef;} #${ROOT_ID} .ctb-preset-compare-row{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(0,1fr) minmax(0,1fr);gap:7px;padding:6px 7px;border-bottom:1px solid #d5d7da;font-size:10px;} #${ROOT_ID} .ctb-preset-compare-title{display:flex;flex-direction:column;gap:2px;min-width:0;} #${ROOT_ID} .ctb-preset-compare-title span{color:#85898e;font-size:9px;} #${ROOT_ID} .ctb-preset-compare-title strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#50545a;font-size:10px;font-weight:600;} #${ROOT_ID} .ctb-preset-compare-side{min-width:0;padding-left:6px;border-left:1px solid #d5d7da;} #${ROOT_ID} .ctb-preset-compare-side small{color:#85898e;font-size:9px;} #${ROOT_ID} .ctb-preset-compare-side p{margin:2px 0 0;overflow:hidden;color:#5b6066;line-height:1.4;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;}
             #${ROOT_ID} .ctb-list-more{display:block;width:100%;border:0;border-top:1px solid #d1d4d7;background:#e1e3e5;color:#697078;padding:7px;cursor:pointer;font:10px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-list-more:hover{background:#d8ddda;}
-            #${SETTINGS_ID}{margin:10px 0;border:1px solid var(--SmartThemeBorderColor,#777);border-radius:5px;background:rgba(255,255,255,.04);color:var(--SmartThemeBodyColor,inherit);} #${SETTINGS_ID}>summary{display:flex;align-items:center;gap:8px;padding:9px 11px;cursor:pointer;font-weight:700;} #${SETTINGS_ID}>summary span{margin-left:auto;color:var(--SmartThemeEmColor,#999);font-size:11px;font-weight:400;} #${SETTINGS_ID} .ctb-extension-settings-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:4px 12px 12px;} #${SETTINGS_ID} .ctb-extension-settings-title,#${SETTINGS_ID} p{grid-column:1/-1;} #${SETTINGS_ID} .ctb-extension-settings-title{font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;} #${SETTINGS_ID} p{margin:4px 0 0;color:var(--SmartThemeEmColor,#999);font-size:11px;line-height:1.45;}
+            #${SETTINGS_ID}{display:block!important;clear:both;margin:10px 0;border:1px solid var(--SmartThemeBorderColor,#777);border-radius:5px;background:rgba(255,255,255,.04);color:var(--SmartThemeBodyColor,inherit);} #${SETTINGS_ID} .ctb-extension-settings-header{display:flex;align-items:center;gap:8px;min-height:36px;padding:9px 11px;cursor:pointer;font-weight:700;} #${SETTINGS_ID} .ctb-extension-settings-header b{display:inline-flex;align-items:center;gap:7px;} #${SETTINGS_ID} .ctb-settings-version{margin-left:auto;color:var(--SmartThemeEmColor,#999);font-size:11px;font-weight:400;} #${SETTINGS_ID} .ctb-settings-chevron{margin-left:2px;transition:transform .15s;} #${SETTINGS_ID} .ctb-settings-chevron.down{transform:rotate(180deg);} #${SETTINGS_ID} .ctb-extension-settings-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:8px 12px 12px;border-top:1px solid rgba(127,132,140,.22);} #${SETTINGS_ID} .ctb-extension-settings-body[hidden]{display:none!important;} #${SETTINGS_ID} .ctb-extension-settings-title,#${SETTINGS_ID} p{grid-column:1/-1;} #${SETTINGS_ID} .ctb-extension-settings-title{font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;} #${SETTINGS_ID} p{margin:4px 0 0;color:var(--SmartThemeEmColor,#999);font-size:11px;line-height:1.45;}
             @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-grid,#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
-            @media (max-width:560px){#${ROOT_ID} .ctb-manager-grid,#${ROOT_ID} .ctb-preset-transfer-grid{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:-12px;margin-right:-12px;padding-left:12px;padding-right:12px;}#${SETTINGS_ID} .ctb-extension-settings-body{grid-template-columns:1fr;}}
+            @media (max-width:560px){#${ROOT_ID} .ctb-manager-grid,#${ROOT_ID} .ctb-preset-transfer-grid,#${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-preset-compare-side{padding-left:0;border-left:0;border-top:1px solid #d5d7da;padding-top:4px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:-12px;margin-right:-12px;padding-left:12px;padding-right:12px;}#${SETTINGS_ID} .ctb-extension-settings-body{grid-template-columns:1fr;}}
+            @media (max-width:560px){#${ROOT_ID} .ctb-worldbook-sort,#${ROOT_ID} .ctb-worldbook-anchor-kind,#${ROOT_ID} .ctb-worldbook-anchor-uid{min-width:0;flex-basis:100%;}#${ROOT_ID} .ctb-worldbook-meta{font-size:8px;}#${ROOT_ID} .ctb-manager-row{grid-template-columns:16px 16px minmax(0,1fr) auto;padding-left:5px;padding-right:5px;}}
         `;
         doc.head.appendChild(style);
 
@@ -3365,10 +4611,47 @@
         root.hidden = true;
         root.addEventListener('click', (event) => {
             if (event.target === root) closePanel();
+            if (event.target.classList?.contains('ctb-reader-overlay')) {
+                theaterReader = null;
+                renderPanel();
+            }
         });
         root.addEventListener('input', handleInput);
         root.addEventListener('change', handleChange);
+        root.addEventListener('dragstart', (event) => {
+            const handle = event.target.closest('[data-worldbook-drag-uid]');
+            if (!handle || worldbookSortMode !== 'manual') return;
+            worldbookDragUid = String(handle.dataset.worldbookDragUid);
+            event.dataTransfer?.setData('text/plain', worldbookDragUid);
+            event.dataTransfer?.setDragImage(handle, 8, 8);
+            handle.closest('[data-worldbook-row-uid]')?.classList.add('is-dragging');
+        });
+        root.addEventListener('dragover', (event) => {
+            if (worldbookDragUid) event.preventDefault();
+        });
+        root.addEventListener('drop', (event) => {
+            const row = event.target.closest('[data-worldbook-row-uid]');
+            if (!row || !worldbookDragUid) return;
+            event.preventDefault();
+            reorderWorldbookEntryV2(worldbookDragUid, row.dataset.worldbookRowUid);
+            worldbookDragUid = '';
+        });
+        root.addEventListener('dragend', (event) => {
+            event.target.closest('[data-worldbook-row-uid]')?.classList.remove('is-dragging');
+            worldbookDragUid = '';
+        });
         root.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && theaterReader) {
+                event.preventDefault();
+                theaterReader = null;
+                renderPanel();
+                return;
+            }
+            if (event.key === 'Escape' && worldbookSortModalOpen) {
+                event.preventDefault();
+                cancelWorldbookSortModalV2();
+                return;
+            }
             if (event.key === 'Enter' && event.target?.id === 'ctb-query') {
                 event.preventDefault();
                 executeSearch();
@@ -3427,12 +4710,32 @@
         else if (id === 'ctb-theater-context-floors') settings.theater.contextFloors = target.value;
         else if (id === 'ctb-theater-context-tags') settings.theater.contextTags = target.value;
         else if (id === 'ctb-worldbook-search') { worldbookSearch = target.value; return; }
-        else if (id === 'ctb-worldbook-comment' && worldbookDraft) { worldbookDraft.comment = target.value; worldbookDirty = true; return; }
-        else if (id === 'ctb-worldbook-keys' && worldbookDraft) { worldbookDraft.key = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); worldbookDirty = true; return; }
-        else if (id === 'ctb-worldbook-content' && worldbookDraft) { worldbookDraft.content = target.value; worldbookDirty = true; return; }
-        else if (id === 'ctb-worldbook-order' && worldbookDraft) { worldbookDraft.order = Number(target.value) || 0; worldbookDirty = true; return; }
-        else if (id === 'ctb-worldbook-depth' && worldbookDraft) { worldbookDraft.depth = Number(target.value) || 0; worldbookDirty = true; return; }
+        else if (id === 'ctb-worldbook-comment' && worldbookDraft) { worldbookDraft.comment = target.value; markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-keys' && worldbookDraft) { worldbookDraft.key = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-keysecondary' && worldbookDraft) { worldbookDraft.keysecondary = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-content' && worldbookDraft) { worldbookDraft.content = target.value; markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-order' && worldbookDraft) { worldbookDraft.order = Number(target.value) || 0; markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-depth' && worldbookDraft) { worldbookDraft.depth = Math.max(0, Number(target.value) || 0); markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-probability' && worldbookDraft) { worldbookDraft.probability = Math.max(0, Math.min(100, Number(target.value) || 0)); markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-group' && worldbookDraft) { worldbookDraft.group = target.value; markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-outlet' && worldbookDraft) { worldbookDraft.outletName = target.value; markWorldbookDraftDirtyV2(); return; }
         else if (id === 'ctb-preset-transfer-search') { presetTransferSearch = target.value; return; }
+        else if (id === 'ctb-preset-draft-name' && presetTransferDraft) {
+            presetTransferDraft.raw.name = target.value;
+            return;
+        }
+        else if (id === 'ctb-preset-draft-content' && presetTransferDraft) {
+            // Chat Completion prompts normally use `content`; preserve the
+            // original field shape for older preset variants.
+            if (Object.prototype.hasOwnProperty.call(presetTransferDraft.raw, 'content')) {
+                presetTransferDraft.raw.content = target.value;
+            } else if (Object.prototype.hasOwnProperty.call(presetTransferDraft.raw, 'prompt')) {
+                presetTransferDraft.raw.prompt = target.value;
+            } else {
+                presetTransferDraft.raw.content = target.value;
+            }
+            return;
+        }
         else if (target.dataset.channelId) {
             const channel = channelEditor?.draft?.id === target.dataset.channelId ? channelEditor.draft : null;
             if (!channel) return;
@@ -3475,14 +4778,16 @@
             const uid = String(target.dataset.worldbookSelectUid);
             if (target.checked) worldbookSelected.add(uid);
             else worldbookSelected.delete(uid);
-            renderPanel();
+            syncWorldbookSelectionUI();
             return;
         }
         else if (target.dataset.presetEntryId !== undefined) {
             const idValue = String(target.dataset.presetEntryId);
             if (target.checked) presetTransferSelected.add(idValue);
             else presetTransferSelected.delete(idValue);
-            renderPanel();
+            // Do not rebuild the panel here: rebuilding loses the list's
+            // scroll position and made selecting an entry jump to the top.
+            updatePresetTransferSelectionUi();
             return;
         }
         else if (id === 'ctb-rewrite-world-book') {
@@ -3499,21 +4804,55 @@
         }
         else if (id === 'ctb-worldbook-transfer-target') {
             worldbookTransferTarget = target.value;
+            worldbookTransferAnchor = { kind: 'bottom', anchorUid: '' };
+            await loadWorldbookTransferTargetV2(target.value);
+            return;
+        }
+        else if (id === 'ctb-worldbook-sort-mode') {
+            worldbookSortMode = target.value === 'manual' ? 'manual' : 'priority';
+            settings.worldbook.sortMode = worldbookSortMode;
+            saveSettings();
+            worldbookEntries = currentWorldbookView();
+            renderPanel();
+            return;
+        }
+        else if (id === 'ctb-worldbook-transfer-anchor-kind') {
+            const kind = ['top', 'before', 'after', 'bottom'].includes(target.value) ? target.value : 'bottom';
+            worldbookTransferAnchor = {
+                kind,
+                anchorUid: ['before', 'after'].includes(kind) ? String(worldbookTransferAnchor.anchorUid || worldbookTransferTargetEntries[0]?.uid || '') : '',
+            };
+            renderPanel();
+            return;
+        }
+        else if (id === 'ctb-worldbook-transfer-anchor') {
+            worldbookTransferAnchor.anchorUid = String(target.value || '');
             return;
         }
         else if (id === 'ctb-worldbook-position' && worldbookDraft) {
             worldbookDraft.position = Number(target.value) || 0;
-            worldbookDirty = true;
+            markWorldbookDraftDirtyV2();
+            renderPanel();
             return;
         }
         else if (id === 'ctb-worldbook-constant' && worldbookDraft) {
             worldbookDraft.constant = target.checked;
-            worldbookDirty = true;
+            markWorldbookDraftDirtyV2();
+            return;
+        }
+        else if (id === 'ctb-worldbook-selective' && worldbookDraft) {
+            worldbookDraft.selective = target.checked;
+            markWorldbookDraftDirtyV2();
             return;
         }
         else if (id === 'ctb-worldbook-disabled' && worldbookDraft) {
             worldbookDraft.disable = target.checked;
-            worldbookDirty = true;
+            markWorldbookDraftDirtyV2();
+            return;
+        }
+        else if (id === 'ctb-worldbook-ignore-budget' && worldbookDraft) {
+            worldbookDraft.ignoreBudget = target.checked;
+            markWorldbookDraftDirtyV2();
             return;
         }
         else if (id === 'ctb-preset-transfer-source') {
@@ -3522,6 +4861,14 @@
         }
         else if (id === 'ctb-preset-transfer-target') {
             await choosePresetTransferSide('target', target.value);
+            return;
+        }
+        else if (id === 'ctb-preset-draft-role' && presetTransferDraft) {
+            presetTransferDraft.raw.role = target.value;
+            return;
+        }
+        else if (id === 'ctb-preset-draft-enabled' && presetTransferDraft) {
+            presetTransferDraft.enabled = target.checked;
             return;
         }
         else if (id === 'ctb-postEdit-channel') {
@@ -3600,7 +4947,11 @@
             case 'cancel-dialog': pendingConfirm = null; return renderPanel();
             case 'show-info': infoMessage = infoMessage === data.infoKey ? null : data.infoKey; return renderPanel();
             case 'close-info': infoMessage = null; return renderPanel();
-            case 'tab': infoMessage = null; activeTab = data.tab; return renderPanel();
+            case 'tab':
+                rememberPanelScroll(activeTab);
+                infoMessage = null;
+                activeTab = data.tab;
+                return renderPanel({ remember: false });
             case 'jump-floor': return jumpToFloor(ui.floor);
             case 'open-bookmark': ui.bookmarkEditing = true; ui.bookmarkName = ui.bookmarkName || (ui.floor !== '' ? `楼层 ${ui.floor}` : ''); return renderPanel();
             case 'cancel-bookmark': ui.bookmarkEditing = false; return renderPanel();
@@ -3696,8 +5047,22 @@
             case 'run-theater': return runTheater();
             case 'preview-theater-prompt': return previewTheaterPrompt();
             case 'close-theater-preview': theaterPromptPreview = ''; return renderPanel();
-            case 'use-theater-history': return loadTheaterHistory(data.historyIndex);
-            case 'refresh-worldbook': return loadWorldbookManager({ force: true, book: worldbookBook });
+            case 'set-theater-history-view': theaterHistoryView = data.theaterView === 'favorites' ? 'favorites' : 'recent'; return renderPanel();
+            case 'use-theater-history': return loadTheaterHistory(data.theaterId, data.theaterSource);
+            case 'toggle-theater-favorite': return toggleTheaterFavorite(data.theaterId, data.theaterSource);
+            case 'delete-theater-history': return deleteTheaterHistory(data.theaterId, data.theaterSource);
+            case 'open-theater-reader': {
+                const item = theaterRecordById(data.theaterId, data.theaterSource);
+                if (item) theaterReader = { title: item.prompt || item.time || '小剧场阅读', output: item.output || '' };
+                return renderPanel();
+            }
+            case 'open-theater-current-reader':
+                theaterReader = { title: settings.theater.prompt || '小剧场阅读', output: theaterResult };
+                return renderPanel();
+            case 'close-theater-reader': theaterReader = null; return renderPanel();
+            case 'refresh-worldbook':
+                if (!canDiscardWorldbookChangesV2()) return renderPanel();
+                return loadWorldbookManager({ force: true, book: worldbookBook });
             case 'create-worldbook': return createWorldbookBook();
             case 'rename-worldbook': return renameWorldbookBook();
             case 'delete-worldbook': return deleteWorldbookBook();
@@ -3706,9 +5071,12 @@
             case 'more-worldbook-entries': worldbookVisibleLimit += 120; return renderPanel();
             case 'edit-worldbook-entry': return editWorldbookEntry(data.worldbookUid);
             case 'apply-worldbook-entry': return applyWorldbookDraft();
-            case 'sort-worldbook-priority':
-                worldbookEntries.sort((left, right) => Number(right.raw?.order || 0) - Number(left.raw?.order || 0) || worldbookRecordLabel(left).localeCompare(worldbookRecordLabel(right)));
-                return renderPanel();
+            case 'discard-worldbook-entry': return discardWorldbookDraftV2();
+            case 'open-worldbook-sort': return openWorldbookSortModalV2();
+            case 'move-worldbook-sort-entry': return moveWorldbookSortModalEntryV2(data.worldbookUid, data.worldbookSortDelta);
+            case 'save-worldbook-sort': return saveWorldbookSortModalV2();
+            case 'cancel-worldbook-sort': return cancelWorldbookSortModalV2();
+            case 'commit-worldbook-priority': return applyWorldbookVisualOrderToPriority();
             case 'save-worldbook': return saveCurrentWorldbook();
             case 'copy-worldbook-entries': return transferWorldbookEntries('copy');
             case 'move-worldbook-entries': return transferWorldbookEntries('move');
@@ -3716,6 +5084,22 @@
             case 'refresh-preset-transfer': return loadPresetTransfer({ force: true });
             case 'filter-preset-transfer': presetTransferVisibleLimit = 120; return renderPanel();
             case 'more-preset-transfer-entries': presetTransferVisibleLimit += 120; return renderPanel();
+            case 'set-preset-transfer-mode': return setPresetTransferMode(data.mode);
+            case 'swap-preset-sides': return swapPresetTransferSides();
+            case 'toggle-preset-compare': presetCompareOpen = !presetCompareOpen; return renderPanel();
+            case 'set-preset-anchor':
+                presetTransferAnchor = {
+                    kind: data.presetAnchorKind === 'top' ? 'top' : data.presetAnchorKind === 'after' ? 'after' : 'bottom',
+                    anchorId: data.presetAnchorKind === 'after' ? String(data.presetAnchorId || '') : '',
+                };
+                return renderPanel();
+            case 'edit-preset-entry': return startPresetEntryEdit(data.presetEntryId);
+            case 'edit-selected-preset-entry': {
+                const id = [...presetTransferSelected][0];
+                return id ? startPresetEntryEdit(id) : undefined;
+            }
+            case 'save-preset-edit': return commitPresetEntryDraft();
+            case 'cancel-preset-edit': presetTransferDraft = null; return renderPanel();
             case 'copy-preset-entries': return transferPresetEntries('copy');
             case 'move-preset-entries': return transferPresetEntries('move');
             case 'delete-preset-entries': return deletePresetEntries();
@@ -3744,30 +5128,62 @@
 
     function findExtensionsSettingsRoot() {
         const selectors = [
-            '#extensions_settings2 .inline-drawer-content',
-            '#extensions_settings2',
-            '#extensions_settings .inline-drawer-content',
             '#extensions_settings',
+            '#extensions_settings2',
             '.extensions_settings',
         ];
+        const candidates = [];
         for (const selector of selectors) {
-            const node = doc.querySelector(selector);
-            if (node && !node.closest(`#${ROOT_ID}`)) return node;
+            doc.querySelectorAll(selector).forEach((node) => {
+                if (node.id !== SETTINGS_ID && !node.closest(`#${ROOT_ID}`) && !candidates.includes(node)) candidates.push(node);
+            });
         }
-        return null;
+        // The Extensions drawer is often `display:none` until the user opens
+        // it.  Injecting only into a visible node made the feature switches
+        // disappear entirely on first load.  Prefer a visible root, but keep
+        // a connected hidden root as a reliable fallback; the panel becomes
+        // visible together with the host drawer.
+        return candidates.find((node) => node.isConnected && !node.hidden && node.getClientRects?.().length)
+            || candidates.find((node) => node.isConnected && !node.hidden)
+            || candidates.find((node) => node.isConnected)
+            || null;
     }
 
     function injectExtensionSettings() {
         if (destroyed || !doc.body) return false;
         const target = findExtensionsSettingsRoot();
         if (!target) return false;
-        let panel = doc.getElementById(SETTINGS_ID);
-        if (panel && panel.parentElement === target) return true;
+        const duplicatePanels = [...doc.querySelectorAll(`#${SETTINGS_ID}`)];
+        let panel = duplicatePanels.find((node) => node.parentElement === target) || duplicatePanels[0] || null;
+        const kept = panel;
+        duplicatePanels.forEach((node) => { if (node !== kept) node.remove(); });
+        const signature = `${VERSION}|${MODULES.map((module) => `${module.key}:${settings.modules?.[module.key] !== false ? 1 : 0}`).join(',')}`;
+        if (panel && panel.dataset.ctbSettingsSignature === signature) {
+            panel.hidden = false;
+            if (panel.parentElement !== target) target.appendChild(panel);
+            return true;
+        }
         if (!panel) {
-            panel = doc.createElement('details');
+            panel = doc.createElement('div');
             panel.id = SETTINGS_ID;
             panel.className = 'ctb-extension-settings';
-            panel.open = false;
+            panel.dataset.open = 'true';
+            panel.addEventListener('click', (event) => {
+                const toggle = event.target.closest('[data-ctb-settings-toggle]');
+                if (!toggle) return;
+                panel.dataset.open = panel.dataset.open === 'false' ? 'true' : 'false';
+                const body = panel.querySelector('.ctb-extension-settings-body');
+                const icon = panel.querySelector('.ctb-settings-chevron');
+                if (body) body.hidden = panel.dataset.open === 'false';
+                icon?.classList.toggle('down', panel.dataset.open !== 'false');
+                toggle.setAttribute('aria-expanded', panel.dataset.open !== 'false' ? 'true' : 'false');
+            });
+            panel.addEventListener('keydown', (event) => {
+                const toggle = event.target.closest('[data-ctb-settings-toggle]');
+                if (!toggle || !['Enter', ' '].includes(event.key)) return;
+                event.preventDefault();
+                toggle.click();
+            });
             panel.addEventListener('change', (event) => {
                 const input = event.target.closest('[data-ctb-module]');
                 if (!input) return;
@@ -3780,7 +5196,21 @@
                 injectExtensionSettings();
             });
         }
-        panel.innerHTML = `<summary><i class="fa-solid fa-toolbox"></i> 聊天工具箱 <span>v${VERSION}</span></summary><div class="ctb-extension-settings-body"><div class="ctb-extension-settings-title">功能开关</div>${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"${settings.modules?.[module.key] !== false ? ' checked' : ''}> <span>${module.label}</span></label>`).join('')}<p>关闭后只隐藏对应功能页；三条杠菜单中的“聊天工具箱”入口始终保留。</p></div>`;
+        const isOpen = panel.dataset.open !== 'false';
+        panel.className = 'ctb-extension-settings';
+        panel.hidden = false;
+        panel.dataset.ctbSettingsSignature = signature;
+        panel.innerHTML = `
+            <div class="ctb-extension-settings-header" data-ctb-settings-toggle role="button" tabindex="0" aria-expanded="${isOpen}">
+                <b><i class="fa-solid fa-toolbox"></i> 聊天工具箱</b>
+                <span class="ctb-settings-version">v${VERSION}</span>
+                <div class="ctb-settings-chevron fa-solid fa-circle-chevron-down${isOpen ? ' down' : ''}"></div>
+            </div>
+            <div class="ctb-extension-settings-body"${isOpen ? '' : ' hidden'}>
+                <div class="ctb-extension-settings-title">功能开关</div>
+                ${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"${settings.modules?.[module.key] !== false ? ' checked' : ''}> <span>${module.label}</span></label>`).join('')}
+                <p>关闭后只隐藏对应功能页；三条杠菜单中的“聊天工具箱”入口始终保留。</p>
+            </div>`;
         if (panel.parentElement !== target) target.appendChild(panel);
         return true;
     }
@@ -3798,15 +5228,39 @@
             entry.innerHTML = '<i class="fa-lg fa-solid fa-toolbox"></i><span>聊天工具箱</span>';
             entry.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); showPanel('search'); });
         }
-        if (menu.lastElementChild !== entry) menu.appendChild(entry);
+        if (entry.parentElement !== menu) menu.appendChild(entry);
         return true;
+    }
+
+    function scheduleHostInjection() {
+        if (destroyed || injectionTimer) return;
+        injectionTimer = host.setTimeout(() => {
+            injectionTimer = null;
+            injectMenuEntry();
+            injectExtensionSettings();
+        }, 180);
     }
 
     function registerSlashCommand() {
         try {
+            commandHandler = () => {
+                if (!destroyed) showPanel('search');
+            };
+            // The parser keeps command objects beyond an extension reload.
+            // Reusing one stable callback prevents old closures from retaining
+            // a destroyed panel; a new instance simply replaces this handler.
+            host[COMMAND_HANDLER_KEY] = commandHandler;
+            if (host[COMMAND_REGISTERED_KEY]) return;
             const parser = host.SillyTavern?.SlashCommandParser;
             const command = host.SillyTavern?.SlashCommand;
-            if (parser && command?.fromProps) parser.addCommandObject(command.fromProps({ name: 'chat-toolbox', callback: () => showPanel('search'), helpString: '打开聊天工具箱' }));
+            if (parser && command?.fromProps) {
+                parser.addCommandObject(command.fromProps({
+                    name: 'chat-toolbox',
+                    callback: (...args) => host[COMMAND_HANDLER_KEY]?.(...args),
+                    helpString: '打开聊天工具箱',
+                }));
+                host[COMMAND_REGISTERED_KEY] = true;
+            }
         } catch (_) {}
     }
 
@@ -3814,7 +5268,21 @@
         if (destroyed) return;
         destroyed = true;
         stopSearchSaveClock();
+        if (injectionTimer) host.clearTimeout(injectionTimer);
+        injectionTimer = null;
         menuObserver?.disconnect();
+        if (onPageHide) host.removeEventListener('pagehide', onPageHide);
+        if (onUnload) host.removeEventListener('unload', onUnload);
+        host.removeEventListener('keydown', handleGlobalKeydown, true);
+        onPageHide = null;
+        onUnload = null;
+        if (host[COMMAND_HANDLER_KEY] === commandHandler) {
+            host[COMMAND_HANDLER_KEY] = null;
+        }
+        commandHandler = null;
+        theaterReader = null;
+        theaterRenderCache.clear();
+        theaterHistory = [];
         doc.getElementById(STYLE_ID)?.remove();
         doc.getElementById(ROOT_ID)?.remove();
         doc.getElementById(FLOAT_ID)?.remove();
@@ -3828,7 +5296,7 @@
         const context = getContext();
         if ((!context || !context.extensionSettings) && initAttempts++ < 30) return host.setTimeout(init, 100);
         settings = loadSettings();
-        theaterHistory = Array.isArray(settings.theater?.history) ? settings.theater.history : [];
+        theaterHistory = [];
         presetTransferApi = settings.presetTransfer?.apiId || 'openai';
         presetTransferSource = settings.presetTransfer?.source || '';
         presetTransferTarget = settings.presetTransfer?.target || '';
@@ -3836,18 +5304,18 @@
         createUI();
         injectMenuEntry();
         injectExtensionSettings();
-        host.setTimeout(injectMenuEntry, 800);
-        host.setTimeout(injectExtensionSettings, 900);
-        host.setTimeout(injectMenuEntry, 2200);
-        host.setTimeout(injectExtensionSettings, 2300);
-        menuObserver = new MutationObserver(() => {
-            injectMenuEntry();
-            injectExtensionSettings();
-        });
-        menuObserver.observe(doc.body, { childList: true, subtree: true });
+        host.setTimeout(scheduleHostInjection, 800);
+        host.setTimeout(scheduleHostInjection, 900);
+        host.setTimeout(scheduleHostInjection, 2200);
+        host.setTimeout(scheduleHostInjection, 2300);
+        menuObserver = new MutationObserver(() => scheduleHostInjection());
+        menuObserver.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
         registerSlashCommand();
-        host.addEventListener('pagehide', destroy, { once: true });
-        host.addEventListener('unload', destroy, { once: true });
+        onPageHide = destroy;
+        onUnload = destroy;
+        host.addEventListener('pagehide', onPageHide, { once: true });
+        host.addEventListener('unload', onUnload, { once: true });
+        host.addEventListener('keydown', handleGlobalKeydown, true);
         host[INSTANCE_KEY] = destroy;
         console.info(`[聊天工具箱] v${VERSION} 已加载`);
     }
