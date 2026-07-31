@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.6.0
+// @version      0.7.0
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改与逐段改写
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -40,6 +40,10 @@
     let results = [];
     let currentResultIndex = -1;
     let infoMessage = null;
+    // Keep plugin notifications inside the toolbox so API/save errors do not
+    // leak into SillyTavern's page-level toastr layer while the panel is open.
+    let notice = null;
+    let noticeTimer = null;
     let lastUndo = null; // 只在本页脚本内存中保留一份；不会写入聊天文件或 localStorage。
     let dirtyChanges = new Map();
     let searchSaveState = { saving: false, phase: '', startedAt: 0 };
@@ -47,6 +51,10 @@
     let postEditDraft = null;
     let postEditLoading = false;
     let postEditEditing = false;
+    let postEditReview = [];
+    let postEditReviewEditingIndex = -1;
+    let postEditPromptPreview = '';
+    let postEditPreviewLoading = false;
     let channelLoadingId = '';
     let channelEditor = null;
     let rewriteDraft = null;
@@ -62,6 +70,8 @@
     let rewriteWorldBook = '';
     const rewriteWorldEntryCache = new Map();
     let initAttempts = 0;
+    let transientNotice = null;
+    let pendingConfirm = null;
     let settings = defaults();
     const ui = {
         query: '',
@@ -109,6 +119,7 @@
                 channelId: 'main',
                 tag: 'content',
                 floor: '',
+                systemPrompt: defaultPostEditSystemPrompt(),
                 rules: '',
                 selectedPresetId: '',
                 presetName: '',
@@ -118,6 +129,7 @@
                 channelId: 'main',
                 tag: 'content',
                 floor: '',
+                systemPrompt: defaultRewriteSystemPrompt(),
                 contextFloors: 4,
                 contextTags: '',
                 includeCharacter: true,
@@ -203,8 +215,28 @@
 
     function notify(message, level = 'info') {
         const toastr = host.toastr;
+        if (root && !root.hidden) {
+            transientNotice = { message: String(message), level: String(level || 'info') };
+            renderPanel();
+            const snapshot = transientNotice;
+            host.setTimeout(() => {
+                if (transientNotice === snapshot) {
+                    transientNotice = null;
+                    renderPanel();
+                }
+            }, level === 'error' ? 9000 : 4200);
+            return;
+        }
         if (toastr && typeof toastr[level] === 'function') toastr[level](message);
         else console.log(`[聊天工具箱] ${message}`);
+    }
+
+    function defaultPostEditSystemPrompt() {
+        return '你是中文文学文本的词句修订器。逐段检查正文，只修改词句表达，不续写剧情，不新增或删减事实、人物、事件、对白含义与段落顺序。对每一段都给出修改原因，并返回可直接替换的完整修订正文。只输出 JSON，不输出 Markdown。';
+    }
+
+    function defaultRewriteSystemPrompt() {
+        return '你是中文小说的精确段落改写器。理解给出的剧情和设定，但只改写明确列出的段落；不得续写、删改事实、改变人物关系或段落顺序。每个 replacement 必须对应一个原段落，可以保留段内换行，但不要额外创建段落。只输出 JSON：{"changes":[{"paragraph":2,"replacement":"改写后的完整段落"}]}。必须为每个请求段落返回一项，不要输出分析或 Markdown。';
     }
 
     function infoButton(key, extraClass = '', inline = false) {
@@ -219,6 +251,17 @@
     function renderInfoPopup() {
         if (!infoMessage || !INFO[infoMessage]) return '';
         return `<div class="ctb-info-popup" role="status"><span>${escapeHTML(INFO[infoMessage])}</span><button type="button" data-action="close-info" aria-label="关闭说明">×</button></div>`;
+    }
+
+    function renderTransientNotice() {
+        if (!transientNotice) return '';
+        const tone = transientNotice.level === 'error' ? 'error' : transientNotice.level === 'warning' ? 'warning' : transientNotice.level === 'success' ? 'success' : 'info';
+        return `<div class="ctb-notice-overlay" role="alertdialog" aria-modal="true"><div class="ctb-notice-card is-${tone}"><div class="ctb-notice-title">${tone === 'error' ? '插件错误' : tone === 'warning' ? '提示' : tone === 'success' ? '已完成' : '聊天工具箱'}</div><div class="ctb-notice-message">${escapeHTML(transientNotice.message)}</div><button type="button" class="ctb-button ctb-primary" data-action="close-notice">知道了</button></div></div>`;
+    }
+
+    function renderConfirmDialog() {
+        if (!pendingConfirm) return '';
+        return `<div class="ctb-notice-overlay" role="dialog" aria-modal="true"><div class="ctb-notice-card is-warning"><div class="ctb-notice-title">${escapeHTML(pendingConfirm.title || '请确认')}</div><div class="ctb-notice-message">${escapeHTML(pendingConfirm.message)}</div><div class="ctb-inline ctb-confirm-actions"><button type="button" class="ctb-button ctb-primary" data-action="confirm-dialog">确认</button><button type="button" class="ctb-button" data-action="cancel-dialog">取消</button></div></div></div>`;
     }
 
     function escapeHTML(value) {
@@ -384,83 +427,18 @@
         }
 
         try {
-            const found = [];
-            const regex = ui.regex ? compileRegex(query) : null;
-            for (const row of getRows()) {
-                const value = fieldValue(row, ui.scope);
-                if (!value) continue;
-                let occurrence = 0;
-                if (regex) {
-                    regex.lastIndex = 0;
-                    for (const match of value.matchAll(regex)) {
-                        const matched = match[0] ?? '';
-                        const start = match.index ?? 0;
-                        occurrence += 1;
-                        found.push({ ...row, scope: ui.scope, start, length: matched.length, match: matched, preview: previewFor(value, start, matched.length), regex: true, occurrence });
-                        if (found.length >= MAX_RESULTS) break;
-                        // 对空匹配留给 matchAll 的规范推进；这里避免异常输入把界面塞满。
-                        if (!matched && start >= value.length) break;
-                    }
-                } else {
-                    const needle = query.toLocaleLowerCase();
-                    const haystack = value.toLocaleLowerCase();
-                    let from = 0;
-                    while (from <= haystack.length) {
-                        const start = haystack.indexOf(needle, from);
-                        if (start < 0) break;
-                        const match = value.slice(start, start + query.length);
-                        occurrence += 1;
-                        found.push({ ...row, scope: ui.scope, start, length: match.length, match, preview: previewFor(value, start, match.length), regex: false, occurrence });
-                        if (found.length >= MAX_RESULTS) break;
-                        from = start + Math.max(query.length, 1);
-                    }
-                }
-                if (found.length >= MAX_RESULTS) break;
-            }
-            results = found;
-            currentResultIndex = found.length ? (preserveIndex ? Math.min(Math.max(previousIndex, 0), found.length - 1) : 0) : -1;
-            renderPanel();
-            if (!silent && !found.length) notify('没有找到匹配内容', 'info');
-            else if (!silent && found.length >= MAX_RESULTS) notify(`结果超过 ${MAX_RESULTS} 条，仅显示前 ${MAX_RESULTS} 条`, 'warning');
-        } catch (error) {
-            results = [];
-            currentResultIndex = -1;
-            renderPanel();
-            notify(error.message, 'error');
-        }
-    }
-
-    function selectedResult() {
-        return results[currentResultIndex] || null;
-    }
-
-    function selectResult(index, jump) {
-        if (!results.length) return;
-        currentResultIndex = (index + results.length) % results.length;
-        renderPanel();
-        const row = root?.querySelector(`[data-result-index="${currentResultIndex}"]`);
-        row?.scrollIntoView?.({ block: 'nearest' });
-        if (jump) {
-            jumpToFloor(selectedResult());
-            closePanel();
-        }
-    }
-
-    function jumpToFloor(resultOrFloor) {
-        const result = typeof resultOrFloor === 'object' ? resultOrFloor : null;
-        const floor = result ? result.id : resultOrFloor;
-        if (floor === '' || floor === undefined || floor === null) return;…29701 tokens truncated…el{color:#74777c;font-size:10px;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;} #${ROOT_ID} .ctb-rewrite-global{height:62px;margin-top:6px;}
-            #${ROOT_ID} .ctb-primary-soft{border-color:#91aa98;background:#e0e9e3;color:#4d6755;} #${ROOT_ID} .ctb-world-picker-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button:first-child{flex:1;justify-content:space-between;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button span{color:#7a817c;font-size:10px;font-weight:400;}
-            #${ROOT_ID} .ctb-world-selected-summary{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;} #${ROOT_ID} .ctb-world-selected-summary span{max-width:100%;overflow:hidden;padding:3px 6px;border:1px solid #c9d2cc;border-radius:3px;background:#e5ebe7;color:#5c6860;font-size:10px;text-overflow:ellipsis;white-space:nowrap;}
-            #${ROOT_ID} .ctb-world-picker{margin-top:6px;overflow:hidden;border:1px solid #cbd0cc;border-radius:3px;background:#e9ebeb;} #${ROOT_ID} .ctb-world-book-row{padding:6px;border-bottom:1px solid #cfd3d0;} #${ROOT_ID} .ctb-world-book-row select{flex:1;} #${ROOT_ID} .ctb-world-bulk{justify-content:flex-end;padding:5px 6px;border-bottom:1px solid #d3d6d4;color:#6d716f;font-size:10px;} #${ROOT_ID} .ctb-world-bulk>span{margin-right:auto;}
-            #${ROOT_ID} .ctb-world-entry-list{max-height:230px;overflow:auto;} #${ROOT_ID} .ctb-world-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px;border-bottom:1px solid #d4d7d5;color:#555b57;cursor:pointer;} #${ROOT_ID} .ctb-world-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-world-entry.is-selected{background:#dfe8e1;} #${ROOT_ID} .ctb-world-entry-main{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-world-entry-main strong{overflow:hidden;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-world-entry-main small{overflow:hidden;color:#858a87;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-world-entry-meta{color:#8a8d8b;font-size:9px;white-space:nowrap;} #${ROOT_ID} .ctb-world-empty{display:flex;align-items:center;justify-content:center;gap:7px;min-height:70px;padding:10px;color:#858a87;font-size:10px;} #${ROOT_ID} .ctb-world-error{color:#985957;}
-            #${ROOT_ID} .ctb-rewrite-list{max-height:280px;overflow:auto;border:1px solid #cfd1d5;border-radius:3px;background:#ededf0;}
-            #${ROOT_ID} .ctb-rewrite-paragraph{display:grid;grid-template-columns:42px minmax(0,1fr);gap:5px 8px;padding:7px 8px;border-bottom:1px solid #d5d6da;} #${ROOT_ID} .ctb-rewrite-paragraph:last-child{border-bottom:0;}
-            #${ROOT_ID} .ctb-rewrite-select{grid-row:1/3;display:flex;align-items:flex-start;gap:4px;color:#6b6e73;font-size:10px;font-weight:700;} #${ROOT_ID} .ctb-rewrite-source{min-width:0;color:#4f5257;font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-word;}
-            #${ROOT_ID} .ctb-rewrite-generate,#${ROOT_ID} .ctb-rewrite-final{justify-content:flex-end;flex-wrap:wrap;margin-top:7px;}
-            #${ROOT_ID} .ctb-rewrite-reviews{display:grid;gap:6px;} #${ROOT_ID} .ctb-rewrite-review{overflow:hidden;border:1px solid #cfd1d5;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-rewrite-review.is-accepted{border-color:#92b19a;} #${ROOT_ID} .ctb-rewrite-review.is-rejected{opacity:.68;}
-            #${ROOT_ID} .ctb-rewrite-review-title{display:flex;justify-content:space-between;padding:5px 7px;border-bottom:1px solid #d3d5d8;color:#65696e;font-size:10px;font-weight:700;} #${ROOT_ID} .ctb-rewrite-compare{display:grid;grid-template-columns:1fr 1fr;} #${ROOT_ID} .ctb-rewrite-compare>div{min-width:0;padding:7px;} #${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:1px solid #d3d5d8;background:#e5ebe7;} #${ROOT_ID} .ctb-rewrite-compare small{color:#85898e;} #${ROOT_ID} .ctb-rewrite-compare p{margin:3px 0 0;color:#4e5156;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-rewrite-review>.ctb-inline{padding:0 7px 7px;}
+            const found = […33697 tokens truncated…-rewrite-compare>div{min-width:0;padding:7px;} #${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:1px solid #d3d5d8;background:#e5ebe7;} #${ROOT_ID} .ctb-rewrite-compare small{color:#85898e;} #${ROOT_ID} .ctb-rewrite-compare p{margin:3px 0 0;color:#4e5156;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-rewrite-review>.ctb-inline{padding:0 7px 7px;}
             #${ROOT_ID} .ctb-prompt-preview{padding:7px;border:1px solid #cfd3d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-prompt-preview .ctb-section-title{justify-content:space-between;} #${ROOT_ID} .ctb-prompt-preview pre{max-height:320px;overflow:auto;margin:0;padding:8px;background:#f3f3f5;color:#50545a;font:10px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word;}
+            #${ROOT_ID} .ctb-system-prompt{min-height:92px;height:92px;font:11px/1.45 var(--mainFontFamily,Arial,sans-serif);resize:vertical;}
+            #${ROOT_ID} .ctb-post-review-grid{grid-template-columns:1fr 1fr 1fr;}
+            #${ROOT_ID} .ctb-post-review-grid>div+div{border-left:1px solid #d3d5d8;background:#eef0ee;}
+            #${ROOT_ID} .ctb-review-edit{width:100%;min-height:75px;height:75px;resize:vertical;font-size:11px;line-height:1.45;}
+            #${ROOT_ID} .ctb-diff-review-text{color:#c1504f!important;font-weight:700;}
+            #${ROOT_ID} .ctb-notice-overlay{position:fixed;inset:0;z-index:2147483200;display:grid;place-items:center;padding:20px;background:rgba(18,21,27,.35);}
+            #${ROOT_ID} .ctb-notice-card{width:min(420px,calc(100vw - 36px));padding:14px 16px;border:1px solid #c3c7cc;border-radius:4px;background:#f7f7f9;box-shadow:0 12px 30px rgba(0,0,0,.28);color:#50545a;}
+            #${ROOT_ID} .ctb-notice-card.is-error{border-left:4px solid #c35a58;} #${ROOT_ID} .ctb-notice-card.is-warning{border-left:4px solid #b58b4d;} #${ROOT_ID} .ctb-notice-card.is-success{border-left:4px solid #7da287;}
+            #${ROOT_ID} .ctb-notice-title{margin-bottom:7px;font-size:13px;font-weight:700;} #${ROOT_ID} .ctb-notice-message{margin-bottom:12px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;}
+            #${ROOT_ID} .ctb-confirm-actions{justify-content:flex-end;}
             @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-grid,#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
         `;
         doc.head.appendChild(style);
@@ -500,10 +478,25 @@
         else if (id === 'ctb-export-tags') ui.exportTags = target.value;
         else if (id === 'ctb-post-edit-floor') settings.postEdit.floor = target.value;
         else if (id === 'ctb-post-edit-tag') settings.postEdit.tag = target.value;
+        else if (id === 'ctb-post-edit-system') settings.postEdit.systemPrompt = target.value;
         else if (id === 'ctb-post-edit-rules') settings.postEdit.rules = target.value;
         else if (id === 'ctb-post-edit-preset-name') settings.postEdit.presetName = target.value;
         else if (id === 'ctb-post-edit-revised') {
             if (postEditDraft) postEditDraft.revisedContent = target.value;
+            return;
+        }
+        else if (id?.startsWith('ctb-post-edit-review-revised-')) {
+            const index = Number(id.slice('ctb-post-edit-review-revised-'.length));
+            if (postEditReview[index]) {
+                postEditReview[index].replacement = target.value;
+                if (postEditDraft) {
+                    const current = postEditReview.filter((item) => item.decision === 'accept');
+                    postEditDraft.revisedContent = postEditParagraphs(postEditDraft.originalContent).map((paragraph, paragraphIndex) => {
+                        const item = current.find((review) => review.paragraph === paragraphIndex + 1);
+                        return item ? item.replacement : paragraph;
+                    }).join('\n\n');
+                }
+            }
             return;
         }
         else if (id === 'ctb-rewrite-floor') settings.rewrite.floor = target.value;
@@ -511,6 +504,7 @@
         else if (id === 'ctb-rewrite-context-floors') settings.rewrite.contextFloors = target.value;
         else if (id === 'ctb-rewrite-context-tags') settings.rewrite.contextTags = target.value;
         else if (id === 'ctb-rewrite-global') settings.rewrite.globalInstruction = target.value;
+        else if (id === 'ctb-rewrite-system') settings.rewrite.systemPrompt = target.value;
         else if (target.dataset.channelId) {
             const channel = channelEditor?.draft?.id === target.dataset.channelId ? channelEditor.draft : null;
             if (!channel) return;
@@ -588,6 +582,15 @@
     async function handleAction(action, data) {
         switch (action) {
             case 'close': return closePanel();
+            case 'close-notice': transientNotice = null; return renderPanel();
+            case 'confirm-dialog': {
+                const confirm = pendingConfirm;
+                pendingConfirm = null;
+                renderPanel();
+                if (confirm?.action === 'replace-all') return replaceAllNow();
+                return undefined;
+            }
+            case 'cancel-dialog': pendingConfirm = null; return renderPanel();
             case 'show-info': infoMessage = infoMessage === data.infoKey ? null : data.infoKey; return renderPanel();
             case 'close-info': infoMessage = null; return renderPanel();
             case 'tab': infoMessage = null; activeTab = data.tab; return renderPanel();
@@ -629,10 +632,21 @@
             case 'save-post-preset': return savePostEditPreset();
             case 'delete-post-preset': return deletePostEditPreset();
             case 'prepare-post-edit': return preparePostEditFloor();
+            case 'preview-post-edit-prompt': return previewPostEditPrompt();
+            case 'close-post-edit-preview': postEditPromptPreview = ''; return renderPanel();
             case 'run-post-edit': return runPostEdit();
             case 'apply-post-edit': return applyPostEdit();
+            case 'post-edit-decision': {
+                const review = postEditReview[Number(data.reviewIndex)];
+                if (review) review.decision = data.decision;
+                return renderPanel();
+            }
+            case 'post-edit-all': postEditReview.forEach((review) => { review.decision = data.decision; }); return renderPanel();
+            case 'toggle-post-edit-review-editor':
+                postEditReviewEditingIndex = postEditReviewEditingIndex === Number(data.reviewIndex) ? -1 : Number(data.reviewIndex);
+                return renderPanel();
             case 'toggle-post-edit-editor': postEditEditing = !postEditEditing; return renderPanel();
-            case 'clear-post-edit': postEditDraft = null; postEditEditing = false; return renderPanel();
+            case 'clear-post-edit': postEditDraft = null; postEditEditing = false; postEditReview = []; postEditPromptPreview = ''; postEditReviewEditingIndex = -1; return renderPanel();
             case 'toggle-rewrite-world-picker':
                 rewriteWorldPickerOpen = !rewriteWorldPickerOpen;
                 if (rewriteWorldPickerOpen) return loadRewriteWorldBooks();
