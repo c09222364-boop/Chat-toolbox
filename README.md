@@ -1,11 +1,12 @@
 # SillyTavern 聊天工具箱
 
-面向 SillyTavern 当前聊天的 Userscript 工具箱。所有设置（API 通道、规则预设、功能开关、小剧场收藏）保存在酒馆扩展设置或浏览器缓存中，不写入聊天记录。
+面向 SillyTavern 当前聊天的原生第三方扩展，同时保留 Userscript 兼容入口。所有设置（API 通道、规则预设、功能开关、小剧场收藏）保存在酒馆扩展设置或浏览器缓存中，不写入聊天记录。
 
 ## 当前版本
 
 - 当前稳定版：**v0.9.5**
-- 安装文件：[聊天工具箱.user.js](./聊天工具箱.user.js)
+- 原生扩展清单：[manifest.json](./manifest.json)
+- Userscript 兼容入口：[聊天工具箱.user.js](./聊天工具箱.user.js)
 - 版本归档：[versions/v0.9.5/聊天工具箱-v0.9.5.user.js](./versions/v0.9.5/聊天工具箱-v0.9.5.user.js)
 - 上一稳定版：[versions/v0.9.4/聊天工具箱-v0.9.4.user.js](./versions/v0.9.4/聊天工具箱-v0.9.4.user.js)
 - 历史版本：[versions/v0.9.3/聊天工具箱-v0.9.3.user.js](./versions/v0.9.3/聊天工具箱-v0.9.3.user.js)
@@ -26,11 +27,20 @@
 
 ## 安装
 
-1. 安装 Tampermonkey、Violentmonkey 等 Userscript 管理器。
-2. 打开 [聊天工具箱.user.js](./聊天工具箱.user.js)，复制全部内容到新建脚本中并保存。
-3. 在 SillyTavern 的三条杠菜单底部点击“聊天工具箱”，或从 Extensions 设置开启/关闭功能页。
+### SillyTavern 原生扩展（推荐）
 
-如果直接使用 Raw 链接，请确保当前 GitHub 会话有权限访问这个私人仓库。
+1. 确保运行 SillyTavern 的设备已经安装 Git。
+2. 在 SillyTavern 顶部打开“扩展”（Extensions）。
+3. 选择“安装扩展”（Install Extension）。
+4. 粘贴仓库地址：`https://github.com/c09222364-boop/Chat-toolbox`
+5. 按需选择“当前用户”或“所有用户”，完成安装后刷新 SillyTavern。
+6. 在三条杠菜单底部点击“聊天工具箱”，也可以从 Extensions 设置开启或关闭各功能。
+
+后续版本可以在“管理扩展”中更新，无需重新复制脚本。
+
+### Userscript 兼容安装
+
+如果使用的 SillyTavern 环境无法安装第三方扩展，也可以安装 Tampermonkey、Violentmonkey 等 Userscript 管理器，打开 [聊天工具箱.user.js](./聊天工具箱.user.js)，复制全部内容到新建脚本中并保存。
 
 ## 使用建议
 
@@ -60,4 +70,4 @@
 
 ## 隐私说明
 
-仓库设为 Private。脚本不会把 API Key、聊天内容或浏览器中的规则预设写入仓库；上传内容仅为脚本源代码。
+插件不会把 API Key、聊天内容或浏览器中的规则预设写入仓库；仓库中只保存插件源代码。
