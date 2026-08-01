@@ -1,9 +1,12 @@
 {
-  "display_name": "聊天工具箱",
-  "loading_order": 100,
-  "js": "聊天工具箱.user.js",
-  "author": "c09222364-boop",
-  "version": "0.9.5",
-  "homePage": "https://github.com/c09222364-boop/Chat-toolbox",
-  "auto_update": true
+    "display_name": "聊天工具箱",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "聊天工具箱.user.js",
+    "css": "",
+    "author": "c09222364-boop",
+    "version": "0.9.7",
+    "homePage": "https://github.com/c09222364-boop/Chat-toolbox",
+    "auto_update": true
 }
