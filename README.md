@@ -4,11 +4,12 @@
 
 ## 当前版本
 
-- 当前稳定版：**v0.9.5**
+- 当前稳定版：**v0.9.6**
 - 原生扩展清单：[manifest.json](./manifest.json)
 - Userscript 兼容入口：[聊天工具箱.user.js](./聊天工具箱.user.js)
-- 版本归档：[versions/v0.9.5/聊天工具箱-v0.9.5.user.js](./versions/v0.9.5/聊天工具箱-v0.9.5.user.js)
-- 上一稳定版：[versions/v0.9.4/聊天工具箱-v0.9.4.user.js](./versions/v0.9.4/聊天工具箱-v0.9.4.user.js)
+- 版本归档：[versions/v0.9.6/聊天工具箱-v0.9.6.user.js](./versions/v0.9.6/聊天工具箱-v0.9.6.user.js)
+- 上一稳定版：[versions/v0.9.5/聊天工具箱-v0.9.5.user.js](./versions/v0.9.5/聊天工具箱-v0.9.5.user.js)
+- 历史版本：[versions/v0.9.4/聊天工具箱-v0.9.4.user.js](./versions/v0.9.4/聊天工具箱-v0.9.4.user.js)
 - 历史版本：[versions/v0.9.3/聊天工具箱-v0.9.3.user.js](./versions/v0.9.3/聊天工具箱-v0.9.3.user.js)
 - 历史版本：[versions/v0.9.2/聊天工具箱-v0.9.2.user.js](./versions/v0.9.2/聊天工具箱-v0.9.2.user.js)
 - 历史版本：[versions/v0.8.0/聊天工具箱-v0.8.0.user.js](./versions/v0.8.0/聊天工具箱-v0.8.0.user.js)
@@ -55,6 +56,7 @@
 
 | 版本 | 说明 |
 | --- | --- |
+| v0.9.6 | 使用 SillyTavern 原生 Extensions 抽屉 UI，移除重复展开逻辑；保留 AI 词句修改的稳健解析、按段深红标注和原位保存校验。 |
 | v0.9.5 | 修复词句修改返回解析与保存回读误判；原正文和完整修改后仅按段落标深红，逐段审核取消字符级颜色标记，并清理冗余 diff 与旧版清理代码。 |
 | v0.9.4 | 增加预设条目转移、世界书编辑与保存确认、扩展设置开关等功能。 |
 | v0.9.3 | 补齐世界书保存/放弃/继续编辑三种退出选择，调整状态灯、调色图标、间距与面板宽度；预设转移新增加载范围与折叠编辑。 |
