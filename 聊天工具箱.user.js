@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.9.6
+// @version      0.9.7
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.6';
+    const VERSION = '0.9.7';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -4831,7 +4831,7 @@
             #${ROOT_ID} .ctb-preset-compare-side small{color:#85898e;font-size:9px;}
             #${ROOT_ID} .ctb-preset-compare-side p{margin:2px 0 0;overflow:hidden;color:#5b6066;line-height:1.4;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;}
             #${ROOT_ID} .ctb-list-more{display:block;width:100%;border:0;border-top:1px solid #d1d4d7;background:#e1e3e5;color:#697078;padding:7px;cursor:pointer;font:10px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-list-more:hover{background:#d8ddda;}
-            #${SETTINGS_ID}{display:block!important;clear:both;margin:0;color:var(--SmartThemeBodyColor,inherit);background:transparent;opacity:1;} #${SETTINGS_ID} .ctb-extension-settings-header b{display:inline-flex;align-items:center;gap:7px;} #${SETTINGS_ID} .ctb-settings-version{margin-left:auto;color:var(--SmartThemeEmColor,#999);font-size:11px;font-weight:400;} #${SETTINGS_ID} .ctb-settings-chevron{margin-left:2px;} #${SETTINGS_ID} .ctb-extension-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:8px 15px 12px;} #${SETTINGS_ID} .ctb-extension-settings-title{grid-column:1/-1;font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;}
+            #${SETTINGS_ID} .ctb-extension-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:8px 15px 12px;} #${SETTINGS_ID} .ctb-extension-settings-title{grid-column:1/-1;font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;}
             @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-grid,#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
             @media (max-width:560px){#${ROOT_ID} .ctb-manager-grid,#${ROOT_ID} .ctb-preset-transfer-grid,#${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-preset-compare-side{padding-left:0;border-left:0;border-top:1px solid #d5d7da;padding-top:4px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:0;margin-right:0;padding-left:0;padding-right:0;}#${SETTINGS_ID} .ctb-extension-settings-grid{grid-template-columns:1fr;}}
 
@@ -5602,16 +5602,25 @@
         let panel = duplicatePanels.find((node) => node.parentElement === target) || duplicatePanels[0] || null;
         const kept = panel;
         duplicatePanels.forEach((node) => { if (node !== kept) node.remove(); });
-        const signature = `${VERSION}|${MODULES.map((module) => `${module.key}:${settings.modules?.[module.key] !== false ? 1 : 0}`).join(',')}`;
-        if (panel && panel.dataset.ctbSettingsSignature === signature) {
-            panel.hidden = false;
-            if (panel.parentElement !== target) target.appendChild(panel);
-            return true;
+        if (panel?.querySelector('.ctb-extension-settings-header')) {
+            panel.remove();
+            panel = null;
         }
         if (!panel) {
             panel = doc.createElement('div');
             panel.id = SETTINGS_ID;
             panel.className = 'ctb-extension-settings inline-drawer';
+            panel.innerHTML = `
+                <div class="inline-drawer-toggle inline-drawer-header">
+                    <b>聊天工具箱</b>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                    <div class="ctb-extension-settings-grid">
+                        <div class="ctb-extension-settings-title">功能开关</div>
+                        ${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"> <span>${module.label}</span></label>`).join('')}
+                    </div>
+                </div>`;
             panel.addEventListener('change', (event) => {
                 const input = event.target.closest('[data-ctb-module]');
                 if (!input) return;
@@ -5621,25 +5630,13 @@
                 saveSettings();
                 ensureActiveTab();
                 renderPanel();
-                injectExtensionSettings();
             });
         }
-        const isOpen = panel?.querySelector('.ctb-settings-chevron')?.classList.contains('up') === true;
         panel.className = 'ctb-extension-settings inline-drawer';
         panel.hidden = false;
-        panel.dataset.ctbSettingsSignature = signature;
-        panel.innerHTML = `
-            <div class="ctb-extension-settings-header inline-drawer-toggle inline-drawer-header">
-                <b><i class="fa-solid fa-toolbox"></i> 聊天工具箱</b>
-                <span class="ctb-settings-version">v${VERSION}</span>
-                <div class="ctb-settings-chevron inline-drawer-icon fa-solid fa-circle-chevron-${isOpen ? 'up up' : 'down down'}"></div>
-            </div>
-            <div class="ctb-extension-settings-body inline-drawer-content"${isOpen ? ' style="display:block"' : ''}>
-                <div class="ctb-extension-settings-grid">
-                    <div class="ctb-extension-settings-title">功能开关</div>
-                    ${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"${settings.modules?.[module.key] !== false ? ' checked' : ''}> <span>${module.label}</span></label>`).join('')}
-                </div>
-            </div>`;
+        panel.querySelectorAll('[data-ctb-module]').forEach((input) => {
+            input.checked = settings.modules?.[input.dataset.ctbModule] !== false;
+        });
         if (panel.parentElement !== target) target.appendChild(panel);
         return true;
     }
