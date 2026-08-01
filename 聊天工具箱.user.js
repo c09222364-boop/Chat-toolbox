@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.9.3
+// @version      0.9.4
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
@@ -10,7 +10,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.3';
+    const VERSION = '0.9.4';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -96,6 +96,12 @@
     let theaterWorldBooks = [];
     let theaterWorldBook = '';
     const theaterWorldEntryCache = new Map();
+    let theaterNativePresetLoading = false;
+    let theaterNativePresetLoadedOnce = false;
+    let theaterNativePresetNames = [];
+    let theaterNativePresetName = '';
+    let theaterNativePresetEntries = [];
+    let theaterNativePresetError = '';
     let worldbookLoading = false;
     let worldbookLoadedOnce = false;
     let worldbookSaving = false;
@@ -111,6 +117,7 @@
     let worldbookDraftDirty = false;
     let worldbookDirty = false;
     let worldbookBatchMode = false;
+    let worldbookCopyTarget = '';
     // Keep staged edits when the user changes the selected book.  They are
     // still written only from the close/save checkpoint, never on row changes.
     const worldbookPendingDocuments = new Map();
@@ -174,7 +181,7 @@
         'system-cache': '这里的提示词只保存在聊天工具箱的插件设置缓存中，不会写入聊天记录；留空时使用内置默认提示词。',
         'theater-scope': '小剧场只在插件里独立生成和保存最近结果，不会插入聊天楼层，也不会改动原聊天。',
         'worldbook-save': '世界书编辑采用先在界面修改、再一次保存的方式。移动条目时会先保存目标世界书，确认成功后才从来源删除。',
-        'preset-transfer': '预设转移分为单预设编辑和双预设对比。复制或移动时只选择“列表开头”或“所选条目后”；只处理提示词条目及主 prompt_order，不会修改其他预设参数。',
+        'preset-transfer': '预设转移分为单预设编辑和双预设对比。复制或移动时可放到列表开头，或放到指定条目后；只处理提示词条目及主 prompt_order，不会修改其他预设参数。',
     });
 
     function defaults() {
@@ -226,6 +233,8 @@
                 presetName: '',
                 selectedPresetId: '',
                 presets: [],
+                nativePresetName: '',
+                nativePresetEntryIds: [],
                 history: [],
                 favorites: [],
             },
@@ -302,6 +311,7 @@
                     ...base.theater,
                     ...(stored.theater && typeof stored.theater === 'object' ? stored.theater : {}),
                     presets: Array.isArray(stored.theater?.presets) ? stored.theater.presets : [],
+                    nativePresetEntryIds: Array.isArray(stored.theater?.nativePresetEntryIds) ? stored.theater.nativePresetEntryIds.map(String) : [],
                     history: [],
                     favorites: Array.isArray(stored.theater?.favorites) ? stored.theater.favorites.slice(0, 50) : [],
                     worldEntries: Array.isArray(stored.theater?.worldEntries)
@@ -1289,59 +1299,6 @@
         }
     }
 
-    function preparePostEditLatest(options = {}) {
-        settings.postEdit.floor = '';
-        return preparePostEditFloor(options);
-    }
-
-    function postEditEndpoint(value) {
-        let endpoint = String(value || '').trim().replace(/\/+$/, '');
-        if (!endpoint) throw new Error('请填写 API 地址');
-        if (/\/chat\/completions$/i.test(endpoint)) return endpoint;
-        if (/\/v1$/i.test(endpoint)) return `${endpoint}/chat/completions`;
-        return `${endpoint}/v1/chat/completions`;
-    }
-
-    function requestJson(url, apiKey, body) {
-        if (typeof GM_xmlhttpRequest === 'function') {
-            return new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: 'POST',
-                    url,
-                    headers: {
-                        'Content-Type': 'application/json',
-                        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-                    },
-                    data: JSON.stringify(body),
-                    timeout: 120000,
-                    onload(response) {
-                        let json;
-                        try { json = JSON.parse(response.responseText || '{}'); }
-                        catch (_) { return reject(new Error(`API 返回的不是 JSON（HTTP ${response.status}）`)); }
-                        if (response.status < 200 || response.status >= 300) {
-                            return reject(new Error(json?.error?.message || `API 请求失败（HTTP ${response.status}）`));
-                        }
-                        resolve(json);
-                    },
-                    ontimeout() { reject(new Error('API 请求超时')); },
-                    onerror() { reject(new Error('API 请求失败，请检查地址、网络或跨域设置')); },
-                });
-            });
-        }
-        return (host.fetch || fetch)(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-            },
-            body: JSON.stringify(body),
-        }).then(async (response) => {
-            const json = await response.json().catch(() => ({}));
-            if (!response.ok) throw new Error(json?.error?.message || `API 请求失败（HTTP ${response.status}）`);
-            return json;
-        });
-    }
-
     function apiOutputText(json) {
         const standard = json?.choices?.[0]?.message?.content ?? json?.choices?.[0]?.text ?? json?.output_text;
         if (typeof standard === 'string') return standard;
@@ -1684,44 +1641,49 @@
         }
     }
 
-    function diffPostEditHtml(before, after) {
-        const splitParagraphsForDiff = (value) => String(value ?? '')
-            .replace(/\r\n?/g, '\n')
-            .split(/\n[ \t]*\n+/)
-            .map((paragraph) => paragraph.trim())
-            .filter(Boolean);
-        const oldParagraphs = splitParagraphsForDiff(before);
-        const newParagraphs = splitParagraphsForDiff(after);
-        // 用段落级 LCS 对齐，避免模型增删一个空行后把后面整篇误判为修改。
-        const rows = oldParagraphs.length + 1;
-        const cols = newParagraphs.length + 1;
-        const lcs = Array.from({ length: rows }, () => Array(cols).fill(0));
-        for (let oldIndex = oldParagraphs.length - 1; oldIndex >= 0; oldIndex -= 1) {
-            for (let newIndex = newParagraphs.length - 1; newIndex >= 0; newIndex -= 1) {
-                lcs[oldIndex][newIndex] = oldParagraphs[oldIndex] === newParagraphs[newIndex]
-                    ? lcs[oldIndex + 1][newIndex + 1] + 1
-                    : Math.max(lcs[oldIndex + 1][newIndex], lcs[oldIndex][newIndex + 1]);
+    function diffTokens(value) {
+        return String(value ?? '').replace(/\r\n?/g, '\n').match(/\s+|[\u4e00-\u9fff]|[A-Za-z0-9_]+|[^A-Za-z0-9_\s\u4e00-\u9fff]/g) || [];
+    }
+
+    function inlineDiffOps(before, after) {
+        const left = diffTokens(before);
+        const right = diffTokens(after);
+        const table = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
+        for (let i = left.length - 1; i >= 0; i -= 1) {
+            for (let j = right.length - 1; j >= 0; j -= 1) {
+                table[i][j] = left[i] === right[j] ? table[i + 1][j + 1] + 1 : Math.max(table[i + 1][j], table[i][j + 1]);
             }
         }
-        const unchangedNewIndexes = new Set();
-        let oldIndex = 0;
-        let newIndex = 0;
-        while (oldIndex < oldParagraphs.length && newIndex < newParagraphs.length) {
-            if (oldParagraphs[oldIndex] === newParagraphs[newIndex]) {
-                unchangedNewIndexes.add(newIndex);
-                oldIndex += 1;
-                newIndex += 1;
-            } else if (lcs[oldIndex + 1][newIndex] >= lcs[oldIndex][newIndex + 1]) {
-                oldIndex += 1;
+        const ops = [];
+        let i = 0;
+        let j = 0;
+        while (i < left.length || j < right.length) {
+            if (i < left.length && j < right.length && left[i] === right[j]) {
+                ops.push({ type: 'equal', value: left[i++] });
+            } else if (i < left.length && (!j || table[i + 1][j] >= table[i][j + 1])) {
+                ops.push({ type: 'delete', value: left[i++] });
             } else {
-                newIndex += 1;
+                ops.push({ type: 'insert', value: right[j++] });
             }
         }
-        return newParagraphs.map((paragraph, index) => (
-            unchangedNewIndexes.has(index)
-                ? escapeHTML(paragraph)
-                : `<mark class="ctb-diff-add ctb-diff-paragraph">${escapeHTML(paragraph)}</mark>`
-        )).join('\n\n');
+        return ops;
+    }
+
+    function renderInlineDiff(before, after, side) {
+        return inlineDiffOps(before, after).map((op) => {
+            const value = escapeHTML(op.value);
+            if (side === 'combined' && op.type === 'delete') return `<del class="ctb-diff-removed">${value}</del>`;
+            if (side === 'combined' && op.type === 'insert') return `<ins class="ctb-diff-added">${value}</ins>`;
+            if (side === 'before' && op.type === 'delete') return `<del class="ctb-diff-removed">${value}</del>`;
+            if (side === 'after' && op.type === 'insert') return `<ins class="ctb-diff-added">${value}</ins>`;
+            return op.type === (side === 'before' ? 'insert' : 'delete') ? '' : value;
+        }).join('');
+    }
+
+    function renderDiffPair(before, after, { emptyAfter = '（删除本段）' } = {}) {
+        const left = String(before ?? '');
+        const right = String(after ?? '');
+        return `<div class="ctb-diff-pair"><div><small>原文</small><p>${renderInlineDiff(left, right, 'before') || '<em>（空）</em>'}</p></div><div><small>修改后</small><p>${right ? renderInlineDiff(left, right, 'after') : `<em>${escapeHTML(emptyAfter)}</em>`}</p></div></div>`;
     }
 
     async function runPostEdit() {
@@ -2343,7 +2305,7 @@
                     <label class="ctb-check"><input id="ctb-export-floor" type="checkbox"${ui.exportShowFloor ? ' checked' : ''}> 显示楼层号</label>
                 </div>
             </section>
-            <div class="ctb-export-actions"><button type="button" class="ctb-button ctb-export-txt" data-action="export-txt"><i class="fa-solid fa-file-lines"></i> 导出 TXT</button><span class="ctb-export-epub-combo"><button type="button" class="ctb-button ctb-export-epub" data-action="export-epub"><i class="fa-solid fa-book-open"></i> 导出 EPUB</button>${infoButton('export-epub', 'ctb-export-info ctb-info-on-button')}</span></div>`;
+            <div class="ctb-export-actions"><button type="button" class="ctb-button ctb-export-txt" data-action="export-txt"><i class="fa-solid fa-file-lines"></i> 导出 TXT</button><span class="ctb-export-epub-combo"><button type="button" class="ctb-button ctb-export-epub" data-action="export-epub"><i class="fa-solid fa-book-open"></i> 导出 EPUB</button>${infoButton('export-epub', 'ctb-export-info ctb-info-on-button', true)}</span></div>`;
     }
 
     function renderChannelSettings(feature) {
@@ -2397,7 +2359,7 @@
                     <div class="ctb-rewrite-compare ctb-post-review-grid">
                         <div><small>原文</small><p>${escapeHTML(review.original)}</p></div>
                         <div><small>修改原因</small><p>${escapeHTML(review.reason || '未提供修改原因')}</p></div>
-                        <div><small>修改后</small>${postEditReviewEditingIndex === index ? `<textarea class="ctb-input ctb-review-edit" id="ctb-post-edit-review-revised-${index}">${escapeHTML(review.replacement)}</textarea>` : `<p class="ctb-diff-review-text">${escapeHTML(review.replacement)}</p>`}</div>
+                        <div><small>修改后</small>${postEditReviewEditingIndex === index ? `<textarea class="ctb-input ctb-review-edit" id="ctb-post-edit-review-revised-${index}">${escapeHTML(review.replacement)}</textarea>` : `<p class="ctb-diff-review-text">${renderInlineDiff(review.original, review.replacement, 'combined')}</p>`}</div>
                     </div>
                     <div class="ctb-inline"><button type="button" class="ctb-button ctb-primary" data-action="post-edit-decision" data-review-index="${index}" data-decision="accept">采用这段</button><button type="button" class="ctb-button" data-action="post-edit-decision" data-review-index="${index}" data-decision="reject">不采用</button><button type="button" class="ctb-button" data-action="toggle-post-edit-review-editor" data-review-index="${index}">${postEditReviewEditingIndex === index ? '完成编辑' : '编辑'}</button></div>
                 </div>`).join('')}
@@ -2436,7 +2398,7 @@
             ${draft ? `<section class="ctb-section ctb-post-preview">
                 <div class="ctb-section-title">楼层 #${escapeHTML(draft.floor)} · 修改预览</div>
                 <div class="ctb-post-column"><div class="ctb-post-label">原正文</div><pre class="ctb-post-text">${escapeHTML(draft.originalContent)}</pre></div>
-                <div class="ctb-post-column"><div class="ctb-post-label ctb-post-label-actions"><span>完整修改后（备用总稿）</span>${revised ? `<button type="button" class="ctb-review-expand" data-action="toggle-post-edit-editor" title="${postEditEditing ? '完成编辑' : '编辑修改后正文'}" aria-label="${postEditEditing ? '完成编辑' : '编辑修改后正文'}"><i class="fa-solid ${postEditEditing ? 'fa-check' : 'fa-pen'}"></i></button>` : ''}</div>${postEditEditing ? `<textarea class="ctb-input ctb-post-text ctb-post-edit-textarea" id="ctb-post-edit-revised">${escapeHTML(revised)}</textarea>` : `<pre class="ctb-post-text">${revised ? diffPostEditHtml(draft.originalContent, revised) : '点击“调用 API 修改”后显示结果。'}</pre>`}</div>
+                <div class="ctb-post-column"><div class="ctb-post-label ctb-post-label-actions"><span>完整修改后（备用总稿）</span>${revised ? `<button type="button" class="ctb-review-expand" data-action="toggle-post-edit-editor" title="${postEditEditing ? '完成编辑' : '编辑修改后正文'}" aria-label="${postEditEditing ? '完成编辑' : '编辑修改后正文'}"><i class="fa-solid ${postEditEditing ? 'fa-check' : 'fa-pen'}"></i></button>` : ''}</div>${postEditEditing ? `<textarea class="ctb-input ctb-post-text ctb-post-edit-textarea" id="ctb-post-edit-revised">${escapeHTML(revised)}</textarea>` : `<pre class="ctb-post-text">${revised ? escapeHTML(revised) : '点击“调用 API 修改”后显示结果。'}</pre>`}</div>
              </section>` : '<div class="ctb-results ctb-results-empty">先选择楼层并读取正文，再调用 API 生成修改预览。</div>'}
             ${reviewList}`;
     }
@@ -2499,7 +2461,7 @@
             <div class="ctb-rewrite-reviews">
                 ${rewriteReview.map((review, index) => `<div class="ctb-rewrite-review${review.decision === 'accept' ? ' is-accepted' : review.decision === 'reject' ? ' is-rejected' : ''}">
                     <div class="ctb-rewrite-review-title"><span>P${review.paragraph}</span><span>${review.decision === 'accept' ? '将采用' : review.decision === 'reject' ? '不采用' : '等待决定'}</span></div>
-                    <div class="ctb-rewrite-compare"><div><small>原文</small><p>${escapeHTML(review.original)}</p></div><div><small>改写</small><p>${review.replacement ? escapeHTML(review.replacement) : '<em>（删除本段）</em>'}</p></div></div>
+                    ${renderDiffPair(review.original, review.replacement)}
                     <div class="ctb-inline"><button type="button" class="ctb-button ctb-primary" data-action="rewrite-decision" data-review-index="${index}" data-decision="accept">采用这段</button><button type="button" class="ctb-button" data-action="rewrite-decision" data-review-index="${index}" data-decision="reject">不采用</button></div>
                 </div>`).join('')}
             </div>
@@ -2535,6 +2497,93 @@
             </section>
             ${rewritePromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览（与生成共用同一份消息）</span><button type="button" class="ctb-review-expand" data-action="close-rewrite-preview" title="关闭预览" aria-label="关闭预览">×</button></div><pre>${escapeHTML(rewritePromptPreview)}</pre></section>` : ''}
             ${reviewList}`;
+    }
+
+    async function loadTheaterNativePresets({ force = false, name = '' } = {}) {
+        if (theaterNativePresetLoading) return;
+        theaterNativePresetLoading = true;
+        theaterNativePresetError = '';
+        try {
+            const manager = getPresetTransferManager();
+            if (force || !theaterNativePresetNames.length) theaterNativePresetNames = presetTransferNames(manager);
+            const preferred = String(name || settings.theater.nativePresetName || theaterNativePresetName || '');
+            theaterNativePresetName = theaterNativePresetNames.includes(preferred) ? preferred : '';
+            settings.theater.nativePresetName = theaterNativePresetName;
+            if (theaterNativePresetName) {
+                const document = await loadPresetTransferDocument(manager, theaterNativePresetName);
+                theaterNativePresetEntries = presetTransferRecords(document).filter((entry) => !entry.locked);
+                const known = new Set(theaterNativePresetEntries.map((entry) => String(entry.id)));
+                const saved = (settings.theater.nativePresetEntryIds || []).map(String).filter((id) => known.has(id));
+                settings.theater.nativePresetEntryIds = saved.length ? saved : theaterNativePresetEntries.filter((entry) => entry.inserted && entry.enabled).map((entry) => String(entry.id));
+            } else {
+                theaterNativePresetEntries = [];
+                settings.theater.nativePresetEntryIds = [];
+            }
+            saveSettings();
+        } catch (error) {
+            theaterNativePresetError = error.message || String(error);
+            theaterNativePresetEntries = [];
+        } finally {
+            theaterNativePresetLoading = false;
+            theaterNativePresetLoadedOnce = true;
+            renderPanel();
+        }
+    }
+
+    async function chooseTheaterNativePreset(name) {
+        theaterNativePresetName = String(name || '');
+        settings.theater.nativePresetName = theaterNativePresetName;
+        settings.theater.nativePresetEntryIds = [];
+        saveSettings();
+        if (!theaterNativePresetName) {
+            theaterNativePresetEntries = [];
+            theaterNativePresetError = '';
+            renderPanel();
+            return;
+        }
+        await loadTheaterNativePresets({ name: theaterNativePresetName });
+    }
+
+    function setTheaterNativePresetEntrySelected(id, selected) {
+        const key = String(id || '');
+        const current = new Set((settings.theater.nativePresetEntryIds || []).map(String));
+        if (selected) current.add(key); else current.delete(key);
+        settings.theater.nativePresetEntryIds = [...current];
+        saveSettings();
+        renderPanel();
+    }
+
+    function setTheaterNativePresetSelection(selected) {
+        settings.theater.nativePresetEntryIds = selected
+            ? theaterNativePresetEntries.map((entry) => String(entry.id))
+            : [];
+        saveSettings();
+        renderPanel();
+    }
+
+    async function collectTheaterNativePresetEntries() {
+        if (!theaterNativePresetName || !settings.theater.nativePresetEntryIds?.length) return '';
+        if (!theaterNativePresetEntries.length) {
+            try { await loadTheaterNativePresets({ name: theaterNativePresetName }); } catch (_) {}
+        }
+        const selected = new Set((settings.theater.nativePresetEntryIds || []).map(String));
+        return theaterNativePresetEntries.filter((entry) => selected.has(String(entry.id)) && entry.content?.trim())
+            .map((entry) => `【酒馆预设 · ${entry.name} · ${entry.raw?.role || 'system'}】\n${entry.content.trim()}`)
+            .join('\n\n');
+    }
+
+    function renderTheaterNativePresetPicker() {
+        const selected = new Set((settings.theater.nativePresetEntryIds || []).map(String));
+        const options = ['<option value="">不使用酒馆原生预设</option>']
+            .concat(theaterNativePresetNames.map((name) => `<option value="${escapeHTML(name)}"${name === theaterNativePresetName ? ' selected' : ''}>${escapeHTML(name)}</option>`)).join('');
+        const list = theaterNativePresetLoading
+            ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取预设…</div>'
+            : theaterNativePresetError
+                ? `<div class="ctb-world-empty ctb-world-error">${escapeHTML(theaterNativePresetError)}</div>`
+                : theaterNativePresetName && theaterNativePresetEntries.length
+                    ? `<div class="ctb-theater-native-entry-list">${theaterNativePresetEntries.map((entry) => `<label class="ctb-theater-native-entry"><input type="checkbox" data-theater-native-entry-id="${escapeHTML(entry.id)}"${selected.has(String(entry.id)) ? ' checked' : ''}><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 140) || '（空条目）')}</small></span><em>${entry.enabled ? '启用' : '停用'}</em></label>`).join('')}</div>`
+                    : '<div class="ctb-world-empty">选择一个预设后可勾选要带入小剧场的条目。</div>';
+        return `<div class="ctb-theater-native-picker"><div class="ctb-inline ctb-theater-native-toolbar"><select class="ctb-input" id="ctb-theater-native-preset">${options}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-native-presets" title="刷新"><i class="fa-solid fa-rotate"></i></button>${theaterNativePresetName ? `<button type="button" class="ctb-button" data-action="select-theater-native-preset-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-native-preset">清空</button>` : ''}</div>${list}</div>`;
     }
 
     function theaterSelectionKey(world, uid) {
@@ -2670,9 +2719,11 @@
             const text = extractTags(row.text, tags).trim();
             return text ? `${row.isUser ? '用户' : row.name}（#${row.id}）：${text}` : '';
         }).filter(Boolean).join('\n\n');
+        const nativePresetEntries = await collectTheaterNativePresetEntries();
         const worldEntries = await collectTheaterWorldEntries();
         const contextParts = [
             ...theaterCharacterAndPersona(),
+            nativePresetEntries ? `【用户选择的酒馆原生预设条目】\n${nativePresetEntries}` : '',
             worldEntries ? `【用户选择的世界书条目】\n${worldEntries}` : '',
             history ? `【最近上下文】\n${history}` : '',
         ].filter(Boolean);
@@ -2692,6 +2743,8 @@
             contextTags: String(config.contextTags || ''),
             includeCharacter: config.includeCharacter !== false,
             includePersona: config.includePersona !== false,
+            nativePresetName: String(config.nativePresetName || ''),
+            nativePresetEntryIds: (config.nativePresetEntryIds || []).map(String),
             worldEntries: (config.worldEntries || []).map((item) => ({ world: String(item.world), uid: String(item.uid) })),
             channelId: config.channelId || 'main',
         };
@@ -2910,6 +2963,7 @@
 
     function renderTheaterTab() {
         const config = settings.theater;
+        if (!theaterNativePresetLoadedOnce && !theaterNativePresetLoading) host.setTimeout(() => loadTheaterNativePresets(), 0);
         const presetOptions = ['<option value="">选择小剧场预设…</option>'].concat((config.presets || []).map((preset) => `<option value="${escapeHTML(preset.id)}"${config.selectedPresetId === preset.id ? ' selected' : ''}>${escapeHTML(preset.name)}</option>`)).join('');
         const recent = theaterHistory || [];
         const favorites = theaterFavorites();
@@ -2931,6 +2985,7 @@
         return `<section class="ctb-section"><div class="ctb-section-title">独立小剧场 ${infoButton('theater-scope')}</div></section>
             <section class="ctb-section"><div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>${renderChannelSettings('theater')}</section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场预设</div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-preset">${presetOptions}</select><input class="ctb-input" id="ctb-theater-preset-name" placeholder="预设名称" value="${escapeHTML(config.presetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-preset"${config.selectedPresetId ? '' : ' disabled'}>删除</button></div></section>
+            <section class="ctb-section"><div class="ctb-section-title">酒馆原生预设</div>${renderTheaterNativePresetPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="例如：如果这一刻没有人打断，角色会怎么想？">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterLoading ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterLoading ? '生成中…' : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div></section>
             ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
@@ -3243,6 +3298,8 @@
         root.querySelectorAll('[data-worldbook-needs-selection]').forEach((button) => {
             button.disabled = worldbookSelected.size === 0;
         });
+        const copyToBook = root.querySelector('[data-action="copy-worldbook-entries-to-book"]');
+        if (copyToBook) copyToBook.disabled = worldbookSelected.size === 0 || !worldbookCopyTarget;
     }
 
     async function loadWorldbookManager({ force = false, book = '' } = {}) {
@@ -3272,6 +3329,7 @@
             worldbookDraft = null;
             worldbookDraftDirty = false;
             worldbookBatchMode = false;
+            worldbookCopyTarget = worldbookBooks.find((name) => name !== worldbookBook) || '';
             worldbookDirty = Boolean(pendingDocument);
             saveSettings();
         } catch (error) {
@@ -3526,6 +3584,41 @@
         notify(`已在当前世界书复制 ${copiedIds.length} 个条目；深度、优先级、位置等设置均已保留`, 'success');
     }
 
+    async function copySelectedWorldbookEntriesToBookV2() {
+        if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
+        if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
+        const target = String(worldbookCopyTarget || '').trim();
+        if (!target || target === worldbookBook) return notify('请先选择一本不同名的目标世界书', 'warning');
+        const selected = currentWorldbookView().filter((record) => worldbookSelected.has(record.uid));
+        if (!selected.length) return notify('请先勾选要复制的条目', 'warning');
+        try {
+            const document = await loadFreshWorldInfoDocumentV2(target);
+            const records = worldbookRecords(document);
+            const used = new Set(records.map((record) => worldbookUidNumber(record)));
+            let displayIndex = records.reduce((max, record) => Math.max(max, Number(record.displayIndex) || 0), -1) + 1;
+            const names = new Set(records.map((record) => worldbookRecordLabel(record)));
+            selected.forEach((source) => {
+                const raw = deepClone(source.raw);
+                const uid = nextWorldbookUid(used);
+                const originalName = String(raw.comment || raw.name || `条目 ${source.uid}`);
+                let name = `${originalName}（复制）`;
+                let suffix = 2;
+                while (names.has(name)) name = `${originalName}（复制 ${suffix++}）`;
+                names.add(name);
+                raw.uid = uid;
+                raw.comment = name;
+                raw.displayIndex = displayIndex++;
+                records.push({ uid: String(uid), sourceKey: String(uid), raw, displayIndex: raw.displayIndex });
+            });
+            await saveWorldInfoDocument(target, { ...document, entries: serializeWorldbookRecords(records) }, { immediate: true, refreshList: false, verify: true });
+            theaterWorldEntryCache.delete(target);
+            rewriteWorldEntryCache.delete(target);
+            notify(`已复制 ${selected.length} 个条目到“${target}”，条目设置均已保留`, 'success');
+        } catch (error) {
+            notify(`复制到目标世界书失败：${error.message}`, 'error');
+        }
+    }
+
     function worldbookStatusV2(raw) {
         if (raw?.disable) return { className: 'is-off', label: '已关闭', title: '该条目已关闭，不会触发' };
         if (raw?.constant) return { className: 'is-blue', label: '蓝灯', title: '蓝灯：常驻条目' };
@@ -3607,14 +3700,7 @@
             return !query || worldbookRecordSearchText(record).includes(query);
         });
         if (mode === 'clear') worldbookSelected = new Set();
-        else if (mode === 'invert') {
-            const next = new Set(worldbookSelected);
-            visible.forEach((record) => {
-                if (next.has(record.uid)) next.delete(record.uid);
-                else next.add(record.uid);
-            });
-            worldbookSelected = next;
-        } else visible.forEach((record) => worldbookSelected.add(record.uid));
+        else visible.forEach((record) => worldbookSelected.add(record.uid));
         renderPanel();
     }
 
@@ -3674,8 +3760,8 @@
                 <div class="ctb-worldbook-entry-head${worldbookBatchMode ? ' is-batch-mode' : ''}">
                     ${worldbookBatchMode ? `<input type="checkbox" data-worldbook-select-uid="${escapeHTML(record.uid)}"${selected ? ' checked' : ''} aria-label="选择条目 ${escapeHTML(worldbookRecordLabel(record))}">` : ''}
                     <div class="ctb-worldbook-status-controls" aria-label="条目状态">
-                        <button type="button" class="ctb-worldbook-light-button ${lightClass}" data-action="cycle-worldbook-light" data-worldbook-uid="${escapeHTML(record.uid)}" title="${escapeHTML(lightTitle)}" aria-label="${escapeHTML(lightTitle)}"><span class="ctb-worldbook-status-dot" aria-hidden="true"></span></button>
-                        <button type="button" class="ctb-worldbook-enabled-button${raw.disable ? ' is-off' : ' is-on'}" data-action="toggle-worldbook-enabled" data-worldbook-uid="${escapeHTML(record.uid)}" title="${escapeHTML(enabledTitle)}" aria-label="${escapeHTML(enabledTitle)}"><span class="ctb-worldbook-power-dot" aria-hidden="true"></span></button>
+                        <button type="button" class="ctb-worldbook-light-button ${lightClass}" data-action="cycle-worldbook-light" data-worldbook-uid="${escapeHTML(record.uid)}" title="${escapeHTML(lightTitle)}" aria-label="${escapeHTML(lightTitle)}"><span class="ctb-worldbook-status-track" aria-hidden="true"><span class="ctb-worldbook-status-thumb"></span></span></button>
+                        <button type="button" class="ctb-worldbook-enabled-button${raw.disable ? ' is-off' : ' is-on'}" data-action="toggle-worldbook-enabled" data-worldbook-uid="${escapeHTML(record.uid)}" title="${escapeHTML(enabledTitle)}" aria-label="${escapeHTML(enabledTitle)}"><span class="ctb-worldbook-power-track" aria-hidden="true"><span class="ctb-worldbook-power-thumb"></span></span></button>
                     </div>
                     <button type="button" class="ctb-worldbook-entry-toggle" data-action="toggle-worldbook-entry" data-worldbook-uid="${escapeHTML(record.uid)}" aria-expanded="${expanded ? 'true' : 'false'}">
                         <span class="ctb-worldbook-entry-main"><strong class="ctb-worldbook-name">${escapeHTML(worldbookRecordLabel(record))}</strong></span>
@@ -3699,15 +3785,20 @@
                 ? `<div class="ctb-manager-list" data-ctb-scroll-key="worldbook-list">${renderWorldbookRowsV2(visible)}${filtered.length > visible.length ? `<button type="button" class="ctb-list-more" data-action="more-worldbook-entries">再显示 ${Math.min(120, filtered.length - visible.length)} 条（共 ${filtered.length} 条）</button>` : ''}</div>`
                 : '<div class="ctb-world-empty">没有符合条件的条目。</div>';
         const batchTools = worldbookBatchMode ? `<div class="ctb-worldbook-batch-panel">
-                    <div class="ctb-inline ctb-worldbook-selection-tools">
+                    <div class="ctb-worldbook-batch-head">
                         <span class="ctb-worldbook-selected-count" data-worldbook-selected-count>已选 ${worldbookSelected.size} 条</span>
-                        <button type="button" class="ctb-button" data-action="select-all-worldbook-entries">全选</button>
-                        <button type="button" class="ctb-button" data-action="invert-worldbook-selection">反选</button>
-                        <button type="button" class="ctb-button" data-action="clear-worldbook-selection"${worldbookSelected.size ? '' : ' disabled'}>清空</button>
-                        <button type="button" class="ctb-button ctb-primary-soft" data-action="enable-selected-worldbook-recursion-guards" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>一键开启递归保护</button>
-                        <button type="button" class="ctb-button" data-action="new-worldbook-entry"${worldbookBook ? '' : ' disabled'}>新条目</button>
-                        <button type="button" class="ctb-button" data-action="copy-worldbook-entries" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>复制</button>
-                        <button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook-entries" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>批量删除</button>
+                        <div class="ctb-worldbook-batch-actions">
+                            <button type="button" class="ctb-button" data-action="select-all-worldbook-entries">全选</button>
+                            <button type="button" class="ctb-button" data-action="clear-worldbook-selection"${worldbookSelected.size ? '' : ' disabled'}>清空</button>
+                            <button type="button" class="ctb-button" data-action="copy-worldbook-entries" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>复制</button>
+                            <button type="button" class="ctb-button" data-action="new-worldbook-entry"${worldbookBook ? '' : ' disabled'}>新条目</button>
+                            <button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook-entries" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>批量删除</button>
+                            <button type="button" class="ctb-button ctb-primary-soft" data-action="enable-selected-worldbook-recursion-guards" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}>一键递归保护</button>
+                        </div>
+                    </div>
+                    <div class="ctb-worldbook-copy-row">
+                        <select class="ctb-input ctb-worldbook-copy-target" id="ctb-worldbook-copy-target" data-worldbook-needs-selection${worldbookSelected.size ? '' : ' disabled'}><option value="">复制到其他世界书…</option>${worldbookBooks.filter((name) => name !== worldbookBook).map((name) => `<option value="${escapeHTML(name)}"${name === worldbookCopyTarget ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('')}</select>
+                        <button type="button" class="ctb-button ctb-primary-soft" data-action="copy-worldbook-entries-to-book" data-worldbook-needs-selection${worldbookSelected.size && worldbookCopyTarget ? '' : ' disabled'}>复制到所选书</button>
                     </div>
                 </div>` : '';
         return `<section class="ctb-section">
@@ -4357,10 +4448,10 @@
             : String(candidates[0]?.id || '');
         const referenceOptions = candidates.length
             ? candidates.map((entry) => `<option value="${escapeHTML(entry.id)}"${String(entry.id) === currentReference ? ' selected' : ''}>${escapeHTML(entry.name || '未命名条目')}</option>`).join('')
-            : '<option value="">没有可用参照条目</option>';
+            : '<option value="">没有可用目标条目</option>';
         const placementScope = presetTransferMode() === 'dual' ? '目标预设' : '当前预设';
         const placeButton = (kind, label) => `<button type="button" class="ctb-button ctb-placement-choice${requestedKind === kind ? ' is-active' : ''}" data-action="set-preset-anchor" data-preset-anchor-kind="${kind}" data-preset-anchor-id="${kind === 'after' ? escapeHTML(currentReference) : ''}">${label}</button>`;
-        return `<div class="ctb-preset-placement" aria-label="条目放置位置"><div class="ctb-preset-placement-label"><strong>放到哪里</strong><span>复制或移动后写入${placementScope}</span></div><div class="ctb-preset-placement-main"><div class="ctb-placement-choices">${placeButton('top', '列表开头')}${placeButton('after', '所选条目后')}</div>${needsReference ? `<label class="ctb-placement-reference"><span>选择参照条目</span><select class="ctb-input" id="ctb-preset-transfer-anchor" aria-label="选择参照条目"${candidates.length ? '' : ' disabled'}>${referenceOptions}</select></label>` : ''}</div></div>`;
+        return `<div class="ctb-preset-placement" aria-label="条目放置位置"><div class="ctb-preset-placement-label"><strong>放到哪里</strong><span>复制或移动后写入${placementScope}</span></div><div class="ctb-preset-placement-main"><div class="ctb-placement-choices">${placeButton('top', '列表开头')}${placeButton('after', '所选条目后')}</div>${needsReference ? `<label class="ctb-placement-reference"><span>插入到哪条后面</span><select class="ctb-input" id="ctb-preset-transfer-anchor" aria-label="插入到哪条后面"${candidates.length ? '' : ' disabled'}>${referenceOptions}</select></label>` : ''}</div></div>`;
     }
 
     function renderPresetDraftFields(saveLabel = '保存条目') {
@@ -4473,20 +4564,6 @@
         apply();
         (host.requestAnimationFrame || ((callback) => host.setTimeout(callback, 0)))(apply);
         host.setTimeout(apply, 60);
-    }
-
-    function updateSelectionUi(kind) {
-        if (!root) return;
-        const isPreset = kind === 'preset';
-        const selected = isPreset ? presetTransferSelected : worldbookSelected;
-        const count = selected.size;
-        root.querySelectorAll(`[data-${kind}-selection-count]`).forEach((node) => {
-            node.textContent = `已选 ${count} 条`;
-        });
-        root.querySelectorAll(`[data-${kind}-bulk-action]`).forEach((node) => {
-            const needsTarget = node.dataset.ctbNeedsTarget === 'true';
-            node.disabled = !count || (needsTarget && !presetTransferTarget);
-        });
     }
 
     function renderPanel({ remember = true } = {}) {
@@ -4617,9 +4694,10 @@
             #${ROOT_ID} .ctb-info span{color:inherit!important;font:inherit!important;}
             #${ROOT_ID} .ctb-info:hover{border-color:#70777e;color:#70777e!important;background:transparent!important;}
             #${ROOT_ID} .ctb-info-on-button{margin-left:5px;border-color:#c7cbd0;color:#d1d4d8!important;}
-            #${ROOT_ID} .ctb-export-epub-combo{display:flex;align-items:center;min-width:0;height:39px;overflow:hidden;border-radius:4px;background:#5f94c4;}
-            #${ROOT_ID} .ctb-export-epub{display:inline-flex;align-items:center;justify-content:center;flex:1;min-width:0;gap:4px;border-radius:4px 0 0 4px;}
-            #${ROOT_ID} .ctb-export-info{flex:0 0 auto;margin:0 10px 0 3px;}
+            #${ROOT_ID} .ctb-export-epub-combo{display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;height:39px;overflow:hidden;border-radius:4px;background:#5f94c4;}
+            #${ROOT_ID} .ctb-export-epub-combo .ctb-export-epub{display:inline-flex;align-items:center;justify-content:center;flex:0 1 auto;min-width:0;gap:4px;padding:0;border:0!important;border-radius:0;background:transparent!important;box-shadow:none!important;}
+            #${ROOT_ID} .ctb-export-epub-combo .ctb-export-epub:hover{border:0!important;background:transparent!important;}
+            #${ROOT_ID} .ctb-export-info{flex:0 0 auto;margin:0;border-color:rgba(255,255,255,.72);color:#fff!important;}
             #${ROOT_ID} .ctb-pending-title-side{display:inline-flex;align-items:center;gap:6px;}
             #${ROOT_ID} .ctb-pending-text,#${ROOT_ID} .ctb-review-dialog-text{display:block;max-height:185px;overflow:auto;padding:7px 8px;color:#55585c;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#ebe8e7;}
             #${ROOT_ID} .ctb-pending-text mark,#${ROOT_ID} .ctb-review-dialog-text mark{padding:0;background:transparent;color:#c34f4e;font-weight:700;}
@@ -4639,7 +4717,7 @@
             #${ROOT_ID} .ctb-post-label{margin-bottom:4px;color:#777b81;font-size:11px;}
             #${ROOT_ID} .ctb-post-label-actions{display:flex;align-items:center;justify-content:space-between;gap:6px;}
             #${ROOT_ID} .ctb-post-text{height:170px;max-height:32vh;overflow:auto;margin:0;padding:8px;border:1px solid #d0d2d7;border-radius:3px;background:#ececef;color:#55585d;font:11px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;}
-            #${ROOT_ID} .ctb-post-edit-textarea{width:100%;resize:vertical;} #${ROOT_ID} .ctb-diff-add{padding:0;background:transparent;color:#c1504f;font-weight:700;} #${ROOT_ID} .ctb-diff-paragraph{box-decoration-break:clone;-webkit-box-decoration-break:clone;}
+            #${ROOT_ID} .ctb-post-edit-textarea{width:100%;resize:vertical;}
             #${ROOT_ID} .ctb-save{background:#789b82!important;color:#fff!important;}
             #${ROOT_ID} .ctb-staged-note,#${ROOT_ID} .ctb-save-progress{display:flex;align-items:center;gap:7px;margin-top:6px;padding:6px 8px;border:1px solid #c9d4cc;border-radius:3px;background:#e7ece8;color:#657069;font-size:11px;}
             #${ROOT_ID} .ctb-save-progress{border-color:#b9c9d4;background:#e5ebef;color:#566974;}
@@ -4676,7 +4754,13 @@
             #${ROOT_ID} .ctb-post-review-grid{grid-template-columns:1fr 1fr 1fr;}
             #${ROOT_ID} .ctb-post-review-grid>div+div{border-left:1px solid #d3d5d8;background:#eef0ee;}
             #${ROOT_ID} .ctb-review-edit{width:100%;min-height:75px;height:75px;resize:vertical;font-size:11px;line-height:1.45;}
-            #${ROOT_ID} .ctb-diff-review-text{color:#c1504f!important;font-weight:700;}
+            #${ROOT_ID} .ctb-diff-pair{display:grid;grid-template-columns:1fr 1fr;}
+            #${ROOT_ID} .ctb-diff-pair>div{min-width:0;padding:7px;}
+            #${ROOT_ID} .ctb-diff-pair>div+div{border-left:1px solid #d3d5d8;background:#e5ebe7;}
+            #${ROOT_ID} .ctb-diff-pair small{color:#85898e;}
+            #${ROOT_ID} .ctb-diff-pair p{margin:3px 0 0;color:#4e5156;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
+            #${ROOT_ID} .ctb-diff-removed{color:#d92f3a;background:#fff0f1;text-decoration:line-through;text-decoration-thickness:2.5px;text-decoration-color:#d92f3a;text-decoration-skip-ink:none;}
+            #${ROOT_ID} .ctb-diff-added{color:var(--ctb-accent-ink);background:var(--ctb-accent-soft);text-decoration:none;}
             #${ROOT_ID} .ctb-notice-overlay{position:fixed;inset:0;z-index:2147483200;display:grid;place-items:center;padding:20px;background:rgba(18,21,27,.35);}
             #${ROOT_ID} .ctb-notice-card{width:min(420px,calc(100vw - 36px));padding:14px 16px;border:1px solid #c3c7cc;border-radius:4px;background:#f7f7f9;box-shadow:0 12px 30px rgba(0,0,0,.28);color:#50545a;}
             #${ROOT_ID} .ctb-notice-card.is-error{border-left:4px solid #c35a58;} #${ROOT_ID} .ctb-notice-card.is-warning{border-left:4px solid #b58b4d;} #${ROOT_ID} .ctb-notice-card.is-success{border-left:4px solid #7da287;}
@@ -4684,14 +4768,13 @@
             #${ROOT_ID} .ctb-confirm-actions{justify-content:flex-end;}
             #${ROOT_ID} .ctb-tabs{display:flex;overflow-x:auto;scrollbar-width:thin;} #${ROOT_ID} .ctb-tab{flex:0 0 calc(100% / var(--ctb-tab-count,4));min-width:92px;}
             #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-theater-render{display:block;min-height:1.2em;color:inherit;font:inherit;line-height:1.55;} #${ROOT_ID} .ctb-theater-history-list{max-height:365px;overflow:auto;padding-right:2px;scrollbar-width:thin;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;color:#6e7278;font-size:10px;} #${ROOT_ID} .ctb-theater-history-body{max-height:120px;overflow:hidden;color:#4e5257;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history-actions{justify-content:flex-end;flex-wrap:wrap;margin-top:6px;} #${ROOT_ID} .ctb-theater-history-tabs{margin:5px 0 7px;} #${ROOT_ID} .ctb-reader-overlay{position:fixed;inset:0;z-index:2147483150;display:grid;place-items:center;padding:10px;background:rgba(18,21,27,.5);} #${ROOT_ID} .ctb-reader-card{width:min(1100px,calc(100vw - 20px));height:calc(100vh - 20px);height:calc(100dvh - 20px);max-height:900px;display:flex;flex-direction:column;overflow:hidden;border:1px solid #bfc3c8;border-radius:4px;background:#f5f5f7;box-shadow:0 18px 48px rgba(0,0,0,.38);} #${ROOT_ID} .ctb-reader-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #d3d5d9;background:#fafafd;color:#4c5056;font-size:12px;font-weight:700;} #${ROOT_ID} .ctb-reader-content{flex:1;min-height:0;overflow:auto;padding:15px;background:#f0f0f2;color:#42464c;font:12px/1.65 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-reader-content .ctb-theater-render{min-height:100%;} 
-            #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:7px;margin-top:7px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-row{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border-bottom:1px solid #d5d7da;padding:5px 7px;} #${ROOT_ID} .ctb-manager-row:last-child{border-bottom:0;} #${ROOT_ID} .ctb-manager-row.is-active{background:#dfe8e2;} #${ROOT_ID} .ctb-manager-row>button{display:flex;min-width:0;flex-direction:column;align-items:flex-start;border:0;background:transparent;color:#50545a;text-align:left;cursor:pointer;} #${ROOT_ID} .ctb-manager-row strong,#${ROOT_ID} .ctb-manager-row small{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-manager-row small,#${ROOT_ID} .ctb-manager-row>span{color:#85898e;font-size:9px;} #${ROOT_ID} .ctb-manager-editor{display:grid;align-content:start;gap:6px;padding:8px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:sticky;bottom:-15px;justify-content:space-between;margin:10px -16px -15px;padding:8px 16px;border-top:1px solid #cdd0d4;background:#ececef;color:#697069;font-size:11px;}
-            #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:grid;grid-template-columns:16px minmax(0,1fr);align-items:start;gap:6px;padding:7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry.is-target{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
-            #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;}
+            #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
+            #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:7px;margin-top:7px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-row{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border-bottom:1px solid #d5d7da;padding:5px 7px;} #${ROOT_ID} .ctb-manager-row:last-child{border-bottom:0;} #${ROOT_ID} .ctb-manager-row.is-active{background:#dfe8e2;} #${ROOT_ID} .ctb-manager-row>button{display:flex;min-width:0;flex-direction:column;align-items:flex-start;border:0;background:transparent;color:#50545a;text-align:left;cursor:pointer;} #${ROOT_ID} .ctb-manager-row strong,#${ROOT_ID} .ctb-manager-row small{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-manager-row small,#${ROOT_ID} .ctb-manager-row>span{color:#85898e;font-size:9px;} #${ROOT_ID} .ctb-manager-editor{display:grid;align-content:start;gap:6px;padding:8px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
+            #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
             #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.62;}
             #${ROOT_ID} .ctb-preset-entry-head{display:flex;align-items:center;gap:6px;min-width:0;}
             #${ROOT_ID} .ctb-preset-entry-head>input{flex:0 0 auto;margin:0;}
             #${ROOT_ID} .ctb-preset-entry-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:#50545a;font:11px/1.35 var(--mainFontFamily,Arial,sans-serif);font-weight:500;text-align:left;cursor:pointer;}
-            #${ROOT_ID} .ctb-preset-entry-status{display:block!important;flex-direction:initial!important;margin-left:auto;flex:0 0 auto;color:#85898e;font-size:9px;white-space:nowrap;}
             #${ROOT_ID} .ctb-preset-editor{display:grid;align-content:start;gap:5px;margin-top:7px;padding:7px;border:1px solid #cfd2d6;background:#ececef;}
             #${ROOT_ID} .ctb-preset-editor .ctb-field{display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:5px;font-size:10px;}
             #${ROOT_ID} .ctb-preset-editor .ctb-field>span{color:#697078;}
@@ -4705,9 +4788,9 @@
             #${ROOT_ID} .ctb-preset-compare-side small{color:#85898e;font-size:9px;}
             #${ROOT_ID} .ctb-preset-compare-side p{margin:2px 0 0;overflow:hidden;color:#5b6066;line-height:1.4;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;}
             #${ROOT_ID} .ctb-list-more{display:block;width:100%;border:0;border-top:1px solid #d1d4d7;background:#e1e3e5;color:#697078;padding:7px;cursor:pointer;font:10px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-list-more:hover{background:#d8ddda;}
-            #${SETTINGS_ID}{display:block!important;clear:both;margin:10px 0;border:1px solid var(--SmartThemeBorderColor,#777);border-radius:5px;background:rgba(255,255,255,.04);color:var(--SmartThemeBodyColor,inherit);} #${SETTINGS_ID} .ctb-extension-settings-header{display:flex;align-items:center;gap:8px;min-height:36px;padding:9px 11px;cursor:pointer;font-weight:700;} #${SETTINGS_ID} .ctb-extension-settings-header b{display:inline-flex;align-items:center;gap:7px;} #${SETTINGS_ID} .ctb-settings-version{margin-left:auto;color:var(--SmartThemeEmColor,#999);font-size:11px;font-weight:400;} #${SETTINGS_ID} .ctb-settings-chevron{margin-left:2px;transition:transform .15s;} #${SETTINGS_ID} .ctb-settings-chevron.down{transform:rotate(180deg);} #${SETTINGS_ID} .ctb-extension-settings-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:8px 12px 12px;border-top:1px solid rgba(127,132,140,.22);} #${SETTINGS_ID} .ctb-extension-settings-body[hidden]{display:none!important;} #${SETTINGS_ID} .ctb-extension-settings-title,#${SETTINGS_ID} p{grid-column:1/-1;} #${SETTINGS_ID} .ctb-extension-settings-title{font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;} #${SETTINGS_ID} p{margin:4px 0 0;color:var(--SmartThemeEmColor,#999);font-size:11px;line-height:1.45;}
+            #${SETTINGS_ID}{display:block!important;clear:both;margin:0;color:var(--SmartThemeBodyColor,inherit);} #${SETTINGS_ID} .ctb-extension-settings-header{display:flex;align-items:center;gap:8px;min-height:36px;padding:9px 12px;border-left:3px solid var(--SmartThemeQuoteColor,#4d83b7);border-right:3px solid var(--SmartThemeQuoteColor,#4d83b7);cursor:pointer;font-weight:700;} #${SETTINGS_ID} .ctb-extension-settings-header b{display:inline-flex;align-items:center;gap:7px;} #${SETTINGS_ID} .ctb-settings-version{margin-left:auto;color:var(--SmartThemeEmColor,#999);font-size:11px;font-weight:400;} #${SETTINGS_ID} .ctb-settings-chevron{margin-left:2px;transition:transform .15s;} #${SETTINGS_ID} .ctb-settings-chevron.down{transform:rotate(180deg);} #${SETTINGS_ID} .ctb-extension-settings-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:8px 15px 12px;} #${SETTINGS_ID} .ctb-extension-settings-body[hidden]{display:none!important;} #${SETTINGS_ID} .ctb-extension-settings-title{grid-column:1/-1;font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;}
             @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-grid,#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
-            @media (max-width:560px){#${ROOT_ID} .ctb-manager-grid,#${ROOT_ID} .ctb-preset-transfer-grid,#${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-preset-compare-side{padding-left:0;border-left:0;border-top:1px solid #d5d7da;padding-top:4px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:-12px;margin-right:-12px;padding-left:12px;padding-right:12px;}#${SETTINGS_ID} .ctb-extension-settings-body{grid-template-columns:1fr;}}
+            @media (max-width:560px){#${ROOT_ID} .ctb-manager-grid,#${ROOT_ID} .ctb-preset-transfer-grid,#${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-preset-compare-side{padding-left:0;border-left:0;border-top:1px solid #d5d7da;padding-top:4px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:0;margin-right:0;padding-left:0;padding-right:0;}#${SETTINGS_ID} .ctb-extension-settings-body{grid-template-columns:1fr;}}
 
             /* v0.9.1 manager redesign: light, readable, single-list editing and full-width comparison */
             #${ROOT_ID} .ctb-card{background:#fff;color:#1f2937;border-color:#cbd5e1;}
@@ -4738,7 +4821,7 @@
             #${ROOT_ID} .ctb-card-wide .ctb-check,#${ROOT_ID} .ctb-card-wide .ctb-mini-field{color:#334155;font-size:11px;}
             #${ROOT_ID} .ctb-card-wide .ctb-readonly-note{border-left-color:#64748b;background:#f1f5f9;color:#334155;}
             #${ROOT_ID} .ctb-card-wide .ctb-world-empty{color:#475569;font-size:11px;}
-            #${ROOT_ID} .ctb-card-wide .ctb-manager-savebar{border-color:#cbd5e1;background:#fff;color:#334155;}
+            #${ROOT_ID} .ctb-card-wide .ctb-manager-savebar{border-color:#cbd5e1;background:transparent;color:#334155;}
 
             #${ROOT_ID} .ctb-worldbook-entry-list .ctb-manager-list{max-height:none;overflow:visible;border:0;background:transparent;}
             #${ROOT_ID} .ctb-worldbook-entry{margin-bottom:7px;overflow:hidden;border:1px solid #cbd5e1;border-left:5px solid #94a3b8;border-radius:6px;background:#fff;color:#172033;transition:border-color .15s,box-shadow .15s;}
@@ -4775,7 +4858,6 @@
             #${ROOT_ID} .ctb-preset-entry.is-selected{background:#eff6ff;box-shadow:inset 3px 0 #2563eb;}
             #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.7;background:#f8fafc;}
             #${ROOT_ID} .ctb-preset-entry-title{overflow-wrap:anywhere;white-space:normal;color:#0f172a;font-size:12px;font-weight:650;}
-            #${ROOT_ID} .ctb-preset-entry-status{padding:2px 6px;border-radius:999px;background:#f1f5f9;color:#334155;font-size:10px;}
             #${ROOT_ID} .ctb-preset-editor{border-color:#cbd5e1;border-radius:5px;background:#f8fafc;}
             #${ROOT_ID} .ctb-preset-editor .ctb-field>span{color:#334155;}
             #${ROOT_ID} .ctb-preset-actions{display:grid;gap:9px;padding:10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;}
@@ -4800,6 +4882,7 @@
             #${ROOT_ID} .ctb-preset-entry-head>input{width:16px;height:16px;margin:0;}
             #${ROOT_ID} .ctb-preset-entry-title{min-width:0;margin:0;padding:0;border:0;background:transparent;color:#0f172a;font:600 12px/1.35 var(--mainFontFamily,Arial,sans-serif);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer;}
             #${ROOT_ID} .ctb-preset-entry-status{display:inline-flex!important;align-items:center;justify-content:center;margin-left:0!important;padding:2px 6px;border-radius:999px;background:#f1f5f9;color:#334155;font-size:10px;white-space:nowrap;}
+            #${ROOT_ID} .ctb-preset-entry-head .ctb-preset-entry-status{justify-self:end;width:max-content!important;min-width:0;max-width:86px;flex:0 0 auto;}
             #${ROOT_ID} .ctb-preset-entry-chevron{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;border:0;border-radius:4px;background:transparent;color:#334155;cursor:pointer;}
             #${ROOT_ID} .ctb-preset-entry-chevron:hover{background:#e2e8f0;color:#0f172a;}
             #${ROOT_ID} .ctb-preset-entry-chevron svg{width:16px;height:16px;transition:transform .15s;}
@@ -4853,23 +4936,29 @@
             #${ROOT_ID} .ctb-theme-toggle{display:inline-flex;align-items:center;justify-content:center;width:24px;height:27px;padding:0;border:0;border-radius:0;background:transparent;color:var(--ctb-accent);font-size:16px;cursor:pointer;}
             #${ROOT_ID} .ctb-theme-toggle:hover{background:transparent;color:var(--ctb-accent-strong);transform:scale(1.08);}
 
-            #${ROOT_ID} .ctb-worldbook-status-controls{display:inline-flex;align-items:center;gap:5px;}
-            #${ROOT_ID} .ctb-worldbook-light-button,#${ROOT_ID} .ctb-worldbook-enabled-button{display:inline-flex;align-items:center;justify-content:center;width:27px;height:27px;padding:0;border:1px solid #cbd5e1;border-radius:50%;background:#f8fafc;color:#475569;cursor:pointer;}
-            #${ROOT_ID} .ctb-worldbook-light-button:hover,#${ROOT_ID} .ctb-worldbook-enabled-button:hover{border-color:var(--ctb-accent);background:var(--ctb-accent-soft);}
-            #${ROOT_ID} .ctb-worldbook-light-button .ctb-worldbook-status-dot{width:21px;height:21px;border-radius:50%;background:currentColor;box-shadow:inset 0 0 0 3px rgba(255,255,255,.9);}
-            #${ROOT_ID} .ctb-worldbook-light-button.is-blue{color:#5b789d;background:#eef3f9;border-color:#9bb1cb;}
-            #${ROOT_ID} .ctb-worldbook-light-button.is-green{color:#5f866e;background:#eff6f1;border-color:#a0bdaa;}
-            #${ROOT_ID} .ctb-worldbook-light-button.is-off{color:#64748b;background:#f1f5f9;border-color:#cbd5e1;}
-            #${ROOT_ID} .ctb-worldbook-enabled-button.is-on{color:var(--ctb-accent-ink);}
-            #${ROOT_ID} .ctb-worldbook-enabled-button.is-off{color:#94a3b8;}
-            #${ROOT_ID} .ctb-worldbook-power-dot{width:21px;height:21px;border:2px solid currentColor;border-radius:50%;background:transparent;}
-            #${ROOT_ID} .ctb-worldbook-enabled-button.is-on .ctb-worldbook-power-dot{border-color:currentColor;background:currentColor;}
+            #${ROOT_ID} .ctb-worldbook-status-controls{display:inline-flex;align-items:center;gap:6px;}
+            #${ROOT_ID} .ctb-worldbook-light-button,#${ROOT_ID} .ctb-worldbook-enabled-button{display:inline-flex;align-items:center;justify-content:center;width:36px;height:20px;padding:0;border:0;border-radius:999px;background:transparent;color:inherit;cursor:pointer;box-shadow:none;}
+            #${ROOT_ID} .ctb-worldbook-light-button:focus-visible,#${ROOT_ID} .ctb-worldbook-enabled-button:focus-visible{outline:2px solid color-mix(in srgb,var(--ctb-accent) 65%,#fff);outline-offset:2px;}
+            #${ROOT_ID} .ctb-worldbook-status-track,#${ROOT_ID} .ctb-worldbook-power-track{position:relative;display:block;width:36px;height:20px;border-radius:999px;background:#aebdca;box-shadow:inset 0 0 0 1px rgba(15,23,42,.06);transition:background .15s;}
+            #${ROOT_ID} .ctb-worldbook-status-thumb,#${ROOT_ID} .ctb-worldbook-power-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(15,23,42,.32);transition:left .15s;}
+            #${ROOT_ID} .ctb-worldbook-light-button:hover .ctb-worldbook-status-track,#${ROOT_ID} .ctb-worldbook-enabled-button:hover .ctb-worldbook-power-track{filter:brightness(1.05);}
+            #${ROOT_ID} .ctb-worldbook-light-button.is-blue .ctb-worldbook-status-track{background:#4f86cf;}
+            #${ROOT_ID} .ctb-worldbook-light-button.is-blue .ctb-worldbook-status-thumb{left:2px;}
+            #${ROOT_ID} .ctb-worldbook-light-button.is-green .ctb-worldbook-status-track{background:#579a6b;}
+            #${ROOT_ID} .ctb-worldbook-light-button.is-green .ctb-worldbook-status-thumb{left:calc(100% - 18px);}
+            #${ROOT_ID} .ctb-worldbook-light-button.is-off .ctb-worldbook-status-track{background:#aebdca;}
+            #${ROOT_ID} .ctb-worldbook-enabled-button.is-on .ctb-worldbook-power-track{background:#59636f;}
+            #${ROOT_ID} .ctb-worldbook-enabled-button.is-on .ctb-worldbook-power-thumb{left:calc(100% - 18px);}
+            #${ROOT_ID} .ctb-worldbook-enabled-button.is-off .ctb-worldbook-power-track{background:#aebdca;}
             #${ROOT_ID} .ctb-worldbook-entry.is-expanded{border-color:var(--ctb-accent)!important;box-shadow:0 3px 12px rgba(15,23,42,.09);}
             #${ROOT_ID} .ctb-worldbook-entry.is-selected{outline-color:color-mix(in srgb,var(--ctb-accent) 45%,#fff)!important;}
             #${ROOT_ID} .ctb-worldbook-entry-list{margin-top:8px;}
-            #${ROOT_ID} .ctb-worldbook-selection-tools{flex-wrap:wrap;margin:0;}
-            #${ROOT_ID} .ctb-worldbook-selection-tools .ctb-button{height:27px;}
-            #${ROOT_ID} .ctb-worldbook-batch-panel{margin:8px 0 0;padding:7px 8px;border:1px solid #cbd5e1;border-radius:5px;background:#f8fafc;}
+            #${ROOT_ID} .ctb-worldbook-batch-panel{display:grid;gap:7px;margin:8px 0 0;padding:7px 8px;border:1px solid #cbd5e1;border-radius:5px;background:#f8fafc;}
+            #${ROOT_ID} .ctb-worldbook-batch-head{display:flex;align-items:center;gap:10px;min-width:0;}
+            #${ROOT_ID} .ctb-worldbook-selected-count{flex:0 0 auto;margin-right:auto;font-weight:600;white-space:nowrap;}
+            #${ROOT_ID} .ctb-worldbook-batch-actions,#${ROOT_ID} .ctb-worldbook-copy-row{display:flex;align-items:center;justify-content:flex-end;gap:6px;min-width:0;flex-wrap:wrap;}
+            #${ROOT_ID} .ctb-worldbook-batch-actions .ctb-button,#${ROOT_ID} .ctb-worldbook-copy-row .ctb-button{height:27px;}
+            #${ROOT_ID} .ctb-worldbook-copy-target{flex:0 1 230px;min-width:170px;height:27px;padding:0 7px;font-size:10px;}
             #${ROOT_ID} .ctb-worldbook-selected-count{margin-right:auto;color:#334155;font-weight:700;}
             #${ROOT_ID} .ctb-worldbook-inline-editor .ctb-manager-checks{flex-wrap:wrap;align-items:center;}
             #${ROOT_ID} .ctb-recursion-quick{margin-left:auto;}
@@ -4919,8 +5008,10 @@
                 #${ROOT_ID} .ctb-theme-toggle{width:22px;height:25px;padding:0;font-size:15px;}
                 #${ROOT_ID} .ctb-worldbook-entry-head{gap:5px;padding:6px;}
                 #${ROOT_ID} .ctb-worldbook-status-controls{gap:3px;}
-                #${ROOT_ID} .ctb-worldbook-light-button,#${ROOT_ID} .ctb-worldbook-enabled-button{width:25px;height:25px;}
-                #${ROOT_ID} .ctb-worldbook-light-button .ctb-worldbook-status-dot,#${ROOT_ID} .ctb-worldbook-power-dot{width:19px;height:19px;}
+                #${ROOT_ID} .ctb-worldbook-light-button,#${ROOT_ID} .ctb-worldbook-enabled-button{width:36px;height:20px;}
+                #${ROOT_ID} .ctb-worldbook-batch-head{align-items:flex-start;flex-direction:column;}
+                #${ROOT_ID} .ctb-worldbook-selected-count{margin-right:0;}
+                #${ROOT_ID} .ctb-worldbook-batch-actions,#${ROOT_ID} .ctb-worldbook-copy-row{width:100%;}
                 #${ROOT_ID} .ctb-placement-choices{grid-template-columns:repeat(2,minmax(0,1fr));}
                 #${ROOT_ID} .ctb-placement-reference{align-items:stretch;flex-direction:column;gap:3px;}
             }
@@ -5065,6 +5156,10 @@
             setTheaterWorldEntrySelected(target.dataset.theaterWorldName, target.dataset.theaterWorldEntryUid, target.checked);
             return;
         }
+        else if (target.dataset.theaterNativeEntryId !== undefined) {
+            setTheaterNativePresetEntrySelected(target.dataset.theaterNativeEntryId, target.checked);
+            return;
+        }
         else if (target.dataset.worldbookSelectUid !== undefined) {
             const uid = String(target.dataset.worldbookSelectUid);
             if (target.checked) worldbookSelected.add(uid);
@@ -5087,6 +5182,15 @@
         }
         else if (id === 'ctb-theater-world-book') {
             await chooseTheaterWorldBook(target.value);
+            return;
+        }
+        else if (id === 'ctb-theater-native-preset') {
+            await chooseTheaterNativePreset(target.value);
+            return;
+        }
+        else if (id === 'ctb-worldbook-copy-target') {
+            worldbookCopyTarget = String(target.value || '');
+            syncWorldbookSelectionUI();
             return;
         }
         else if (id === 'ctb-worldbook-book') {
@@ -5197,11 +5301,20 @@
                 settings.theater.contextTags = preset.contextTags || '';
                 settings.theater.includeCharacter = preset.includeCharacter !== false;
                 settings.theater.includePersona = preset.includePersona !== false;
+                settings.theater.nativePresetName = preset.nativePresetName || '';
+                settings.theater.nativePresetEntryIds = Array.isArray(preset.nativePresetEntryIds) ? preset.nativePresetEntryIds.map(String) : [];
                 settings.theater.worldEntries = Array.isArray(preset.worldEntries) ? preset.worldEntries.map((item) => ({ world: String(item.world), uid: String(item.uid) })) : [];
                 settings.theater.channelId = preset.channelId || 'main';
-            } else settings.theater.presetName = '';
+                theaterNativePresetName = settings.theater.nativePresetName;
+            } else {
+                settings.theater.presetName = '';
+                settings.theater.nativePresetName = '';
+                settings.theater.nativePresetEntryIds = [];
+                theaterNativePresetName = '';
+            }
             saveSettings();
-            renderPanel();
+            if (settings.theater.nativePresetName) await loadTheaterNativePresets({ name: settings.theater.nativePresetName });
+            else renderPanel();
         } else if (target.dataset.channelId && id.endsWith('-channel-model')) {
             const channel = channelEditor?.draft?.id === target.dataset.channelId ? channelEditor.draft : null;
             if (channel) channel.model = target.value;
@@ -5330,6 +5443,9 @@
             case 'clear-theater-world-selection': settings.theater.worldEntries = []; saveSettings(); return renderPanel();
             case 'select-theater-world-all': return setTheaterWorldBookSelection(true);
             case 'clear-theater-world-book': return setTheaterWorldBookSelection(false);
+            case 'refresh-theater-native-presets': return loadTheaterNativePresets({ force: true });
+            case 'select-theater-native-preset-all': return setTheaterNativePresetSelection(true);
+            case 'clear-theater-native-preset': return setTheaterNativePresetSelection(false);
             case 'save-theater-preset': return saveTheaterPreset();
             case 'delete-theater-preset': return deleteTheaterPreset();
             case 'run-theater': return runTheater();
@@ -5363,7 +5479,6 @@
             case 'cycle-worldbook-light': return cycleWorldbookLightV2(data.worldbookUid);
             case 'toggle-worldbook-enabled': return toggleWorldbookEnabledV2(data.worldbookUid);
             case 'select-all-worldbook-entries': return setWorldbookSelectionV2('all');
-            case 'invert-worldbook-selection': return setWorldbookSelectionV2('invert');
             case 'clear-worldbook-selection': return setWorldbookSelectionV2('clear');
             case 'enable-worldbook-recursion-guards': return enableCurrentWorldbookRecursionGuardsV2();
             case 'enable-selected-worldbook-recursion-guards': return enableSelectedWorldbookRecursionGuardsV2();
@@ -5371,6 +5486,7 @@
             case 'discard-worldbook-entry': return discardWorldbookDraftV2();
             case 'save-worldbook': return saveCurrentWorldbook();
             case 'copy-worldbook-entries': return copySelectedWorldbookEntriesV2();
+            case 'copy-worldbook-entries-to-book': return copySelectedWorldbookEntriesToBookV2();
             case 'delete-worldbook-entries': return deleteSelectedWorldbookEntries();
             case 'refresh-preset-transfer': return loadPresetTransfer({ force: true });
             case 'filter-preset-transfer': presetTransferVisibleLimit = 120; return renderPanel();
@@ -5401,16 +5517,6 @@
             case 'delete-preset-entries': return deletePresetEntries();
             default: return undefined;
         }
-    }
-
-    function findMenuTarget() {
-        const direct = doc.querySelector('#option_manage_chat_files, #option_select_chat_file, #option_select_chat');
-        if (direct) return direct;
-        const candidates = Array.from(doc.querySelectorAll('a, button, .list-group-item, .option_select'));
-        return candidates.find((node) => {
-            const text = String(node.textContent || '').trim();
-            return /manage\s+chat\s+files|管理聊天文件/i.test(text);
-        }) || null;
     }
 
     function findMenuRoot() {
@@ -5505,7 +5611,6 @@
             <div class="ctb-extension-settings-body"${isOpen ? '' : ' hidden'}>
                 <div class="ctb-extension-settings-title">功能开关</div>
                 ${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"${settings.modules?.[module.key] !== false ? ' checked' : ''}> <span>${module.label}</span></label>`).join('')}
-                <p>关闭后只隐藏对应功能页；三条杠菜单中的“聊天工具箱”入口始终保留。</p>
             </div>`;
         if (panel.parentElement !== target) target.appendChild(panel);
         return true;
