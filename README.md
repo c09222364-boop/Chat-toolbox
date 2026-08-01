@@ -38,6 +38,8 @@
 
 后续版本可以在“管理扩展”中更新，无需重新复制脚本。
 
+如果以前已经通过 Tampermonkey 或 Violentmonkey 启用了本脚本，请先禁用 Userscript 版本，避免同一个工具箱被重复加载。
+
 ### Userscript 兼容安装
 
 如果使用的 SillyTavern 环境无法安装第三方扩展，也可以安装 Tampermonkey、Violentmonkey 等 Userscript 管理器，打开 [聊天工具箱.user.js](./聊天工具箱.user.js)，复制全部内容到新建脚本中并保存。
