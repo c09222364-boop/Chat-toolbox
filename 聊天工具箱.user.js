@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.0
+// @version      1.0.1
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.0';
+    const VERSION = '1.0.1';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -1909,24 +1909,20 @@
     }
 
     function normalizeWorldBookEntries(world, data) {
-        const entries = Object.entries(data?.entries || {})
-            .map(([entryKey, value]) => {
-                if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-                const uid = String(value.uid ?? entryKey);
-                const keys = Array.isArray(value.key) ? value.key.map(String).filter(Boolean) : [];
-                const comment = String(value.comment || value.name || keys.join('、') || `条目 ${uid}`);
-                return {
-                    world: String(world),
-                    uid,
-                    comment,
-                    content: String(value.content ?? ''),
-                    disabled: value.disable === true || value.enabled === false,
-                    raw: value,
-                };
-            })
-            .filter(Boolean);
-        // 小剧场、段落改写和世界书管理共用同一套酒馆发送顺序。
-        return sortWorldbookRecords(entries);
+        // 与世界书管理共用完整记录标准化，避免异常 UID 造成顺序分叉。
+        return sortWorldbookRecords(worldbookRecords(data)).map((record) => {
+            const value = record.raw;
+            const uid = String(record.uid);
+            const keys = Array.isArray(value.key) ? value.key.map(String).filter(Boolean) : [];
+            return {
+                world: String(world),
+                uid,
+                comment: String(value.comment || value.name || keys.join('、') || `条目 ${uid}`),
+                content: String(value.content ?? ''),
+                disabled: value.disable === true || value.enabled === false,
+                raw: value,
+            };
+        });
     }
 
     async function fetchRewriteWorldEntries(world, { force = false } = {}) {
@@ -2747,11 +2743,17 @@
     }
 
     function orderedTheaterWorldBookNames(selections = settings.theater?.worldEntries || []) {
-        const selected = new Set(selections.map((item) => String(item.world || '')).filter(Boolean));
-        return [
-            ...theaterWorldBooks.filter((name) => selected.delete(name)),
-            ...[...selected].sort((a, b) => a.localeCompare(b)),
-        ];
+        const selected = new Set();
+        const order = [];
+        for (const item of selections) {
+            const name = String(item.world || '').trim();
+            if (name && !selected.has(name)) {
+                selected.add(name);
+                order.push(name);
+            }
+        }
+        // 多本书按首次选择顺序分组，书内按世界书管理顺序。
+        return order;
     }
 
     async function collectTheaterWorldEntries() {
