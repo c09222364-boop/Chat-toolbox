@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.9.10
+// @version      1.0.0
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.10';
+    const VERSION = '1.0.0';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -1909,7 +1909,7 @@
     }
 
     function normalizeWorldBookEntries(world, data) {
-        return Object.entries(data?.entries || {})
+        const entries = Object.entries(data?.entries || {})
             .map(([entryKey, value]) => {
                 if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
                 const uid = String(value.uid ?? entryKey);
@@ -1919,14 +1919,14 @@
                     world: String(world),
                     uid,
                     comment,
-                    keys,
                     content: String(value.content ?? ''),
                     disabled: value.disable === true || value.enabled === false,
-                    order: Number(value.order) || 0,
+                    raw: value,
                 };
             })
-            .filter(Boolean)
-            .sort((left, right) => right.order - left.order || left.comment.localeCompare(right.comment));
+            .filter(Boolean);
+        // 小剧场、段落改写和世界书管理共用同一套酒馆发送顺序。
+        return sortWorldbookRecords(entries);
     }
 
     async function fetchRewriteWorldEntries(world, { force = false } = {}) {
@@ -2746,18 +2746,28 @@
         syncTheaterSelectionUi();
     }
 
+    function orderedTheaterWorldBookNames(selections = settings.theater?.worldEntries || []) {
+        const selected = new Set(selections.map((item) => String(item.world || '')).filter(Boolean));
+        return [
+            ...theaterWorldBooks.filter((name) => selected.delete(name)),
+            ...[...selected].sort((a, b) => a.localeCompare(b)),
+        ];
+    }
+
     async function collectTheaterWorldEntries() {
         const selections = settings.theater?.worldEntries || [];
         if (!selections.length) return '';
-        const books = [...new Set(selections.map((item) => item.world))];
-        const loaded = new Map();
-        for (const world of books) {
-            try { loaded.set(world, await fetchTheaterWorldEntries(world)); } catch (_) {}
+        const selected = theaterSelectedWorldKeys();
+        const output = [];
+        for (const world of orderedTheaterWorldBookNames(selections)) {
+            let entries = [];
+            try { entries = await fetchTheaterWorldEntries(world); } catch (_) {}
+            for (const entry of entries) {
+                if (!selected.has(worldEntrySelectionKey(entry.world, entry.uid))) continue;
+                if (entry.content.trim()) output.push(`【${entry.world} · ${entry.comment}】\n${entry.content.trim()}`);
+            }
         }
-        return selections.map((selection) => {
-            const entry = (loaded.get(selection.world) || []).find((item) => item.uid === String(selection.uid));
-            return entry?.content?.trim() ? `【${entry.world} · ${entry.comment}】\n${entry.content.trim()}` : '';
-        }).filter(Boolean).join('\n\n');
+        return output.join('\n\n');
     }
 
     function theaterWorldSelectionCounts() {
@@ -2766,7 +2776,8 @@
             const world = String(item.world || '未命名世界书');
             counts.set(world, (counts.get(world) || 0) + 1);
         }
-        return [...counts.entries()].map(([world, count]) => ({ world, count }));
+        return orderedTheaterWorldBookNames(settings.theater.worldEntries || [])
+            .map((world) => ({ world, count: counts.get(world) || 0 }));
     }
 
     function syncTheaterSelectionUi() {
@@ -3764,12 +3775,6 @@
         }
     }
 
-    function worldbookStatusV2(raw) {
-        if (raw?.disable) return { className: 'is-off', label: '已关闭', title: '该条目已关闭，不会触发' };
-        if (raw?.constant) return { className: 'is-blue', label: '蓝灯', title: '蓝灯：常驻条目' };
-        return { className: 'is-green', label: '绿灯', title: '绿灯：关键词触发条目' };
-    }
-
     function mutateWorldbookEntryV2(uid, mutate) {
         const id = String(uid || '');
         const record = worldbookEntries.find((item) => item.uid === id);
@@ -3890,7 +3895,7 @@
         return records.map((record) => {
             const expanded = record.uid === String(worldbookEditingUid) && !!worldbookDraft;
             const raw = expanded ? worldbookDraft : (record.raw || {});
-            const status = worldbookStatusV2(raw);
+            const statusClass = raw.disable ? 'is-off' : raw.constant ? 'is-blue' : 'is-green';
             // 灯色与开关仍可独立编辑；关闭时界面统一置灰，但不丢失原灯色。
             const lightClass = raw.constant ? 'is-blue' : 'is-green';
             const selected = worldbookBatchMode && worldbookSelected.has(record.uid);
@@ -3898,7 +3903,7 @@
                 ? (raw.constant ? '当前关闭（蓝灯设定），点击切换绿灯设定' : '当前关闭（绿灯设定），点击切换蓝灯设定')
                 : raw.constant ? '当前蓝灯，点击切换绿灯' : '当前绿灯，点击切换蓝灯';
             const enabledTitle = raw.disable ? '条目已关闭，点击开启' : '条目已开启，点击关闭';
-            return `<article class="ctb-worldbook-entry ${status.className}${expanded ? ' is-expanded' : ''}${selected ? ' is-selected' : ''}" data-worldbook-row-uid="${escapeHTML(record.uid)}">
+            return `<article class="ctb-worldbook-entry ${statusClass}${expanded ? ' is-expanded' : ''}${selected ? ' is-selected' : ''}" data-worldbook-row-uid="${escapeHTML(record.uid)}">
                 <div class="ctb-worldbook-entry-head${worldbookBatchMode ? ' is-batch-mode' : ''}">
                     ${worldbookBatchMode ? `<input type="checkbox" data-worldbook-select-uid="${escapeHTML(record.uid)}"${selected ? ' checked' : ''} aria-label="选择条目 ${escapeHTML(worldbookRecordLabel(record))}">` : ''}
                     <div class="ctb-worldbook-status-controls" aria-label="条目状态">
@@ -5578,7 +5583,6 @@
             case 'toggle-worldbook-batch': return toggleWorldbookBatchModeV2();
             case 'filter-worldbook': worldbookVisibleLimit = 120; return renderPanel();
             case 'more-worldbook-entries': worldbookVisibleLimit += 120; return renderPanel();
-            case 'edit-worldbook-entry': return editWorldbookEntry(data.worldbookUid);
             case 'toggle-worldbook-entry': return toggleWorldbookEntry(data.worldbookUid);
             case 'cycle-worldbook-light': return cycleWorldbookLightV2(data.worldbookUid);
             case 'toggle-worldbook-enabled': return toggleWorldbookEnabledV2(data.worldbookUid);
