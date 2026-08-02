@@ -4,11 +4,11 @@
 
 ## 当前版本
 
-- 当前稳定版：**v1.0.1**
+- 当前稳定版：**v1.0.2**
 - 原生扩展清单：[manifest.json](./manifest.json)
 - Userscript 兼容入口：[聊天工具箱.user.js](./聊天工具箱.user.js)
-- 版本归档：[versions/v1.0.1/聊天工具箱-v1.0.1.user.js](./versions/v1.0.1/聊天工具箱-v1.0.1.user.js)
-- 上一稳定版：[versions/v1.0.0/聊天工具箱-v1.0.0.user.js](./versions/v1.0.0/聊天工具箱-v1.0.0.user.js)
+- 版本归档：[versions/v1.0.2/聊天工具箱-v1.0.2.user.js](./versions/v1.0.2/聊天工具箱-v1.0.2.user.js)
+- 上一稳定版：[versions/v1.0.1/聊天工具箱-v1.0.1.user.js](./versions/v1.0.1/聊天工具箱-v1.0.1.user.js)
 - 历史版本：[versions/v0.9.10/聊天工具箱-v0.9.10.user.js](./versions/v0.9.10/聊天工具箱-v0.9.10.user.js)
 - 历史版本：[versions/v0.9.9/聊天工具箱-v0.9.9.user.js](./versions/v0.9.9/聊天工具箱-v0.9.9.user.js)
 - 历史版本：[versions/v0.9.8/聊天工具箱-v0.9.8.user.js](./versions/v0.9.8/聊天工具箱-v0.9.8.user.js)
