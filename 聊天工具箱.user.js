@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.9.9
+// @version      0.9.10
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.9';
+    const VERSION = '0.9.10';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -1444,14 +1444,11 @@
                 .join('\n\n');
             const conversation = normalized
                 .filter((message) => message?.role !== 'system')
-                .map((message) => ({ role: String(message?.role || 'user'), text: contentBlockText(message?.content) }))
-                .filter((message) => message.text);
-            const prompt = conversation.length === 1
-                ? conversation[0].text
-                : conversation.map((message) => `${message.role === 'assistant' ? 'Assistant' : 'User'}:\n${message.text}`).join('\n\n');
-            if (!prompt.trim()) throw new Error('没有可发送给模型的提示词');
+                .map((message) => ({ role: String(message?.role || 'user'), content: contentBlockText(message?.content) }))
+                .filter((message) => message.content.trim());
+            if (!conversation.length) throw new Error('没有可发送给模型的提示词');
             const output = await generateRaw.call(context, {
-                prompt,
+                prompt: conversation,
                 systemPrompt,
                 responseLength: feature === 'theater' ? 4096 : 8192,
             });
@@ -1989,7 +1986,7 @@
                 ? existing
                 : [...existing, { world: String(world), uid: String(uid) }])
             : existing.filter((item) => worldEntrySelectionKey(item.world, item.uid) !== key);
-        renderPanel();
+        syncRewriteSelectionUi();
     }
 
     function setCurrentWorldBookSelection(selected) {
@@ -2000,7 +1997,29 @@
         settings.rewrite.worldEntries = selected
             ? [...otherWorlds, ...entries.map((entry) => ({ world: entry.world, uid: entry.uid }))]
             : otherWorlds;
-        renderPanel();
+        syncRewriteSelectionUi();
+    }
+
+    function syncRewriteSelectionUi() {
+        if (!root) return;
+        const selected = selectedWorldEntryKeys();
+        root.querySelectorAll('[data-world-entry-uid]').forEach((input) => {
+            input.checked = selected.has(worldEntrySelectionKey(input.dataset.worldName, input.dataset.worldEntryUid));
+            input.closest('.ctb-world-entry')?.classList.toggle('is-selected', input.checked);
+        });
+        const count = root.querySelector('[data-rewrite-world-selected-count]');
+        if (count) count.textContent = selected.size ? `已选 ${selected.size} 条` : '未选择';
+        const button = root.querySelector('[data-rewrite-world-picker-button]');
+        button?.classList.toggle('ctb-primary-soft', selected.size > 0);
+        const clear = root.querySelector('[data-rewrite-world-clear]');
+        if (clear) clear.hidden = selected.size === 0;
+        const summary = root.querySelector('[data-rewrite-world-selection-summary]');
+        if (summary) {
+            summary.hidden = selected.size === 0;
+            summary.innerHTML = (settings.rewrite.worldEntries || [])
+                .map((item) => `<span title="${escapeHTML(worldEntryDisplayLabel(item))}">${escapeHTML(worldEntryDisplayLabel(item))}</span>`)
+                .join('');
+        }
     }
 
     function worldEntryDisplayLabel(selection) {
@@ -2482,9 +2501,7 @@
         const selections = settings.rewrite.worldEntries || [];
         const selectedKeys = selectedWorldEntryKeys();
         const entries = rewriteWorldEntryCache.get(rewriteWorldBook) || [];
-        const summary = selections.length
-            ? `<div class="ctb-world-selected-summary">${selections.map((item) => `<span title="${escapeHTML(worldEntryDisplayLabel(item))}">${escapeHTML(worldEntryDisplayLabel(item))}</span>`).join('')}</div>`
-            : '';
+        const summary = `<div class="ctb-world-selected-summary" data-rewrite-world-selection-summary${selections.length ? '' : ' hidden'}>${selections.map((item) => `<span title="${escapeHTML(worldEntryDisplayLabel(item))}">${escapeHTML(worldEntryDisplayLabel(item))}</span>`).join('')}</div>`;
         const bookOptions = rewriteWorldBooks.map((name) => `<option value="${escapeHTML(name)}"${name === rewriteWorldBook ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
         const entryList = rewriteWorldLoading
             ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>'
@@ -2493,7 +2510,7 @@
                 : !rewriteWorldBooks.length
                     ? '<div class="ctb-world-empty">没有读取到世界书。</div>'
                     : entries.length
-                        ? `<div class="ctb-world-entry-list">${entries.map((entry) => {
+                        ? `<div class="ctb-world-entry-list" data-ctb-scroll-key="rewrite-world-entry-list">${entries.map((entry) => {
                             const checked = selectedKeys.has(worldEntrySelectionKey(entry.world, entry.uid));
                             const preview = entry.content.trim().replace(/\s+/g, ' ').slice(0, 110);
                             return `<label class="ctb-world-entry${checked ? ' is-selected' : ''}">
@@ -2505,8 +2522,8 @@
                         : '<div class="ctb-world-empty">这本世界书没有条目。</div>';
         return `
             <div class="ctb-world-picker-summary">
-                <button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-rewrite-world-picker"><i class="fa-solid fa-book-open"></i> 选择世界书具体条目 <span>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button>
-                ${selections.length ? '<button type="button" class="ctb-button" data-action="clear-rewrite-world-selection">清空全部</button>' : ''}
+                <button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-rewrite-world-picker" data-rewrite-world-picker-button><i class="fa-solid fa-book-open"></i> 选择世界书具体条目 <span data-rewrite-world-selected-count>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button>
+                <button type="button" class="ctb-button" data-action="clear-rewrite-world-selection" data-rewrite-world-clear${selections.length ? '' : ' hidden'}>清空全部</button>
             </div>
             ${summary}
             ${rewriteWorldPickerOpen ? `<div class="ctb-world-picker">
@@ -3165,12 +3182,24 @@
 
     async function getWorldBookNames(force = false) {
         const context = getContext();
-        const direct = context.world_names || context.worldNames || host.world_names || host.worldNames;
-        if (!force && Array.isArray(direct) && direct.length) return [...new Set(direct.map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+        const readNames = () => {
+            try {
+                const values = typeof context.getWorldInfoNames === 'function'
+                    ? context.getWorldInfoNames()
+                    : context.world_names || context.worldNames || host.world_names || host.worldNames;
+                return Array.isArray(values)
+                    ? [...new Set(values.map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b))
+                    : [];
+            } catch (_) {
+                return [];
+            }
+        };
+        const direct = readNames();
+        if (!force && direct.length) return direct;
         // 只有缓存确实不存在时才刷新列表；打开管理页不应触发酒馆全局世界书刷新。
         try { await context.updateWorldInfoList?.(); } catch (_) {}
-        const refreshed = context.world_names || context.worldNames || host.world_names || host.worldNames;
-        if (Array.isArray(refreshed) && refreshed.length) return [...new Set(refreshed.map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+        const refreshed = readNames();
+        if (refreshed.length) return refreshed;
         const data = await stProxyJson('/api/settings/get', {});
         return [...new Set((Array.isArray(data?.world_names) ? data.world_names : []).map(String).filter(Boolean))].sort((a, b) => a.localeCompare(b));
     }
@@ -5667,7 +5696,7 @@
         panel.hidden = false;
         panel.querySelectorAll('[data-ctb-module]').forEach((input) => {
             input.checked = settings.modules?.[input.dataset.ctbModule] !== false;
-        }, { timeoutSec: channel.timeoutSec });
+        });
         if (panel.parentElement !== target) target.appendChild(panel);
         return true;
     }
