@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      0.9.8
+// @version      0.9.9
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '0.9.8';
+    const VERSION = '0.9.9';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -117,9 +117,10 @@
     const worldbookPendingDocuments = new Map();
     let presetTransferLoading = false;
     let presetTransferLoadedOnce = false;
-    let presetTransferApi = 'openai';
     let presetTransferSource = '';
     let presetTransferTarget = '';
+    let presetTransferModeValue = 'single';
+    let presetTransferLoadModeValue = 'all';
     let presetTransferSourceEntries = [];
     let presetTransferTargetEntries = [];
     let presetTransferSourceDocument = null;
@@ -167,7 +168,6 @@
         'export-tags': '填入 content、small_theater 等标签名可只导出标签内部文字；留空则导出整条正文。',
         'export-epub': 'EPUB 会按消息生成章节。首次使用若浏览器没有打包组件，会提示加载一次。',
         'undo': '撤销只保留本次页面会话的最后一次操作，不会写进聊天文件；刷新或重开页面后失效。',
-        'post-edit-api': '生成渠道、密钥和规则预设保存在酒馆的插件设置中；酒馆设置不可用时才退回浏览器本地缓存。它们不会写进任何聊天记录。',
         'post-edit-overview': '对所选 AI 楼层做一次低成本的完整词句修订，不带入其他楼层；结果先对照审核，确认后才保存。',
         'post-edit-scope': '填写 content 时，会自动读取并只替换所选楼层 <content> 与 </content> 之间的文字；标签本身和楼层其他内容都保留。',
         'rewrite-scope': '逐段改写会结合选定的历史、角色卡、用户设定和世界书理解剧情，但 API 只返回段落补丁。每段都要由你采用或忽略，未采用的段落不会变化。',
@@ -231,15 +231,7 @@
                 presets: [],
                 nativePresetName: '',
                 nativePresetEntryIds: [],
-                history: [],
                 favorites: [],
-            },
-            presetTransfer: {
-                apiId: 'openai',
-                source: '',
-                target: '',
-                mode: 'single',
-                loadMode: 'all',
             },
         };
     }
@@ -1957,9 +1949,7 @@
         renderPanel();
         try {
             if (force || !rewriteWorldBooks.length) {
-                const data = await stProxyJson('/api/settings/get', {});
-                rewriteWorldBooks = [...new Set((Array.isArray(data?.world_names) ? data.world_names : []).map(String).filter(Boolean))]
-                    .sort((left, right) => left.localeCompare(right));
+                rewriteWorldBooks = await getWorldBookNames(force);
             }
             const preferred = rewriteWorldBook
                 || settings.rewrite.worldEntries?.find((item) => rewriteWorldBooks.includes(item.world))?.world
@@ -2667,12 +2657,8 @@
         return `<div class="ctb-theater-native-picker"><div class="ctb-inline ctb-theater-native-toolbar"><select class="ctb-input" id="ctb-theater-native-preset">${options}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-native-presets" title="刷新"><i class="fa-solid fa-rotate"></i></button>${theaterNativePresetName ? `<span class="ctb-selection-count" data-theater-native-selected-count>已选 ${selected.size} 条</span><button type="button" class="ctb-button" data-action="select-theater-native-preset-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-native-preset">清空</button>` : ''}</div>${list}</div>`;
     }
 
-    function theaterSelectionKey(world, uid) {
-        return `${String(world)}\u0000${String(uid)}`;
-    }
-
     function theaterSelectedWorldKeys() {
-        return new Set((settings.theater?.worldEntries || []).map((item) => theaterSelectionKey(item.world, item.uid)));
+        return new Set((settings.theater?.worldEntries || []).map((item) => worldEntrySelectionKey(item.world, item.uid)));
     }
 
     async function fetchTheaterWorldEntries(world, { force = false } = {}) {
@@ -2692,9 +2678,7 @@
         renderPanel();
         try {
             if (force || !theaterWorldBooks.length) {
-                const data = await stProxyJson('/api/settings/get', {});
-                theaterWorldBooks = [...new Set((Array.isArray(data?.world_names) ? data.world_names : []).map(String).filter(Boolean))]
-                    .sort((left, right) => left.localeCompare(right));
+                theaterWorldBooks = await getWorldBookNames(force);
             }
             const preferred = theaterWorldBook || currentCharacterWorldBookName();
             theaterWorldBook = theaterWorldBooks.includes(preferred) ? preferred : (theaterWorldBooks[0] || '');
@@ -2724,13 +2708,13 @@
     }
 
     function setTheaterWorldEntrySelected(world, uid, selected) {
-        const key = theaterSelectionKey(world, uid);
+        const key = worldEntrySelectionKey(world, uid);
         const existing = settings.theater.worldEntries || [];
         settings.theater.worldEntries = selected
-            ? (existing.some((item) => theaterSelectionKey(item.world, item.uid) === key)
+            ? (existing.some((item) => worldEntrySelectionKey(item.world, item.uid) === key)
                 ? existing
                 : [...existing, { world: String(world), uid: String(uid) }])
-            : existing.filter((item) => theaterSelectionKey(item.world, item.uid) !== key);
+            : existing.filter((item) => worldEntrySelectionKey(item.world, item.uid) !== key);
         syncTheaterSelectionUi();
     }
 
@@ -2780,7 +2764,7 @@
 
         const worldSelected = theaterSelectedWorldKeys();
         root.querySelectorAll('[data-theater-world-entry-uid]').forEach((input) => {
-            input.checked = worldSelected.has(theaterSelectionKey(input.dataset.theaterWorldName, input.dataset.theaterWorldEntryUid));
+            input.checked = worldSelected.has(worldEntrySelectionKey(input.dataset.theaterWorldName, input.dataset.theaterWorldEntryUid));
             input.closest('.ctb-world-entry')?.classList.toggle('is-selected', input.checked);
         });
         const total = settings.theater.worldEntries?.length || 0;
@@ -3074,7 +3058,7 @@
             : theaterWorldError
                 ? `<div class="ctb-world-empty ctb-world-error">${escapeHTML(theaterWorldError)}</div>`
                 : entries.length
-                    ? `<div class="ctb-world-entry-list" data-ctb-scroll-key="theater-world-entry-list">${entries.map((entry) => `<label class="ctb-world-entry${selected.has(theaterSelectionKey(entry.world, entry.uid)) ? ' is-selected' : ''}"><input type="checkbox" data-theater-world-entry-uid="${escapeHTML(entry.uid)}" data-theater-world-name="${escapeHTML(entry.world)}"${selected.has(theaterSelectionKey(entry.world, entry.uid)) ? ' checked' : ''}><span class="ctb-world-entry-main"><strong>${escapeHTML(entry.comment)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 110) || '（空条目）')}</small></span><span class="ctb-world-entry-meta">UID ${escapeHTML(entry.uid)}</span></label>`).join('')}</div>`
+                    ? `<div class="ctb-world-entry-list" data-ctb-scroll-key="theater-world-entry-list">${entries.map((entry) => `<label class="ctb-world-entry${selected.has(worldEntrySelectionKey(entry.world, entry.uid)) ? ' is-selected' : ''}"><input type="checkbox" data-theater-world-entry-uid="${escapeHTML(entry.uid)}" data-theater-world-name="${escapeHTML(entry.world)}"${selected.has(worldEntrySelectionKey(entry.world, entry.uid)) ? ' checked' : ''}><span class="ctb-world-entry-main"><strong>${escapeHTML(entry.comment)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 110) || '（空条目）')}</small></span><span class="ctb-world-entry-meta">UID ${escapeHTML(entry.uid)}</span></label>`).join('')}</div>`
                     : '<div class="ctb-world-empty">没有可选条目。</div>';
         return `<div class="ctb-world-picker-summary"><button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-theater-world-picker" data-theater-world-picker-button><i class="fa-solid fa-book-open"></i> 世界书条目 <span data-theater-world-selected-count>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button><button type="button" class="ctb-button" data-action="clear-theater-world-selection" data-theater-world-clear${selections.length ? '' : ' hidden'}>清空</button></div><div class="ctb-world-selected-summary" data-theater-world-selection-summary${selections.length ? '' : ' hidden'}>${summaries.map(({ world, count }) => `<span title="${escapeHTML(world)}">${escapeHTML(world)} · 已选 ${count} 条</span>`).join('')}</div>${theaterWorldPickerOpen ? `<div class="ctb-world-picker"><div class="ctb-inline ctb-world-book-row"><select class="ctb-input" id="ctb-theater-world-book">${books || '<option value="">没有世界书</option>'}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-world-books" title="刷新"><i class="fa-solid fa-rotate"></i></button><button type="button" class="ctb-button" data-action="close-theater-world-picker">完成</button></div>${theaterWorldBook ? `<div class="ctb-inline ctb-world-bulk"><span>${escapeHTML(theaterWorldBook)} · ${entries.length} 条</span><button type="button" class="ctb-button" data-action="select-theater-world-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-world-book">清空本书</button></div>` : ''}${list}</div>` : ''}`;
     }
@@ -3957,7 +3941,7 @@
         const context = getContext();
         const getter = context.getPresetManager || host.SillyTavern?.getPresetManager || host.getPresetManager;
         if (typeof getter !== 'function') throw new Error('当前酒馆版本没有公开预设管理接口');
-        const manager = getter.call(context, presetTransferApi || 'openai');
+        const manager = getter.call(context, 'openai');
         if (!manager) throw new Error('没有找到 Chat Completion 预设管理器，请先切换到可用的聊天补全接口');
         return manager;
     }
@@ -3967,7 +3951,7 @@
             const names = manager.getAllPresets();
             if (Array.isArray(names)) return [...new Set(names.map(String).filter(Boolean))];
         }
-        const list = manager.getPresetList?.(presetTransferApi) || {};
+        const list = manager.getPresetList?.('openai') || {};
         if (Array.isArray(list.preset_names)) return list.preset_names.map(String).filter(Boolean);
         return Object.keys(list.preset_names || {});
     }
@@ -3976,7 +3960,7 @@
         let data;
         if (typeof manager.getCompletionPresetByName === 'function') data = await manager.getCompletionPresetByName(name);
         if (!data && typeof manager.getPresetList === 'function') {
-            const list = manager.getPresetList(presetTransferApi) || {};
+            const list = manager.getPresetList('openai') || {};
             const names = list.preset_names || [];
             const index = Array.isArray(names) ? names.indexOf(name) : names[name];
             if (index !== undefined && index !== -1) data = list.presets?.[index];
@@ -3996,11 +3980,11 @@
      * 移动都只操作主顺序，删除时再清理其它组中已经失效的引用。
      */
     function presetTransferMode() {
-        return settings?.presetTransfer?.mode === 'dual' ? 'dual' : 'single';
+        return presetTransferModeValue;
     }
 
     function presetTransferLoadMode() {
-        return settings?.presetTransfer?.loadMode === 'enabled' ? 'enabled' : 'all';
+        return presetTransferLoadModeValue;
     }
 
     function presetTransferEntryMatchesLoadMode(entry) {
@@ -4223,7 +4207,7 @@
         if (typeof manager.savePreset !== 'function') throw new Error('当前预设管理器不支持保存');
         const next = deepClone(document);
         await manager.savePreset(name, next, { skipUpdate: true });
-        const list = manager.getPresetList?.(presetTransferApi) || {};
+        const list = manager.getPresetList?.('openai') || {};
         const names = list.preset_names || [];
         const index = Array.isArray(names) ? names.indexOf(name) : names[name];
         if (index !== undefined && index !== -1 && Array.isArray(list.presets)) {
@@ -4243,14 +4227,12 @@
             const manager = getPresetTransferManager();
             const names = presetTransferNames(manager);
             if (!names.length) throw new Error('没有读取到可用预设');
-            const savedSource = force ? presetTransferSource : (presetTransferSource || settings.presetTransfer.source);
-            presetTransferSource = names.includes(savedSource) ? savedSource : names[0];
+            presetTransferSource = names.includes(presetTransferSource) ? presetTransferSource : names[0];
             if (presetTransferMode() === 'single') {
                 presetTransferTarget = '';
             } else {
-                const targetCandidate = presetTransferTarget || settings.presetTransfer.target;
-                presetTransferTarget = names.includes(targetCandidate) && targetCandidate !== presetTransferSource
-                    ? targetCandidate
+                presetTransferTarget = names.includes(presetTransferTarget) && presetTransferTarget !== presetTransferSource
+                    ? presetTransferTarget
                     : (names.find((name) => name !== presetTransferSource) || '');
             }
             presetTransferSourceDocument = await loadPresetTransferDocument(manager, presetTransferSource);
@@ -4266,9 +4248,6 @@
             presetTransferAnchor = { kind: 'top', anchorId: '' };
             presetTransferDraft = null;
             presetTransferVisibleLimit = 120;
-            settings.presetTransfer.apiId = presetTransferApi;
-            settings.presetTransfer.source = presetTransferSource;
-            settings.presetTransfer.target = presetTransferTarget;
         } catch (error) {
             presetTransferError = error.message || String(error);
         } finally {
@@ -4307,7 +4286,7 @@
 
     async function setPresetTransferMode(mode) {
         const next = mode === 'dual' ? 'dual' : 'single';
-        settings.presetTransfer.mode = next;
+        presetTransferModeValue = next;
         presetTransferSelected = new Set();
         presetTransferAnchor = { kind: 'top', anchorId: '' };
         presetTransferDraft = null;
@@ -4794,16 +4773,12 @@
             #${ROOT_ID} .ctb-readonly-note{margin-top:7px;padding:7px 8px;border-left:3px solid #a9adb2;background:#e7e8eb;color:#72767b;font-size:12px;} #${ROOT_ID} .ctb-readonly-note i{margin-right:4px;}
             #${ROOT_ID} .ctb-undo-row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:7px;padding:5px 7px;border-top:1px solid #d9dadd;color:#6b6e73;font-size:11px;}
             #${ROOT_ID} .ctb-results{max-height:285px;overflow:auto;border:1px solid #ced1d5;border-radius:4px;background:#efeff2;} #${ROOT_ID} .ctb-results::-webkit-scrollbar{width:8px;} #${ROOT_ID} .ctb-results::-webkit-scrollbar-thumb{background:#b4b7bc;border-radius:3px;} #${ROOT_ID} .ctb-results-title{position:sticky;top:0;z-index:1;padding:6px 9px;border-bottom:1px solid #d3d5d9;background:#e2e2e7;color:#777a80;text-align:center;font-size:11px;}
-            #${ROOT_ID} .ctb-results-empty{margin-top:11px;padding:14px 9px;color:#8b8e93;text-align:center;} #${ROOT_ID} .ctb-result-row{display:block;width:100%;border:0;border-bottom:1px solid #d5d7db;border-radius:0;background:transparent;padding:6px 11px;color:#46494e;text-align:left;cursor:pointer;font:12px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-result-row:last-child{border-bottom:0;} #${ROOT_ID} .ctb-result-row:hover{background:#e3e7e4;} #${ROOT_ID} .ctb-result-row.is-active{background:#dfe8e2;} #${ROOT_ID} .ctb-result-meta{display:flex;justify-content:space-between;gap:8px;color:#777a80;font-size:11px;} #${ROOT_ID} .ctb-result-text{display:flex;align-items:baseline;min-width:0;overflow:hidden;margin-top:2px;white-space:nowrap;font-size:12px;} #${ROOT_ID} .ctb-result-before{max-width:34%;overflow:hidden;direction:rtl;text-align:right;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-result-text mark{flex:0 0 auto;} #${ROOT_ID} .ctb-result-after{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} mark,#${ROOT_ID} .ctb-pending-preview mark{padding:0;background:transparent;color:#c1504f;font-weight:700;}
+            #${ROOT_ID} .ctb-results-empty{margin-top:11px;padding:14px 9px;color:#8b8e93;text-align:center;} #${ROOT_ID} .ctb-result-row{display:block;width:100%;border:0;border-bottom:1px solid #d5d7db;border-radius:0;background:transparent;padding:6px 11px;color:#46494e;text-align:left;cursor:pointer;font:12px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-result-row:last-child{border-bottom:0;} #${ROOT_ID} .ctb-result-row:hover{background:#e3e7e4;} #${ROOT_ID} .ctb-result-row.is-active{background:#dfe8e2;} #${ROOT_ID} .ctb-result-meta{display:flex;justify-content:space-between;gap:8px;color:#777a80;font-size:11px;} #${ROOT_ID} .ctb-result-text{display:flex;align-items:baseline;min-width:0;overflow:hidden;margin-top:2px;white-space:nowrap;font-size:12px;} #${ROOT_ID} .ctb-result-before{max-width:34%;overflow:hidden;direction:rtl;text-align:right;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-result-text mark{flex:0 0 auto;} #${ROOT_ID} .ctb-result-after{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} mark{padding:0;background:transparent;color:#c1504f;font-weight:700;}
             #${ROOT_ID} .ctb-option-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 10px;margin-top:8px;} #${ROOT_ID} .ctb-export-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:12px;} #${ROOT_ID} .ctb-export-actions .ctb-button{height:39px;color:#fff!important;font-size:13px;font-weight:700;} #${ROOT_ID} .ctb-export-txt{background:#7da287!important;} #${ROOT_ID} .ctb-export-epub{background:#5f94c4!important;}
-            #${ROOT_ID} .ctb-toggle{display:inline-flex;align-items:center;gap:8px;color:#505359;font-weight:700;cursor:pointer;} #${ROOT_ID} .ctb-toggle input{position:absolute;opacity:0;pointer-events:none;} #${ROOT_ID} .ctb-toggle span{position:relative;width:34px;height:18px;border-radius:9px;background:#aeb2b6;} #${ROOT_ID} .ctb-toggle span:after{content:'';position:absolute;top:3px;left:3px;width:12px;height:12px;border-radius:50%;background:#fff;transition:left .15s;} #${ROOT_ID} .ctb-toggle input:checked+span{background:#7da287;} #${ROOT_ID} .ctb-toggle input:checked+span:after{left:19px;}
-            #${ROOT_ID} .ctb-rule-list{display:grid;gap:5px;margin-bottom:7px;} #${ROOT_ID} .ctb-rule-row{display:grid;grid-template-columns:42px minmax(110px,1fr) minmax(100px,1fr) 31px;gap:5px;align-items:center;} #${ROOT_ID} .ctb-rule-switch{display:flex;flex-direction:column;align-items:center;gap:2px;color:#74777c;font-size:10px;} #${ROOT_ID} .ctb-rule-row .ctb-input{font-size:11px;}
-            #${ROOT_ID} .ctb-pending-review{margin-bottom:6px;border:1px solid #d0c7c3;border-radius:4px;background:#ebe8e7;overflow:hidden;} #${ROOT_ID} .ctb-pending-title{display:flex;justify-content:space-between;gap:8px;padding:5px 7px;border-bottom:1px solid #d5cfcc;color:#685755;font-size:11px;font-weight:700;} #${ROOT_ID} .ctb-pending-title span+span{color:#85807d;font-weight:400;} #${ROOT_ID} .ctb-pending-preview{padding:6px 7px;color:#55585c;font-size:11px;word-break:break-word;} #${ROOT_ID} .ctb-pending-actions{display:flex;flex-wrap:wrap;gap:5px;padding:0 7px 7px;}
             #${ROOT_ID} .ctb-info{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;margin:0;padding:0;border:1px solid #9aa0a7;border-radius:50%;background:transparent;color:#7f858c;font-size:11px;line-height:1;cursor:pointer;} #${ROOT_ID} .ctb-info:hover{border-color:#5f826a;color:#51735d;background:#e4ece6;} #${ROOT_ID} .ctb-info-line{display:flex;align-items:center;min-height:5px;margin-top:5px;} #${ROOT_ID} .ctb-info-popup{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-top:10px;padding:7px 8px;border:1px solid #bfc7c2;border-left:3px solid #7da287;border-radius:4px;background:#e7ece8;color:#5e6660;font-size:11px;line-height:1.4;} #${ROOT_ID} .ctb-info-popup button{border:0;background:transparent;color:#747a76;font-size:16px;line-height:12px;padding:0;cursor:pointer;}
-            #${ROOT_ID} .ctb-float-setting{padding-top:10px;border-top:1px solid #d7d9dd;}
             .ctb-jump-highlight{outline:2px solid #7da287!important;outline-offset:2px;transition:outline-color .35s;}
             #${ENTRY_ID}{cursor:pointer;}
-            @media (max-width:560px){#${ROOT_ID}{padding:max(6px,env(safe-area-inset-top)) max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));}#${ROOT_ID} .ctb-card{width:calc(100vw - 12px);max-height:calc(100dvh - 12px);}#${ROOT_ID} .ctb-header{padding:10px 12px 8px;}#${ROOT_ID} .ctb-title{font-size:16px;}#${ROOT_ID} .ctb-tabs{padding:0 7px;}#${ROOT_ID} .ctb-tab{font-size:13px;}#${ROOT_ID} .ctb-body{padding:10px 12px 13px;}#${ROOT_ID} .ctb-search-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-search-row .ctb-input{flex-basis:100%;}#${ROOT_ID} .ctb-rule-row{grid-template-columns:39px 1fr 31px;}#${ROOT_ID} .ctb-rule-row .ctb-input:nth-of-type(2){grid-column:2/3;}#${ROOT_ID} .ctb-rule-row .ctb-input:nth-of-type(3){grid-column:2/3;}#${ROOT_ID} .ctb-rule-row .ctb-icon-button{grid-column:3;grid-row:1/3;} }
+            @media (max-width:560px){#${ROOT_ID}{padding:max(6px,env(safe-area-inset-top)) max(6px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(6px,env(safe-area-inset-left));}#${ROOT_ID} .ctb-card{width:calc(100vw - 12px);max-height:calc(100dvh - 12px);}#${ROOT_ID} .ctb-header{padding:10px 12px 8px;}#${ROOT_ID} .ctb-title{font-size:16px;}#${ROOT_ID} .ctb-tabs{padding:0 7px;}#${ROOT_ID} .ctb-tab{font-size:13px;}#${ROOT_ID} .ctb-body{padding:10px 12px 13px;}#${ROOT_ID} .ctb-search-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-search-row .ctb-input{flex-basis:100%;}}
             @supports not (height:100dvh){#${ROOT_ID}{height:100vh;min-height:100vh;}#${ROOT_ID} .ctb-card{max-height:min(720px,calc(100vh - 24px));}@media (max-width:560px){#${ROOT_ID} .ctb-card{max-height:calc(100vh - 12px);}}}
             /* v0.3.1 compact visual pass */
             #${ROOT_ID} .ctb-card{font-size:11px;border-radius:4px;}
@@ -4821,17 +4796,8 @@
             #${ROOT_ID} .ctb-export-epub-combo .ctb-export-epub{display:inline-flex;align-items:center;justify-content:center;flex:0 1 auto;min-width:0;gap:4px;padding:0;border:0!important;border-radius:0;background:transparent!important;box-shadow:none!important;}
             #${ROOT_ID} .ctb-export-epub-combo .ctb-export-epub:hover{border:0!important;background:transparent!important;}
             #${ROOT_ID} .ctb-export-info{flex:0 0 auto;margin:0;border-color:rgba(255,255,255,.72);color:#fff!important;}
-            #${ROOT_ID} .ctb-pending-title-side{display:inline-flex;align-items:center;gap:6px;}
-            #${ROOT_ID} .ctb-pending-text,#${ROOT_ID} .ctb-review-dialog-text{display:block;max-height:185px;overflow:auto;padding:7px 8px;color:#55585c;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:#ebe8e7;}
-            #${ROOT_ID} .ctb-pending-text mark,#${ROOT_ID} .ctb-review-dialog-text mark{padding:0;background:transparent;color:#c34f4e;font-weight:700;}
-            #${ROOT_ID} .ctb-review-empty{color:#8b8e93;}
             #${ROOT_ID} .ctb-review-expand{display:inline-flex;align-items:center;justify-content:center;width:19px;height:19px;padding:0;border:1px solid #c8c2bf;border-radius:3px;background:transparent;color:#807a78;cursor:pointer;}
             #${ROOT_ID} .ctb-review-expand:hover{background:#e1dcda;color:#5d5653;}
-            #${ROOT_ID} .ctb-review-overlay{position:fixed;inset:0;z-index:2147483100;display:grid;place-items:center;padding:20px;background:rgba(18,21,27,.48);}
-            #${ROOT_ID} .ctb-review-dialog{width:min(820px,calc(100vw - 36px));max-height:min(82vh,760px);display:flex;flex-direction:column;overflow:hidden;background:#f5f5f7;border:1px solid #bfc2c7;border-radius:4px;box-shadow:0 14px 38px rgba(0,0,0,.35);}
-            #${ROOT_ID} .ctb-review-dialog-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #d2d4d8;color:#555960;font-size:12px;font-weight:700;background:#fafafd;}
-            #${ROOT_ID} .ctb-review-dialog-text{max-height:none;flex:1;min-height:120px;overflow:auto;padding:12px;background:#f0f0f2;}
-            #${ROOT_ID} .ctb-post-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;}
             #${ROOT_ID} .ctb-textarea{height:100px;resize:vertical;line-height:1.45;}
             #${ROOT_ID} .ctb-post-actions{flex-wrap:wrap;}
             #${ROOT_ID} .ctb-post-preview{display:grid;grid-template-columns:1fr 1fr;gap:7px;}
@@ -4861,7 +4827,7 @@
             #${ROOT_ID} .ctb-model-row select{flex:1;}
             #${ROOT_ID} .ctb-mini-field{display:flex;align-items:center;gap:5px;min-width:0;color:#6f7277;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-mini-field .ctb-input{width:90px;}
             #${ROOT_ID} .ctb-preset-row{margin-bottom:6px;} #${ROOT_ID} .ctb-preset-row select{max-width:150px;} #${ROOT_ID} .ctb-preset-row input{flex:1;}
-            #${ROOT_ID} .ctb-context-row{flex-wrap:wrap;} #${ROOT_ID} .ctb-context-label{color:#74777c;font-size:10px;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;} #${ROOT_ID} .ctb-rewrite-global{height:62px;margin-top:6px;}
+            #${ROOT_ID} .ctb-context-row{flex-wrap:wrap;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;} #${ROOT_ID} .ctb-rewrite-global{height:62px;margin-top:6px;}
             #${ROOT_ID} .ctb-primary-soft{border-color:#91aa98;background:#e0e9e3;color:#4d6755;} #${ROOT_ID} .ctb-world-picker-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button:first-child{flex:1;justify-content:space-between;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button span{color:#7a817c;font-size:10px;font-weight:400;}
             #${ROOT_ID} .ctb-world-selected-summary{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;} #${ROOT_ID} .ctb-world-selected-summary span{max-width:100%;overflow:hidden;padding:3px 6px;border:1px solid #c9d2cc;border-radius:3px;background:#e5ebe7;color:#5c6860;font-size:10px;text-overflow:ellipsis;white-space:nowrap;}
             #${ROOT_ID} .ctb-world-picker{margin-top:6px;overflow:hidden;border:1px solid #cbd0cc;border-radius:3px;background:#e9ebeb;} #${ROOT_ID} .ctb-world-book-row{padding:6px;border-bottom:1px solid #cfd3d0;} #${ROOT_ID} .ctb-world-book-row select{flex:1;} #${ROOT_ID} .ctb-world-bulk{justify-content:flex-end;padding:5px 6px;border-bottom:1px solid #d3d6d4;color:#6d716f;font-size:10px;} #${ROOT_ID} .ctb-world-bulk>span{margin-right:auto;}
@@ -4891,15 +4857,12 @@
             #${ROOT_ID} .ctb-tabs{display:flex;overflow-x:auto;scrollbar-width:thin;} #${ROOT_ID} .ctb-tab{flex:0 0 calc(100% / var(--ctb-tab-count,4));min-width:92px;}
             #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-theater-render{display:block;min-height:1.2em;color:inherit;font:inherit;line-height:1.55;} #${ROOT_ID} .ctb-theater-history-list{max-height:365px;overflow:auto;padding-right:2px;scrollbar-width:thin;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;color:#6e7278;font-size:10px;} #${ROOT_ID} .ctb-theater-history-body{max-height:120px;overflow:hidden;color:#4e5257;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history-actions{justify-content:flex-end;flex-wrap:wrap;margin-top:6px;} #${ROOT_ID} .ctb-theater-history-tabs{margin:5px 0 7px;} #${ROOT_ID} .ctb-reader-overlay{position:fixed;inset:0;z-index:2147483150;display:grid;place-items:center;padding:10px;background:rgba(18,21,27,.5);} #${ROOT_ID} .ctb-reader-card{width:min(1100px,calc(100vw - 20px));height:calc(100vh - 20px);height:calc(100dvh - 20px);max-height:900px;display:flex;flex-direction:column;overflow:hidden;border:1px solid #bfc3c8;border-radius:4px;background:#f5f5f7;box-shadow:0 18px 48px rgba(0,0,0,.38);} #${ROOT_ID} .ctb-reader-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #d3d5d9;background:#fafafd;color:#4c5056;font-size:12px;font-weight:700;} #${ROOT_ID} .ctb-reader-content{flex:1;min-height:0;overflow:auto;padding:15px;background:#f0f0f2;color:#42464c;font:12px/1.65 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-reader-content .ctb-theater-render{min-height:100%;} 
             #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-selection-count{margin-left:auto;color:#64748b;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry.is-selected{background:#f1f6fb;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
-            #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:7px;margin-top:7px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-row{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border-bottom:1px solid #d5d7da;padding:5px 7px;} #${ROOT_ID} .ctb-manager-row:last-child{border-bottom:0;} #${ROOT_ID} .ctb-manager-row.is-active{background:#dfe8e2;} #${ROOT_ID} .ctb-manager-row>button{display:flex;min-width:0;flex-direction:column;align-items:flex-start;border:0;background:transparent;color:#50545a;text-align:left;cursor:pointer;} #${ROOT_ID} .ctb-manager-row strong,#${ROOT_ID} .ctb-manager-row small{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-manager-row small,#${ROOT_ID} .ctb-manager-row>span{color:#85898e;font-size:9px;} #${ROOT_ID} .ctb-manager-editor{display:grid;align-content:start;gap:6px;padding:8px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
+            #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
             #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
             #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.62;}
             #${ROOT_ID} .ctb-preset-entry-head{display:flex;align-items:center;gap:6px;min-width:0;}
             #${ROOT_ID} .ctb-preset-entry-head>input{flex:0 0 auto;margin:0;}
             #${ROOT_ID} .ctb-preset-entry-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:#50545a;font:11px/1.35 var(--mainFontFamily,Arial,sans-serif);font-weight:500;text-align:left;cursor:pointer;}
-            #${ROOT_ID} .ctb-preset-editor{display:grid;align-content:start;gap:5px;margin-top:7px;padding:7px;border:1px solid #cfd2d6;background:#ececef;}
-            #${ROOT_ID} .ctb-preset-editor .ctb-field{display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:5px;font-size:10px;}
-            #${ROOT_ID} .ctb-preset-editor .ctb-field>span{color:#697078;}
             #${ROOT_ID} .ctb-preset-draft-content{min-height:150px;height:150px;resize:vertical;line-height:1.45;}
             #${ROOT_ID} .ctb-preset-compare-list{max-height:260px;overflow:auto;margin:0 12px 7px;border:1px solid #cfd2d6;background:#ececef;}
             #${ROOT_ID} .ctb-preset-compare-row{display:grid;grid-template-columns:minmax(120px,.7fr) minmax(0,1fr) minmax(0,1fr);gap:7px;padding:6px 7px;border-bottom:1px solid #d5d7da;font-size:10px;}
@@ -4911,8 +4874,8 @@
             #${ROOT_ID} .ctb-preset-compare-side p{margin:2px 0 0;overflow:hidden;color:#5b6066;line-height:1.4;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;}
             #${ROOT_ID} .ctb-list-more{display:block;width:100%;border:0;border-top:1px solid #d1d4d7;background:#e1e3e5;color:#697078;padding:7px;cursor:pointer;font:10px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-list-more:hover{background:#d8ddda;}
             #${SETTINGS_ID} .ctb-extension-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:8px 15px 12px;} #${SETTINGS_ID} .ctb-extension-settings-title{grid-column:1/-1;font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;}
-            @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-grid,#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
-            @media (max-width:560px){#${ROOT_ID} .ctb-manager-grid,#${ROOT_ID} .ctb-preset-transfer-grid,#${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-preset-compare-side{padding-left:0;border-left:0;border-top:1px solid #d5d7da;padding-top:4px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:0;margin-right:0;padding-left:0;padding-right:0;}#${SETTINGS_ID} .ctb-extension-settings-grid{grid-template-columns:1fr;}}
+            @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
+            @media (max-width:560px){#${ROOT_ID} .ctb-preset-transfer-grid,#${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-preset-compare-side{padding-left:0;border-left:0;border-top:1px solid #d5d7da;padding-top:4px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:0;margin-right:0;padding-left:0;padding-right:0;}#${SETTINGS_ID} .ctb-extension-settings-grid{grid-template-columns:1fr;}}
 
             /* v0.9.1 manager redesign: light, readable, single-list editing and full-width comparison */
             #${ROOT_ID} .ctb-card{background:#fff;color:#1f2937;border-color:#cbd5e1;}
@@ -4980,16 +4943,11 @@
             #${ROOT_ID} .ctb-preset-entry.is-selected{background:#eff6ff;box-shadow:inset 3px 0 #2563eb;}
             #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.7;background:#f8fafc;}
             #${ROOT_ID} .ctb-preset-entry-title{overflow-wrap:anywhere;white-space:normal;color:#0f172a;font-size:12px;font-weight:650;}
-            #${ROOT_ID} .ctb-preset-editor{border-color:#cbd5e1;border-radius:5px;background:#f8fafc;}
-            #${ROOT_ID} .ctb-preset-editor .ctb-field>span{color:#334155;}
             #${ROOT_ID} .ctb-preset-actions{display:grid;gap:9px;padding:10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;}
             #${ROOT_ID} .ctb-preset-placement{display:grid;grid-template-columns:minmax(170px,.42fr) minmax(0,1fr);align-items:center;gap:12px;padding:9px 10px;border:1px solid #93c5fd;border-radius:5px;background:#eff6ff;}
             #${ROOT_ID} .ctb-preset-placement-label{display:flex;min-width:0;flex-direction:column;gap:2px;}
             #${ROOT_ID} .ctb-preset-placement-label strong{color:#1e3a8a;font-size:12px;}
             #${ROOT_ID} .ctb-preset-placement-label span{color:#334155;font-size:10px;}
-            #${ROOT_ID} .ctb-preset-placement-fields{min-width:0;}
-            #${ROOT_ID} .ctb-preset-placement-fields .ctb-input:first-child{flex:0 0 150px;}
-            #${ROOT_ID} .ctb-preset-placement-fields .ctb-input:last-child{flex:1;}
             #${ROOT_ID} .ctb-preset-compare-list{max-height:320px;overflow-y:auto;overflow-x:hidden;margin:0 0 11px;border-color:#cbd5e1;border-radius:6px;background:#fff;}
             #${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0;padding:0;border-color:#e2e8f0;background:#fff;font-size:11px;}
             #${ROOT_ID} .ctb-preset-compare-title{grid-column:1/-1;display:flex;flex-direction:row;align-items:center;gap:8px;padding:7px 9px;border-bottom:1px solid #e2e8f0;background:#f8fafc;}
@@ -5030,8 +4988,6 @@
                 #${ROOT_ID} .ctb-card.ctb-card-wide{width:calc(100vw - 12px);}
                 #${ROOT_ID} .ctb-worldbook-inline-editor{padding:10px;}
                 #${ROOT_ID} .ctb-preset-transfer-grid>div{padding:7px;}
-                #${ROOT_ID} .ctb-preset-placement-fields{flex-wrap:wrap;}
-                #${ROOT_ID} .ctb-preset-placement-fields .ctb-input:first-child{flex:1 1 100%;}
             }
 
             /* v0.9.2: one accent family, with a user-selectable blue/green
@@ -5049,7 +5005,6 @@
             #${ROOT_ID} .ctb-tab.is-active{color:var(--ctb-accent-ink)!important;border-bottom-color:var(--ctb-accent)!important;}
             #${ROOT_ID} .ctb-theme-blue .ctb-input:focus,#${ROOT_ID} .ctb-theme-green .ctb-input:focus{border-color:var(--ctb-accent)!important;box-shadow:0 0 0 2px color-mix(in srgb,var(--ctb-accent) 18%,transparent)!important;}
             #${ROOT_ID} input[type="checkbox"]{accent-color:var(--ctb-accent)!important;}
-            #${ROOT_ID} .ctb-toggle input:checked+span{background:var(--ctb-accent)!important;}
             #${ROOT_ID} .ctb-scope.is-active{border-color:var(--ctb-accent)!important;background:var(--ctb-accent-soft)!important;color:var(--ctb-accent-ink)!important;}
             #${ROOT_ID} .ctb-primary-soft{border-color:var(--ctb-accent)!important;background:var(--ctb-accent-soft)!important;color:var(--ctb-accent-ink)!important;}
             #${ROOT_ID} .ctb-info:hover{border-color:var(--ctb-accent)!important;color:var(--ctb-accent-ink)!important;background:var(--ctb-accent-soft)!important;}
@@ -5363,7 +5318,7 @@
             return;
         }
         else if (id === 'ctb-preset-transfer-load-source' || id === 'ctb-preset-transfer-load-target') {
-            settings.presetTransfer.loadMode = target.value === 'enabled' ? 'enabled' : 'all';
+            presetTransferLoadModeValue = target.value === 'enabled' ? 'enabled' : 'all';
             presetTransferSelected = new Set();
             presetTransferAnchor = { kind: 'top', anchorId: '' };
             presetTransferDraft = null;
@@ -5799,9 +5754,6 @@
         if ((!context || !context.extensionSettings) && initAttempts++ < 30) return host.setTimeout(init, 100);
         settings = loadSettings();
         theaterHistory = [];
-        presetTransferApi = settings.presetTransfer?.apiId || 'openai';
-        presetTransferSource = settings.presetTransfer?.source || '';
-        presetTransferTarget = settings.presetTransfer?.target || '';
         saveSettings();
         createUI();
         injectMenuEntry();
