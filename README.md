@@ -4,11 +4,12 @@
 
 ## 当前版本
 
-- 当前稳定版：**v0.9.9**
+- 当前稳定版：**v0.9.10**
 - 原生扩展清单：[manifest.json](./manifest.json)
 - Userscript 兼容入口：[聊天工具箱.user.js](./聊天工具箱.user.js)
-- 版本归档：[versions/v0.9.9/聊天工具箱-v0.9.9.user.js](./versions/v0.9.9/聊天工具箱-v0.9.9.user.js)
-- 上一稳定版：[versions/v0.9.8/聊天工具箱-v0.9.8.user.js](./versions/v0.9.8/聊天工具箱-v0.9.8.user.js)
+- 版本归档：[versions/v0.9.10/聊天工具箱-v0.9.10.user.js](./versions/v0.9.10/聊天工具箱-v0.9.10.user.js)
+- 上一稳定版：[versions/v0.9.9/聊天工具箱-v0.9.9.user.js](./versions/v0.9.9/聊天工具箱-v0.9.9.user.js)
+- 历史版本：[versions/v0.9.8/聊天工具箱-v0.9.8.user.js](./versions/v0.9.8/聊天工具箱-v0.9.8.user.js)
 - 历史版本：[versions/v0.9.7/聊天工具箱-v0.9.7.user.js](./versions/v0.9.7/聊天工具箱-v0.9.7.user.js)
 - 历史版本：[versions/v0.9.6/聊天工具箱-v0.9.6.user.js](./versions/v0.9.6/聊天工具箱-v0.9.6.user.js)
 - 历史版本：[versions/v0.9.5/聊天工具箱-v0.9.5.user.js](./versions/v0.9.5/聊天工具箱-v0.9.5.user.js)
@@ -59,6 +60,7 @@
 
 | 版本 | 说明 |
 | --- | --- |
+| v0.9.10 | 修复 Extensions 设置注入中的未定义变量导致初始化中断；改用酒馆 `getWorldInfoNames()` 获取世界书；主接口按消息数组生成；勾选世界书条目不再整页重绘。 |
 | v0.9.9 | 删除无引用的旧 CSS、过时设置字段和重复的预设转移设置包装；保留功能行为与临时/持久化边界不变。 |
 | v0.9.7 | 对齐 SillyTavern 原生 Extensions 抽屉结构；同步 manifest 版本，移除标题行的额外图标、版本号和重复状态控制。 |
 | v0.9.6 | 使用 SillyTavern 原生 Extensions 抽屉 UI，移除重复展开逻辑；保留 AI 词句修改的稳健解析、按段深红标注和原位保存校验。 |
