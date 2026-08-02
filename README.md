@@ -1,14 +1,14 @@
 # SillyTavern 聊天工具箱
 
-面向 SillyTavern 当前聊天的原生第三方扩展，同时保留 Userscript 兼容入口。所有设置（API 通道、规则预设、功能开关、小剧场收藏）保存在酒馆扩展设置或浏览器缓存中，不写入聊天记录。
+面向 SillyTavern 当前聊天的原生第三方扩展，同时保留 Userscript 兼容入口。持久设置只保留 API 通道、内置提示词、用户修改规则、小剧场预设与收藏；楼层号、选择项和界面状态仅保存在当前浏览器会话，刷新后自动清空，不写入聊天记录。
 
 ## 当前版本
 
-- 当前稳定版：**v0.9.7**
+- 当前稳定版：**v0.9.8**
 - 原生扩展清单：[manifest.json](./manifest.json)
 - Userscript 兼容入口：[聊天工具箱.user.js](./聊天工具箱.user.js)
-- 版本归档：[versions/v0.9.7/聊天工具箱-v0.9.7.user.js](./versions/v0.9.7/聊天工具箱-v0.9.7.user.js)
-- 上一稳定版：[versions/v0.9.6/聊天工具箱-v0.9.6.user.js](./versions/v0.9.6/聊天工具箱-v0.9.6.user.js)
+- 版本归档：[versions/v0.9.8/聊天工具箱-v0.9.8.user.js](./versions/v0.9.8/聊天工具箱-v0.9.8.user.js)
+- 上一稳定版：[versions/v0.9.7/聊天工具箱-v0.9.7.user.js](./versions/v0.9.7/聊天工具箱-v0.9.7.user.js)
 - 历史版本：[versions/v0.9.5/聊天工具箱-v0.9.5.user.js](./versions/v0.9.5/聊天工具箱-v0.9.5.user.js)
 - 历史版本：[versions/v0.9.4/聊天工具箱-v0.9.4.user.js](./versions/v0.9.4/聊天工具箱-v0.9.4.user.js)
 - 历史版本：[versions/v0.9.3/聊天工具箱-v0.9.3.user.js](./versions/v0.9.3/聊天工具箱-v0.9.3.user.js)
