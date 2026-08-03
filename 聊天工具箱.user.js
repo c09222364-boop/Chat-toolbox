@@ -22,7 +22,7 @@
     const STORAGE_KEY = 'chat-toolbox-v020-settings';
     const MAX_RESULTS = 2000;
     const THEATER_MAX_CONCURRENT = 3;
-    const THEATER_TIMEOUT_SEC = 300;
+    const AI_REQUEST_TIMEOUT_SEC = 300;
 
     let doc = document;
     let host = window;
@@ -284,7 +284,7 @@
                 ? 4096
                 : Math.max(256, Math.min(32768, Math.round(rawMaxTokens))),
             timeoutSec: !Number.isFinite(rawTimeout) || rawTimeout <= 0
-                ? 120
+                ? AI_REQUEST_TIMEOUT_SEC
                 : Math.max(10, Math.min(600, Math.round(rawTimeout))),
         };
     }
@@ -339,7 +339,7 @@
                     models: [],
                     temperature: Number(stored.postEdit.temperature) || 0.2,
                     maxTokens: 4096,
-                    timeoutSec: 120,
+                    timeoutSec: AI_REQUEST_TIMEOUT_SEC,
                 }));
             }
             const validChannel = (id) => id === 'main' || next.ai.channels.some((channel) => channel.id === id);
@@ -1379,7 +1379,7 @@
             models: [],
             temperature: 0.2,
             maxTokens: 4096,
-            timeoutSec: 120,
+            timeoutSec: AI_REQUEST_TIMEOUT_SEC,
         };
     }
 
@@ -1501,10 +1501,10 @@
         });
     }
 
-    async function stProxyJson(path, body, { timeoutSec = 120, signal = null } = {}) {
+    async function stProxyJson(path, body, { timeoutSec = AI_REQUEST_TIMEOUT_SEC, signal = null } = {}) {
         const Controller = host.AbortController || globalThis.AbortController;
         const controller = typeof Controller === 'function' ? new Controller() : null;
-        const timeoutMs = Math.max(10, Math.min(600, Number(timeoutSec) || 120)) * 1000;
+        const timeoutMs = Math.max(10, Math.min(600, Number(timeoutSec) || AI_REQUEST_TIMEOUT_SEC)) * 1000;
         let timedOut = false;
         let externallyAborted = false;
         const abortFromSignal = () => {
@@ -1570,7 +1570,7 @@
             // 停止等待被取消的单个任务，并忽略其迟到结果，不触发全局停止事件。
             const output = await waitForAbortable(generation, {
                 signal: options.signal,
-                timeoutSec: options.timeoutSec,
+                timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
             });
             return apiOutputText(output);
         }
@@ -1587,7 +1587,7 @@
             presence_penalty: 0,
             frequency_penalty: 0,
         }, {
-            timeoutSec: options.timeoutSec || channel.timeoutSec || 120,
+            timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
             signal: options.signal,
         });
         return apiOutputText(json);
@@ -3165,7 +3165,7 @@
             const output = await callAiText('theater', messages, {
                 channelOverride: snapshot.channelOverride,
                 signal: task.controller?.signal || null,
-                timeoutSec: THEATER_TIMEOUT_SEC,
+                timeoutSec: AI_REQUEST_TIMEOUT_SEC,
             });
             if (task.cancelled) return;
             theaterResult = String(output || '').trim();
@@ -5996,132 +5996,3 @@
                     <div class="ctb-extension-settings-grid">
                         <div class="ctb-extension-settings-title">功能开关</div>
                         ${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"> <span>${module.label}</span></label>`).join('')}
-                    </div>
-                </div>`;
-            panel.addEventListener('change', (event) => {
-                const input = event.target.closest('[data-ctb-module]');
-                if (!input) return;
-                const key = input.dataset.ctbModule;
-                if (!MODULES.some((module) => module.key === key)) return;
-                settings.modules[key] = Boolean(input.checked);
-                ensureActiveTab();
-                renderPanel();
-            });
-        }
-        panel.className = 'ctb-extension-settings inline-drawer';
-        panel.hidden = false;
-        panel.querySelectorAll('[data-ctb-module]').forEach((input) => {
-            input.checked = settings.modules?.[input.dataset.ctbModule] !== false;
-        });
-        if (panel.parentElement !== target) target.appendChild(panel);
-        return true;
-    }
-
-    function injectMenuEntry() {
-        if (destroyed || !doc.body) return false;
-        const menu = doc.querySelector('#options .options-content') || findMenuRoot();
-        if (!menu) return false;
-        let entry = doc.getElementById(ENTRY_ID);
-        if (!entry) {
-            entry = doc.createElement('a');
-            entry.id = ENTRY_ID;
-            entry.href = '#';
-            entry.className = 'list-group-item';
-            entry.innerHTML = '<i class="fa-lg fa-solid fa-toolbox"></i><span>聊天工具箱</span>';
-            entry.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); showPanel('search'); });
-        }
-        if (entry.parentElement !== menu) menu.appendChild(entry);
-        return true;
-    }
-
-    function scheduleHostInjection() {
-        if (destroyed || injectionTimer) return;
-        injectionTimer = host.setTimeout(() => {
-            injectionTimer = null;
-            injectMenuEntry();
-            injectExtensionSettings();
-        }, 180);
-    }
-
-    function registerSlashCommand() {
-        try {
-            commandHandler = () => {
-                if (!destroyed) showPanel('search');
-            };
-            // The parser keeps command objects beyond an extension reload.
-            // Reusing one stable callback prevents old closures from retaining
-            // a destroyed panel; a new instance simply replaces this handler.
-            host[COMMAND_HANDLER_KEY] = commandHandler;
-            if (host[COMMAND_REGISTERED_KEY]) return;
-            const parser = host.SillyTavern?.SlashCommandParser;
-            const command = host.SillyTavern?.SlashCommand;
-            if (parser && command?.fromProps) {
-                parser.addCommandObject(command.fromProps({
-                    name: 'chat-toolbox',
-                    callback: (...args) => host[COMMAND_HANDLER_KEY]?.(...args),
-                    helpString: '打开聊天工具箱',
-                }));
-                host[COMMAND_REGISTERED_KEY] = true;
-            }
-        } catch (_) {}
-    }
-
-    function destroy() {
-        if (destroyed) return;
-        destroyed = true;
-        stopSearchSaveClock();
-        if (injectionTimer) host.clearTimeout(injectionTimer);
-        injectionTimer = null;
-        menuObserver?.disconnect();
-        if (onPageHide) host.removeEventListener('pagehide', onPageHide);
-        if (onUnload) host.removeEventListener('unload', onUnload);
-        host.removeEventListener('keydown', handleGlobalKeydown, true);
-        onPageHide = null;
-        onUnload = null;
-        if (host[COMMAND_HANDLER_KEY] === commandHandler) {
-            host[COMMAND_HANDLER_KEY] = null;
-        }
-        commandHandler = null;
-        theaterReader = null;
-        for (const task of theaterTasks.values()) task.controller?.abort();
-        theaterTasks.clear();
-        if (theaterTaskTicker) host.clearInterval(theaterTaskTicker);
-        theaterTaskTicker = null;
-        theaterRenderCache.clear();
-        theaterHistory = [];
-        doc.getElementById(STYLE_ID)?.remove();
-        doc.getElementById(ROOT_ID)?.remove();
-        doc.getElementById(FLOAT_ID)?.remove();
-        doc.getElementById(ENTRY_ID)?.remove();
-        doc.getElementById(SETTINGS_ID)?.remove();
-        if (host[INSTANCE_KEY] === destroy) delete host[INSTANCE_KEY];
-    }
-
-    function init() {
-        if (!doc.body) return host.setTimeout(init, 80);
-        const context = getContext();
-        if ((!context || !context.extensionSettings) && initAttempts++ < 30) return host.setTimeout(init, 100);
-        settings = loadSettings();
-        theaterHistory = [];
-        saveSettings();
-        createUI();
-        injectMenuEntry();
-        injectExtensionSettings();
-        host.setTimeout(scheduleHostInjection, 800);
-        host.setTimeout(scheduleHostInjection, 900);
-        host.setTimeout(scheduleHostInjection, 2200);
-        host.setTimeout(scheduleHostInjection, 2300);
-        menuObserver = new MutationObserver(() => scheduleHostInjection());
-        menuObserver.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
-        registerSlashCommand();
-        onPageHide = destroy;
-        onUnload = destroy;
-        host.addEventListener('pagehide', onPageHide, { once: true });
-        host.addEventListener('unload', onUnload, { once: true });
-        host.addEventListener('keydown', handleGlobalKeydown, true);
-        host[INSTANCE_KEY] = destroy;
-        console.info(`[聊天工具箱] v${VERSION} 已加载`);
-    }
-
-    init();
-})();
