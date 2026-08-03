@@ -5158,7 +5158,9 @@
             #${ROOT_ID} .ctb-export-tag-option small{color:#898d92;}
             #${ROOT_ID} .ctb-channel-picker{margin-bottom:6px;} #${ROOT_ID} .ctb-channel-picker select{flex:1;}
             #${ROOT_ID} .ctb-channel-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:7px;border:1px solid #d1d3d7;border-radius:3px;background:#ededf0;}
-            #${ROOT_ID} .ctb-channel-grid>*:nth-child(2),#${ROOT_ID} .ctb-channel-grid>.ctb-model-row,#${ROOT_ID} .ctb-channel-grid>.ctb-in…129 tokens truncated…#85898e;font-size:10px;}
+            #${ROOT_ID} .ctb-channel-grid>*:nth-child(2),#${ROOT_ID} .ctb-channel-grid>.ctb-model-row,#${ROOT_ID} .ctb-channel-grid>.ctb-inline:last-child{grid-column:1/-1;}
+            #${ROOT_ID} .ctb-channel-summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px;border:1px solid #d1d3d7;border-radius:3px;background:#ededf0;}
+            #${ROOT_ID} .ctb-channel-summary>div{display:flex;min-width:0;flex-direction:column;} #${ROOT_ID} .ctb-channel-summary strong,#${ROOT_ID} .ctb-channel-summary small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-channel-summary small{color:#85898e;font-size:10px;}
             #${ROOT_ID} .ctb-channel-editor-actions{grid-column:1/-1;display:flex;justify-content:flex-end;gap:6px;}
             #${ROOT_ID} .ctb-model-row select{flex:1;}
             #${ROOT_ID} .ctb-mini-field{display:flex;align-items:center;gap:5px;min-width:0;color:#6f7277;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-mini-field .ctb-input{width:90px;}
@@ -5996,3 +5998,132 @@
                     <div class="ctb-extension-settings-grid">
                         <div class="ctb-extension-settings-title">功能开关</div>
                         ${MODULES.map((module) => `<label><input type="checkbox" data-ctb-module="${module.key}"> <span>${module.label}</span></label>`).join('')}
+                    </div>
+                </div>`;
+            panel.addEventListener('change', (event) => {
+                const input = event.target.closest('[data-ctb-module]');
+                if (!input) return;
+                const key = input.dataset.ctbModule;
+                if (!MODULES.some((module) => module.key === key)) return;
+                settings.modules[key] = Boolean(input.checked);
+                ensureActiveTab();
+                renderPanel();
+            });
+        }
+        panel.className = 'ctb-extension-settings inline-drawer';
+        panel.hidden = false;
+        panel.querySelectorAll('[data-ctb-module]').forEach((input) => {
+            input.checked = settings.modules?.[input.dataset.ctbModule] !== false;
+        });
+        if (panel.parentElement !== target) target.appendChild(panel);
+        return true;
+    }
+
+    function injectMenuEntry() {
+        if (destroyed || !doc.body) return false;
+        const menu = doc.querySelector('#options .options-content') || findMenuRoot();
+        if (!menu) return false;
+        let entry = doc.getElementById(ENTRY_ID);
+        if (!entry) {
+            entry = doc.createElement('a');
+            entry.id = ENTRY_ID;
+            entry.href = '#';
+            entry.className = 'list-group-item';
+            entry.innerHTML = '<i class="fa-lg fa-solid fa-toolbox"></i><span>聊天工具箱</span>';
+            entry.addEventListener('click', (event) => { event.preventDefault(); event.stopPropagation(); showPanel('search'); });
+        }
+        if (entry.parentElement !== menu) menu.appendChild(entry);
+        return true;
+    }
+
+    function scheduleHostInjection() {
+        if (destroyed || injectionTimer) return;
+        injectionTimer = host.setTimeout(() => {
+            injectionTimer = null;
+            injectMenuEntry();
+            injectExtensionSettings();
+        }, 180);
+    }
+
+    function registerSlashCommand() {
+        try {
+            commandHandler = () => {
+                if (!destroyed) showPanel('search');
+            };
+            // The parser keeps command objects beyond an extension reload.
+            // Reusing one stable callback prevents old closures from retaining
+            // a destroyed panel; a new instance simply replaces this handler.
+            host[COMMAND_HANDLER_KEY] = commandHandler;
+            if (host[COMMAND_REGISTERED_KEY]) return;
+            const parser = host.SillyTavern?.SlashCommandParser;
+            const command = host.SillyTavern?.SlashCommand;
+            if (parser && command?.fromProps) {
+                parser.addCommandObject(command.fromProps({
+                    name: 'chat-toolbox',
+                    callback: (...args) => host[COMMAND_HANDLER_KEY]?.(...args),
+                    helpString: '打开聊天工具箱',
+                }));
+                host[COMMAND_REGISTERED_KEY] = true;
+            }
+        } catch (_) {}
+    }
+
+    function destroy() {
+        if (destroyed) return;
+        destroyed = true;
+        stopSearchSaveClock();
+        if (injectionTimer) host.clearTimeout(injectionTimer);
+        injectionTimer = null;
+        menuObserver?.disconnect();
+        if (onPageHide) host.removeEventListener('pagehide', onPageHide);
+        if (onUnload) host.removeEventListener('unload', onUnload);
+        host.removeEventListener('keydown', handleGlobalKeydown, true);
+        onPageHide = null;
+        onUnload = null;
+        if (host[COMMAND_HANDLER_KEY] === commandHandler) {
+            host[COMMAND_HANDLER_KEY] = null;
+        }
+        commandHandler = null;
+        theaterReader = null;
+        for (const task of theaterTasks.values()) task.controller?.abort();
+        theaterTasks.clear();
+        if (theaterTaskTicker) host.clearInterval(theaterTaskTicker);
+        theaterTaskTicker = null;
+        theaterRenderCache.clear();
+        theaterHistory = [];
+        doc.getElementById(STYLE_ID)?.remove();
+        doc.getElementById(ROOT_ID)?.remove();
+        doc.getElementById(FLOAT_ID)?.remove();
+        doc.getElementById(ENTRY_ID)?.remove();
+        doc.getElementById(SETTINGS_ID)?.remove();
+        if (host[INSTANCE_KEY] === destroy) delete host[INSTANCE_KEY];
+    }
+
+    function init() {
+        if (!doc.body) return host.setTimeout(init, 80);
+        const context = getContext();
+        if ((!context || !context.extensionSettings) && initAttempts++ < 30) return host.setTimeout(init, 100);
+        settings = loadSettings();
+        theaterHistory = [];
+        saveSettings();
+        createUI();
+        injectMenuEntry();
+        injectExtensionSettings();
+        host.setTimeout(scheduleHostInjection, 800);
+        host.setTimeout(scheduleHostInjection, 900);
+        host.setTimeout(scheduleHostInjection, 2200);
+        host.setTimeout(scheduleHostInjection, 2300);
+        menuObserver = new MutationObserver(() => scheduleHostInjection());
+        menuObserver.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
+        registerSlashCommand();
+        onPageHide = destroy;
+        onUnload = destroy;
+        host.addEventListener('pagehide', onPageHide, { once: true });
+        host.addEventListener('unload', onUnload, { once: true });
+        host.addEventListener('keydown', handleGlobalKeydown, true);
+        host[INSTANCE_KEY] = destroy;
+        console.info(`[聊天工具箱] v${VERSION} 已加载`);
+    }
+
+    init();
+})();
