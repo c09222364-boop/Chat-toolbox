@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.6
+// @version      1.0.7
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.6';
+    const VERSION = '1.0.7';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -3498,10 +3498,12 @@
         return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
     }
 
-    // Worldbook position is the visible priority requested by the toolbox:
-    // character-before, character-after, author-note positions, depth, then
-    // example-message positions. Within each position keep the 1.0.2 order:
-    // Order descending and UID ascending.
+    // Match SillyTavern's final prompt order for the internal worldbook list.
+    // ST processes activated entries by Order descending, then unshifts the
+    // before/after, author-note and example buckets. Thus the visible text
+    // order within each position is Order ascending. Depth/chat interleaving
+    // is intentionally not flattened here; only worldbook-internal order is
+    // represented. UID is only a deterministic tie-breaker for equal Order.
     function worldbookPositionV2(raw) {
         const value = Number(raw?.position);
         return Number.isInteger(value) && value >= 0 && value <= 7 ? value : 1;
@@ -3512,6 +3514,11 @@
         return Number.isFinite(value) ? value : 0;
     }
 
+    function worldbookDepthV2(raw) {
+        const value = Number(raw?.depth);
+        return Number.isFinite(value) ? value : 4;
+    }
+
     function worldbookGroupKeyV2(record) {
         const position = Number.isInteger(Number(record?.raw?.position)) ? Number(record.raw.position) : 1;
         return position === 4 ? `position-${position}-depth-${Number(record?.raw?.depth ?? 4)}` : `position-${position}`;
@@ -3519,10 +3526,20 @@
 
     function sortWorldbookRecords(records) {
         const list = Array.isArray(records) ? records.slice() : [];
-        return list.sort((a, b) => worldbookPositionV2(a.raw) - worldbookPositionV2(b.raw)
-            || worldbookOrderV2(b.raw) - worldbookOrderV2(a.raw)
-            || worldbookUidNumber(a) - worldbookUidNumber(b)
-            || Number(a.displayIndex ?? 0) - Number(b.displayIndex ?? 0));
+        return list.sort((a, b) => {
+            const positionCompare = worldbookPositionV2(a.raw) - worldbookPositionV2(b.raw);
+            if (positionCompare) return positionCompare;
+            // At-depth entries are placed by chat depth first.  Larger depth
+            // means an earlier position in the prompt history; Order only
+            // controls entries sharing that same depth.
+            if (worldbookPositionV2(a.raw) === 4) {
+                const depthCompare = worldbookDepthV2(b.raw) - worldbookDepthV2(a.raw);
+                if (depthCompare) return depthCompare;
+            }
+            return worldbookOrderV2(a.raw) - worldbookOrderV2(b.raw)
+                || worldbookUidNumber(a) - worldbookUidNumber(b)
+                || Number(a.displayIndex ?? 0) - Number(b.displayIndex ?? 0);
+        });
     }
 
     function normalizeWorldbookDisplayIndexesV2(records) {
