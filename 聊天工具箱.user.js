@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.3
+// @version      1.0.4
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.3';
+    const VERSION = '1.0.4';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -4801,7 +4801,7 @@
             #${ROOT_ID}, #${ROOT_ID} * { box-sizing:border-box; }
             #${ROOT_ID}{position:fixed;inset:0;z-index:2147483000;width:100vw;height:100dvh;min-height:100dvh;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:max(12px,env(safe-area-inset-top)) max(12px,env(safe-area-inset-right)) max(12px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));background:rgba(14,18,27,.42);font-family:var(--mainFontFamily,Arial,sans-serif);color:var(--SmartThemeBodyColor,#404247);}
             #${ROOT_ID}[hidden]{display:none!important;}
-            #${ROOT_ID} .ctb-card{width:min(650px,calc(100vw - 24px));max-height:min(720px,calc(100dvh - 24px));min-height:0;margin:auto;display:flex;flex-direction:column;overflow:hidden;background:var(--SmartThemeBlurTintColor,var(--SmartThemeBodyColor,#f5f5f7));background:#f6f6f8;border:1px solid rgba(92,99,110,.38);border-radius:5px;box-shadow:0 14px 40px rgba(0,0,0,.32);font-size:12px;line-height:1.35;}
+            #${ROOT_ID} .ctb-card{width:min(650px,calc(100vw - 24px));max-height:min(720px,calc(100dvh - 24px));min-height:0;margin:auto;display:flex;flex-direction:column;overflow:hidden;background:#f6f6f8;border:1px solid rgba(92,99,110,.38);border-radius:5px;box-shadow:0 14px 40px rgba(0,0,0,.32);font-size:12px;line-height:1.35;}
             #${ROOT_ID} .ctb-header{display:flex;align-items:center;justify-content:space-between;padding:11px 16px 9px;border-bottom:1px solid #d5d7dc;background:#fafafd;flex:0 0 auto;}
             #${ROOT_ID} .ctb-title{font-size:18px;font-weight:700;color:#373a40;letter-spacing:.01em;} #${ROOT_ID} .ctb-title i{font-size:16px;margin-right:6px;}
             #${ROOT_ID} .ctb-header-side{display:flex;gap:11px;align-items:center;color:#83868c;font-size:12px;}
