@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.4
+// @version      1.0.5
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.4';
+    const VERSION = '1.0.5';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -226,6 +226,9 @@
                 includeCharacter: true,
                 includePersona: true,
                 worldEntries: [],
+                worldPresetName: '',
+                selectedWorldPresetId: '',
+                worldPresets: [],
                 presetName: '',
                 selectedPresetId: '',
                 presets: [],
@@ -280,6 +283,33 @@
         };
     }
 
+    function normalizeWorldEntrySelections(values) {
+        const seen = new Set();
+        const selections = [];
+        for (const item of Array.isArray(values) ? values : []) {
+            const world = String(item?.world || '').trim();
+            const uid = String(item?.uid ?? '').trim();
+            if (!world || !uid) continue;
+            const key = worldEntrySelectionKey(world, uid);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            selections.push({ world, uid });
+        }
+        return selections;
+    }
+
+    function normalizeTheaterWorldPreset(preset) {
+        if (!preset || typeof preset !== 'object') return null;
+        const name = String(preset.name || '').trim();
+        const worldEntries = normalizeWorldEntrySelections(preset.worldEntries);
+        if (!name || !worldEntries.length) return null;
+        return {
+            id: String(preset.id || `theater-world-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`),
+            name,
+            worldEntries,
+        };
+    }
+
     function loadSettings() {
         try {
             const contextStored = getContext()?.extensionSettings?.[STORAGE_KEY];
@@ -318,6 +348,9 @@
             next.rewrite.systemPrompt = typeof stored.rewrite?.systemPrompt === 'string' ? stored.rewrite.systemPrompt : base.rewrite.systemPrompt;
             next.theater.channelId = validChannel(theaterChannelId) ? theaterChannelId : 'main';
             next.theater.presets = Array.isArray(stored.theater?.presets) ? stored.theater.presets : [];
+            next.theater.worldPresets = (Array.isArray(stored.theater?.worldPresets) ? stored.theater.worldPresets : [])
+                .map(normalizeTheaterWorldPreset)
+                .filter(Boolean);
             next.theater.favorites = Array.isArray(stored.theater?.favorites) ? stored.theater.favorites.slice(0, 50) : [];
             return next;
         } catch (_) {
@@ -341,6 +374,9 @@
             theater: {
                 channelId: settings.theater.channelId || 'main',
                 presets: Array.isArray(settings.theater.presets) ? settings.theater.presets : [],
+                worldPresets: (Array.isArray(settings.theater.worldPresets) ? settings.theater.worldPresets : [])
+                    .map(normalizeTheaterWorldPreset)
+                    .filter(Boolean),
                 favorites: Array.isArray(settings.theater.favorites) ? settings.theater.favorites.slice(0, 50) : [],
             },
         };
@@ -2762,6 +2798,64 @@
         syncTheaterSelectionUi();
     }
 
+    function saveTheaterWorldPreset() {
+        const config = settings.theater;
+        const name = String(config.worldPresetName || '').trim();
+        const worldEntries = normalizeWorldEntrySelections(config.worldEntries);
+        if (!name) return notify('请先填写世界书选择预设名称', 'warning');
+        if (!worldEntries.length) return notify('请先选择至少一个世界书条目', 'warning');
+        if (!Array.isArray(config.worldPresets)) config.worldPresets = [];
+        let preset = config.worldPresets.find((item) => item.id === config.selectedWorldPresetId);
+        if (!preset) {
+            preset = {
+                id: `theater-world-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+                name,
+                worldEntries,
+            };
+            config.worldPresets.push(preset);
+            config.selectedWorldPresetId = preset.id;
+        } else {
+            Object.assign(preset, { name, worldEntries });
+        }
+        config.worldPresetName = name;
+        config.worldEntries = worldEntries;
+        saveSettings();
+        renderPanel();
+        notify(`世界书选择预设“${name}”已保存`, 'success');
+    }
+
+    function deleteTheaterWorldPreset() {
+        const config = settings.theater;
+        const index = (config.worldPresets || []).findIndex((item) => item.id === config.selectedWorldPresetId);
+        if (index < 0) return;
+        const name = config.worldPresets[index].name;
+        if (!host.confirm(`确定删除世界书选择预设“${name}”吗？`)) return;
+        config.worldPresets.splice(index, 1);
+        config.selectedWorldPresetId = '';
+        config.worldPresetName = '';
+        saveSettings();
+        renderPanel();
+    }
+
+    async function selectTheaterWorldPreset(id) {
+        const config = settings.theater;
+        config.selectedWorldPresetId = String(id || '');
+        const preset = (config.worldPresets || []).find((item) => item.id === config.selectedWorldPresetId);
+        if (!preset) {
+            config.worldPresetName = '';
+            renderPanel();
+            return;
+        }
+        config.worldPresetName = preset.name || '';
+        config.worldEntries = normalizeWorldEntrySelections(preset.worldEntries);
+        const firstWorld = config.worldEntries[0]?.world || '';
+        if (firstWorld) theaterWorldBook = firstWorld;
+        renderPanel();
+        if (firstWorld && (!theaterWorldBooks.length || !theaterWorldEntryCache.has(firstWorld))) {
+            await loadTheaterWorldBooks();
+        }
+    }
+
     function orderedTheaterWorldBookNames(selections = settings.theater?.worldEntries || []) {
         const selected = new Set();
         const order = [];
@@ -2900,7 +2994,7 @@
             includePersona: config.includePersona !== false,
             nativePresetName: String(config.nativePresetName || ''),
             nativePresetEntryIds: (config.nativePresetEntryIds || []).map(String),
-            worldEntries: (config.worldEntries || []).map((item) => ({ world: String(item.world), uid: String(item.uid) })),
+            worldEntries: normalizeWorldEntrySelections(config.worldEntries),
             channelId: config.channelId || 'main',
         };
         if (!preset) {
@@ -3109,6 +3203,10 @@
         const selected = theaterSelectedWorldKeys();
         const entries = theaterWorldEntryCache.get(theaterWorldBook) || [];
         const books = theaterWorldBooks.map((name) => `<option value="${escapeHTML(name)}"${name === theaterWorldBook ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
+        const worldPresetOptions = ['<option value="">选择世界书预设…</option>']
+            .concat((settings.theater.worldPresets || []).map((preset) => `<option value="${escapeHTML(preset.id)}"${settings.theater.selectedWorldPresetId === preset.id ? ' selected' : ''}>${escapeHTML(preset.name)}</option>`))
+            .join('');
+        const presetControls = `<div class="ctb-section-title ctb-world-preset-title">世界书选择预设 <span>只保存勾选条目</span></div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-world-preset">${worldPresetOptions}</select><input class="ctb-input" id="ctb-theater-world-preset-name" placeholder="预设名称" value="${escapeHTML(settings.theater.worldPresetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-world-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-world-preset"${settings.theater.selectedWorldPresetId ? '' : ' disabled'}>删除</button></div>`;
         const list = theaterWorldLoading
             ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>'
             : theaterWorldError
@@ -3116,7 +3214,7 @@
                 : entries.length
                     ? `<div class="ctb-world-entry-list" data-ctb-scroll-key="theater-world-entry-list">${entries.map((entry) => `<label class="ctb-world-entry${selected.has(worldEntrySelectionKey(entry.world, entry.uid)) ? ' is-selected' : ''}"><input type="checkbox" data-theater-world-entry-uid="${escapeHTML(entry.uid)}" data-theater-world-name="${escapeHTML(entry.world)}"${selected.has(worldEntrySelectionKey(entry.world, entry.uid)) ? ' checked' : ''}><span class="ctb-world-entry-main"><strong>${escapeHTML(entry.comment)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 110) || '（空条目）')}</small></span><span class="ctb-world-entry-meta">UID ${escapeHTML(entry.uid)}</span></label>`).join('')}</div>`
                     : '<div class="ctb-world-empty">没有可选条目。</div>';
-        return `<div class="ctb-world-picker-summary"><button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-theater-world-picker" data-theater-world-picker-button><i class="fa-solid fa-book-open"></i> 世界书条目 <span data-theater-world-selected-count>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button><button type="button" class="ctb-button" data-action="clear-theater-world-selection" data-theater-world-clear${selections.length ? '' : ' hidden'}>清空</button></div><div class="ctb-world-selected-summary" data-theater-world-selection-summary${selections.length ? '' : ' hidden'}>${summaries.map(({ world, count }) => `<span title="${escapeHTML(world)}">${escapeHTML(world)} · 已选 ${count} 条</span>`).join('')}</div>${theaterWorldPickerOpen ? `<div class="ctb-world-picker"><div class="ctb-inline ctb-world-book-row"><select class="ctb-input" id="ctb-theater-world-book">${books || '<option value="">没有世界书</option>'}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-world-books" title="刷新"><i class="fa-solid fa-rotate"></i></button><button type="button" class="ctb-button" data-action="close-theater-world-picker">完成</button></div>${theaterWorldBook ? `<div class="ctb-inline ctb-world-bulk"><span>${escapeHTML(theaterWorldBook)} · ${entries.length} 条</span><button type="button" class="ctb-button" data-action="select-theater-world-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-world-book">清空本书</button></div>` : ''}${list}</div>` : ''}`;
+        return `${presetControls}<div class="ctb-world-picker-summary"><button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-theater-world-picker" data-theater-world-picker-button><i class="fa-solid fa-book-open"></i> 世界书条目 <span data-theater-world-selected-count>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button><button type="button" class="ctb-button" data-action="clear-theater-world-selection" data-theater-world-clear${selections.length ? '' : ' hidden'}>清空</button></div><div class="ctb-world-selected-summary" data-theater-world-selection-summary${selections.length ? '' : ' hidden'}>${summaries.map(({ world, count }) => `<span title="${escapeHTML(world)}">${escapeHTML(world)} · 已选 ${count} 条</span>`).join('')}</div>${theaterWorldPickerOpen ? `<div class="ctb-world-picker"><div class="ctb-inline ctb-world-book-row"><select class="ctb-input" id="ctb-theater-world-book">${books || '<option value="">没有世界书</option>'}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-world-books" title="刷新"><i class="fa-solid fa-rotate"></i></button><button type="button" class="ctb-button" data-action="close-theater-world-picker">完成</button></div>${theaterWorldBook ? `<div class="ctb-inline ctb-world-bulk"><span>${escapeHTML(theaterWorldBook)} · ${entries.length} 条</span><button type="button" class="ctb-button" data-action="select-theater-world-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-world-book">清空本书</button></div>` : ''}${list}</div>` : ''}`;
     }
 
     function renderTheaterTab() {
@@ -3400,10 +3498,15 @@
         return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
     }
 
-    // SillyTavern's native world-info list and prompt collector both use the
-    // numeric Order field (descending), then UID ascending as the stable tie
-    // breaker. Keep this one comparator for the manager, picker, preview and
-    // actual request so an entry cannot move between those views.
+    // Match SillyTavern's default "Priority" world-info sort: constant entries
+    // first, then normal entries, then disabled entries. Within each group use
+    // Order descending and UID ascending. The manager, pickers, previews and
+    // actual requests all share this comparator so entries cannot move between
+    // those surfaces.
+    function worldbookPriorityV2(raw) {
+        return raw?.disable ? 2 : raw?.constant ? 0 : 1;
+    }
+
     function worldbookOrderV2(raw) {
         const value = Number(raw?.order);
         return Number.isFinite(value) ? value : 0;
@@ -3416,7 +3519,8 @@
 
     function sortWorldbookRecords(records) {
         const list = Array.isArray(records) ? records.slice() : [];
-        return list.sort((a, b) => worldbookOrderV2(b.raw) - worldbookOrderV2(a.raw)
+        return list.sort((a, b) => worldbookPriorityV2(a.raw) - worldbookPriorityV2(b.raw)
+            || worldbookOrderV2(b.raw) - worldbookOrderV2(a.raw)
             || worldbookUidNumber(a) - worldbookUidNumber(b)
             || Number(a.displayIndex ?? 0) - Number(b.displayIndex ?? 0));
     }
@@ -3436,8 +3540,8 @@
     }
 
     function currentWorldbookView() {
-        // The manager follows the same effective order used when SillyTavern
-        // builds the prompt. There is no second manual ordering model here.
+        // There is no second manual ordering model: manager and AI context use
+        // the same SillyTavern-compatible Priority comparator.
         return sortWorldbookRecords(worldbookEntries);
     }
 
@@ -4874,7 +4978,7 @@
             #${ROOT_ID} .ctb-channel-editor-actions{grid-column:1/-1;display:flex;justify-content:flex-end;gap:6px;}
             #${ROOT_ID} .ctb-model-row select{flex:1;}
             #${ROOT_ID} .ctb-mini-field{display:flex;align-items:center;gap:5px;min-width:0;color:#6f7277;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-mini-field .ctb-input{width:90px;}
-            #${ROOT_ID} .ctb-preset-row{margin-bottom:6px;} #${ROOT_ID} .ctb-preset-row select{max-width:150px;} #${ROOT_ID} .ctb-preset-row input{flex:1;}
+            #${ROOT_ID} .ctb-preset-row{margin-bottom:6px;} #${ROOT_ID} .ctb-preset-row select{max-width:150px;} #${ROOT_ID} .ctb-preset-row input{flex:1;} #${ROOT_ID} .ctb-world-preset-title{margin-top:9px;}
             #${ROOT_ID} .ctb-context-row{flex-wrap:wrap;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;} #${ROOT_ID} .ctb-rewrite-global{height:62px;margin-top:6px;}
             #${ROOT_ID} .ctb-primary-soft{border-color:#91aa98;background:#e0e9e3;color:#4d6755;} #${ROOT_ID} .ctb-world-picker-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button:first-child{flex:1;justify-content:space-between;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button span{color:#7a817c;font-size:10px;font-weight:400;}
             #${ROOT_ID} .ctb-world-selected-summary{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;} #${ROOT_ID} .ctb-world-selected-summary span{max-width:100%;overflow:hidden;padding:3px 6px;border:1px solid #c9d2cc;border-radius:3px;background:#e5ebe7;color:#5c6860;font-size:10px;text-overflow:ellipsis;white-space:nowrap;}
@@ -5222,6 +5326,7 @@
         else if (id === 'ctb-rewrite-system') settings.rewrite.systemPrompt = target.value;
         else if (id === 'ctb-theater-prompt') settings.theater.prompt = target.value;
         else if (id === 'ctb-theater-preset-name') settings.theater.presetName = target.value;
+        else if (id === 'ctb-theater-world-preset-name') settings.theater.worldPresetName = target.value;
         else if (id === 'ctb-theater-context-floors') settings.theater.contextFloors = target.value;
         else if (id === 'ctb-theater-context-tags') settings.theater.contextTags = target.value;
         else if (id === 'ctb-worldbook-search') { worldbookSearch = target.value; return; }
@@ -5416,6 +5521,8 @@
             settings.theater.includeCharacter = target.checked;
         } else if (id === 'ctb-theater-persona') {
             settings.theater.includePersona = target.checked;
+        } else if (id === 'ctb-theater-world-preset') {
+            await selectTheaterWorldPreset(target.value);
         } else if (id === 'ctb-theater-preset') {
             settings.theater.selectedPresetId = target.value;
             const preset = settings.theater.presets.find((item) => item.id === target.value);
@@ -5428,7 +5535,9 @@
                 settings.theater.includePersona = preset.includePersona !== false;
                 settings.theater.nativePresetName = preset.nativePresetName || '';
                 settings.theater.nativePresetEntryIds = Array.isArray(preset.nativePresetEntryIds) ? preset.nativePresetEntryIds.map(String) : [];
-                settings.theater.worldEntries = Array.isArray(preset.worldEntries) ? preset.worldEntries.map((item) => ({ world: String(item.world), uid: String(item.uid) })) : [];
+                settings.theater.worldEntries = normalizeWorldEntrySelections(preset.worldEntries);
+                settings.theater.selectedWorldPresetId = '';
+                settings.theater.worldPresetName = '';
                 settings.theater.channelId = preset.channelId || 'main';
                 theaterNativePresetName = settings.theater.nativePresetName;
             } else {
@@ -5566,6 +5675,8 @@
             case 'clear-theater-world-selection': settings.theater.worldEntries = []; syncTheaterSelectionUi(); return undefined;
             case 'select-theater-world-all': return setTheaterWorldBookSelection(true);
             case 'clear-theater-world-book': return setTheaterWorldBookSelection(false);
+            case 'save-theater-world-preset': return saveTheaterWorldPreset();
+            case 'delete-theater-world-preset': return deleteTheaterWorldPreset();
             case 'refresh-theater-native-presets': return loadTheaterNativePresets({ force: true });
             case 'select-theater-native-preset-all': return setTheaterNativePresetSelection(true);
             case 'clear-theater-native-preset': return setTheaterNativePresetSelection(false);
