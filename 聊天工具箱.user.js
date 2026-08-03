@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.2
+// @version      1.0.3
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.2';
+    const VERSION = '1.0.3';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -64,7 +64,7 @@
     let postEditEditing = false;
     let postEditReview = [];
     let postEditReviewEditingIndex = -1;
-    let postEditPromptPreview = '';
+    let postEditPromptPreview = null;
     let postEditPreviewLoading = false;
     let channelLoadingId = '';
     let channelEditor = null;
@@ -72,7 +72,7 @@
     let rewriteLoading = false;
     let rewriteReview = [];
     let rewriteApplyLoading = false;
-    let rewritePromptPreview = '';
+    let rewritePromptPreview = null;
     let rewritePreviewLoading = false;
     let rewriteWorldPickerOpen = false;
     let rewriteWorldLoading = false;
@@ -1273,7 +1273,7 @@
             postEditEditing = false;
             postEditReview = [];
             postEditReviewEditingIndex = -1;
-            postEditPromptPreview = '';
+            postEditPromptPreview = null;
             settings.postEdit.floor = String(selected.id);
             if (!silent) {
                 renderPanel();
@@ -1692,8 +1692,16 @@
         ];
     }
 
-    function formatPromptPreview(messages) {
-        return messages.map((message, index) => `===== ${index + 1}. ${message.role === 'system' ? 'SYSTEM' : 'USER'} =====\n${message.content}`).join('\n\n');
+    function countCharacters(value) {
+        return Array.from(String(value ?? '')).length;
+    }
+
+    function buildPromptPreview(messages) {
+        const items = Array.isArray(messages) ? messages : [];
+        return {
+            text: items.map((message, index) => `===== ${index + 1}. ${message.role === 'system' ? 'SYSTEM' : 'USER'} =====\n${message.content}`).join('\n\n'),
+            characters: items.reduce((total, message) => total + countCharacters(message?.content), 0),
+        };
     }
 
     // Models often wrap JSON in prose or a Markdown fence. Extract one
@@ -1740,9 +1748,9 @@
         postEditPreviewLoading = true;
         renderPanel();
         try {
-            postEditPromptPreview = formatPromptPreview(buildPostEditRequest());
+            postEditPromptPreview = buildPromptPreview(buildPostEditRequest());
         } catch (error) {
-            postEditPromptPreview = '';
+            postEditPromptPreview = null;
             notify(`无法生成发送预览：${error.message}`, 'error');
         } finally {
             postEditPreviewLoading = false;
@@ -1765,11 +1773,11 @@
         if (!String(config.rules || '').trim()) return notify('请填写词句修改规则', 'warning');
         postEditLoading = true;
         postEditReview = [];
-        postEditPromptPreview = '';
+        postEditPromptPreview = null;
         renderPanel();
         try {
             const messages = buildPostEditRequest();
-            postEditPromptPreview = formatPromptPreview(messages);
+            postEditPromptPreview = buildPromptPreview(messages);
             const output = await callAiText('postEdit', messages);
             const parsed = parsePostEditResult(output, postEditDraft.originalContent);
             if (!parsed.fullRevised) throw new Error('API 返回了空文本');
@@ -1838,7 +1846,7 @@
             postEditDraft.originalContent = revisedContent;
             postEditDraft.revisedContent = '';
             postEditReview = [];
-            postEditPromptPreview = '';
+            postEditPromptPreview = null;
             postEditEditing = false;
             renderPanel();
             notify(`已采用并保存楼层 #${postEditDraft.floor}`, 'success');
@@ -1900,7 +1908,7 @@
                 paragraphs: split.paragraphs,
             };
             rewriteReview = [];
-            rewritePromptPreview = '';
+            rewritePromptPreview = null;
             settings.rewrite.floor = String(selected.id);
             if (!silent) {
                 renderPanel();
@@ -2125,10 +2133,6 @@
         ];
     }
 
-    function formatRewritePromptPreview(messages) {
-        return messages.map((message, index) => `===== ${index + 1}. ${message.role === 'system' ? 'SYSTEM' : 'USER'} =====\n${message.content}`).join('\n\n');
-    }
-
     async function previewRewritePrompt() {
         if (rewritePreviewLoading) return;
         if (!rewriteDraft && !prepareRewriteFloor({ silent: true })) return notify('请先读取要改写的 AI 楼层', 'warning');
@@ -2136,9 +2140,9 @@
         renderPanel();
         try {
             const messages = await buildRewriteRequest(rewriteDraft);
-            rewritePromptPreview = formatRewritePromptPreview(messages);
+            rewritePromptPreview = buildPromptPreview(messages);
         } catch (error) {
-            rewritePromptPreview = '';
+            rewritePromptPreview = null;
             notify(`无法生成发送预览：${error.message}`, 'error');
         } finally {
             rewritePreviewLoading = false;
@@ -2174,7 +2178,7 @@
         renderPanel();
         try {
             const messages = await buildRewriteRequest(rewriteDraft);
-            rewritePromptPreview = formatRewritePromptPreview(messages);
+            rewritePromptPreview = buildPromptPreview(messages);
             const output = await callAiText('rewrite', messages);
             const changes = parseRewritePatch(output);
             const byNumber = new Map(selected.map((paragraph) => [paragraph.number, paragraph]));
@@ -2497,7 +2501,7 @@
                     <button type="button" class="ctb-button" data-action="clear-post-edit" ${draft ? '' : 'disabled'}>清空预览</button>
                 </div>
             </section>
-            ${postEditPromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览（与生成共用同一份消息）</span><button type="button" class="ctb-review-expand" data-action="close-post-edit-preview" title="关闭预览" aria-label="关闭预览">×</button></div><pre>${escapeHTML(postEditPromptPreview)}</pre></section>` : ''}
+            ${postEditPromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览 · 总字数 ${postEditPromptPreview.characters}</span><button type="button" class="ctb-review-expand" data-action="close-post-edit-preview" title="关闭预览" aria-label="关闭预览">×</button></div><pre>${escapeHTML(postEditPromptPreview.text)}</pre></section>` : ''}
             ${draft ? `<section class="ctb-section ctb-post-preview">
                 <div class="ctb-section-title">楼层 #${escapeHTML(draft.floor)} · 修改预览</div>
                 <div class="ctb-post-column"><div class="ctb-post-label">原正文</div><pre class="ctb-post-text">${renderPostEditParagraphPreview(draft.originalContent, changedParagraphs)}</pre></div>
@@ -2596,7 +2600,7 @@
                 ${paragraphList}
                 ${draft ? `<div class="ctb-inline ctb-rewrite-generate"><button type="button" class="ctb-button" data-action="rewrite-select-all" data-selected="true">全选</button><button type="button" class="ctb-button" data-action="rewrite-select-all" data-selected="false">全不选</button><button type="button" class="ctb-button" data-action="preview-rewrite-prompt"${rewritePreviewLoading ? ' disabled' : ''}><i class="fa-solid fa-eye"></i> ${rewritePreviewLoading ? '整理中…' : '预览发送内容'}</button><button type="button" class="ctb-button ctb-primary" data-action="run-rewrite"${rewriteLoading ? ' disabled' : ''}>${rewriteLoading ? '正在理解剧情并生成…' : '生成段落补丁'}</button></div>` : ''}
             </section>
-            ${rewritePromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览（与生成共用同一份消息）</span><button type="button" class="ctb-review-expand" data-action="close-rewrite-preview" title="关闭预览" aria-label="关闭预览">×</button></div><pre>${escapeHTML(rewritePromptPreview)}</pre></section>` : ''}
+            ${rewritePromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览 · 总字数 ${rewritePromptPreview.characters}</span><button type="button" class="ctb-review-expand" data-action="close-rewrite-preview" title="关闭预览" aria-label="关闭预览">×</button></div><pre>${escapeHTML(rewritePromptPreview.text)}</pre></section>` : ''}
             ${reviewList}`;
     }
 
@@ -3142,19 +3146,20 @@
             <section class="ctb-section"><div class="ctb-section-title">酒馆原生预设</div>${renderTheaterNativePresetPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="例如：如果这一刻没有人打断，角色会怎么想？">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterLoading ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterLoading ? '生成中…' : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div></section>
-            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
+            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 · 字数 ${countCharacters(theaterResult)} <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
             <section class="ctb-section"><div class="ctb-section-title">记录 <span>${theaterHistoryView === 'favorites' ? '收藏夹' : '本次会话'}</span></div>
                 <div class="ctb-inline ctb-theater-history-tabs"><button type="button" class="ctb-scope${theaterHistoryView === 'recent' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="recent">最近</button><button type="button" class="ctb-scope${theaterHistoryView === 'favorites' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="favorites">★ 收藏夹</button></div>
                 <div class="ctb-theater-history-list" data-ctb-scroll-key="theater-history-list">${history || '<div class="ctb-results ctb-results-empty">这里还没有记录。</div>'}</div>
-            </section>${theaterPromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览</span><button type="button" class="ctb-review-expand" data-action="close-theater-preview">×</button></div><pre>${escapeHTML(theaterPromptPreview)}</pre></section>` : ''}`;
+            </section>${theaterPromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览 · 总字数 ${theaterPromptPreview.characters}</span><button type="button" class="ctb-review-expand" data-action="close-theater-preview">×</button></div><pre>${escapeHTML(theaterPromptPreview.text)}</pre></section>` : ''}`;
     }
 
-    let theaterPromptPreview = '';
+    let theaterPromptPreview = null;
 
     async function previewTheaterPrompt() {
         try {
-            theaterPromptPreview = formatPromptPreview(await buildTheaterMessages());
+            theaterPromptPreview = buildPromptPreview(await buildTheaterMessages());
         } catch (error) {
+            theaterPromptPreview = null;
             notify(error.message, 'warning');
         }
         renderPanel();
@@ -5512,7 +5517,7 @@
             case 'delete-post-preset': return deletePostEditPreset();
             case 'prepare-post-edit': return preparePostEditFloor();
             case 'preview-post-edit-prompt': return previewPostEditPrompt();
-            case 'close-post-edit-preview': postEditPromptPreview = ''; return renderPanel();
+            case 'close-post-edit-preview': postEditPromptPreview = null; return renderPanel();
             case 'run-post-edit': return runPostEdit();
             case 'apply-post-edit': return applyPostEdit();
             case 'post-edit-decision': {
@@ -5525,7 +5530,7 @@
                 postEditReviewEditingIndex = postEditReviewEditingIndex === Number(data.reviewIndex) ? -1 : Number(data.reviewIndex);
                 return renderPanel();
             case 'toggle-post-edit-editor': postEditEditing = !postEditEditing; return renderPanel();
-            case 'clear-post-edit': postEditDraft = null; postEditEditing = false; postEditReview = []; postEditPromptPreview = ''; postEditReviewEditingIndex = -1; return renderPanel();
+            case 'clear-post-edit': postEditDraft = null; postEditEditing = false; postEditReview = []; postEditPromptPreview = null; postEditReviewEditingIndex = -1; return renderPanel();
             case 'toggle-rewrite-world-picker':
                 rewriteWorldPickerOpen = !rewriteWorldPickerOpen;
                 if (rewriteWorldPickerOpen) return loadRewriteWorldBooks();
@@ -5539,7 +5544,7 @@
             case 'clear-rewrite-world-book': return setCurrentWorldBookSelection(false);
             case 'prepare-rewrite': return prepareRewriteFloor();
             case 'preview-rewrite-prompt': return previewRewritePrompt();
-            case 'close-rewrite-preview': rewritePromptPreview = ''; return renderPanel();
+            case 'close-rewrite-preview': rewritePromptPreview = null; return renderPanel();
             case 'run-rewrite': return runRewrite();
             case 'rewrite-select-all': {
                 rewriteDraft?.paragraphs?.forEach((paragraph) => { paragraph.selected = data.selected === 'true'; });
@@ -5568,7 +5573,7 @@
             case 'delete-theater-preset': return deleteTheaterPreset();
             case 'run-theater': return runTheater();
             case 'preview-theater-prompt': return previewTheaterPrompt();
-            case 'close-theater-preview': theaterPromptPreview = ''; return renderPanel();
+            case 'close-theater-preview': theaterPromptPreview = null; return renderPanel();
             case 'set-theater-history-view': theaterHistoryView = data.theaterView === 'favorites' ? 'favorites' : 'recent'; return renderPanel();
             case 'use-theater-history': return loadTheaterHistory(data.theaterId, data.theaterSource);
             case 'toggle-theater-favorite': return toggleTheaterFavorite(data.theaterId, data.theaterSource);
