@@ -8,7 +8,7 @@
 - 原生扩展清单：[manifest.json](./manifest.json)
 - Userscript 兼容入口：[聊天工具箱.user.js](./聊天工具箱.user.js)
 - 版本归档：[versions/v1.0.8/聊天工具箱-v1.0.8.user.js](./versions/v1.0.8/聊天工具箱-v1.0.8.user.js)
-- 上一稳定版：[versions/v1.0.6/聊天工具箱-v1.0.6.user.js](./versions/v1.0.6/聊天工具箱-v1.0.6.user.js)
+- 上一稳定版：[versions/v1.0.7/聊天工具箱-v1.0.7.user.js](./versions/v1.0.7/聊天工具箱-v1.0.7.user.js)
 - 历史版本：[versions/v0.9.10/聊天工具箱-v0.9.10.user.js](./versions/v0.9.10/聊天工具箱-v0.9.10.user.js)
 - 历史版本：[versions/v0.9.9/聊天工具箱-v0.9.9.user.js](./versions/v0.9.9/聊天工具箱-v0.9.9.user.js)
 - 历史版本：[versions/v0.9.8/聊天工具箱-v0.9.8.user.js](./versions/v0.9.8/聊天工具箱-v0.9.8.user.js)
