@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.5
+// @version      1.0.6
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.5';
+    const VERSION = '1.0.6';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -3498,13 +3498,13 @@
         return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
     }
 
-    // Match SillyTavern's default "Priority" world-info sort: constant entries
-    // first, then normal entries, then disabled entries. Within each group use
-    // Order descending and UID ascending. The manager, pickers, previews and
-    // actual requests all share this comparator so entries cannot move between
-    // those surfaces.
-    function worldbookPriorityV2(raw) {
-        return raw?.disable ? 2 : raw?.constant ? 0 : 1;
+    // Worldbook position is the visible priority requested by the toolbox:
+    // character-before, character-after, author-note positions, depth, then
+    // example-message positions. Within each position keep the 1.0.2 order:
+    // Order descending and UID ascending.
+    function worldbookPositionV2(raw) {
+        const value = Number(raw?.position);
+        return Number.isInteger(value) && value >= 0 && value <= 7 ? value : 1;
     }
 
     function worldbookOrderV2(raw) {
@@ -3519,7 +3519,7 @@
 
     function sortWorldbookRecords(records) {
         const list = Array.isArray(records) ? records.slice() : [];
-        return list.sort((a, b) => worldbookPriorityV2(a.raw) - worldbookPriorityV2(b.raw)
+        return list.sort((a, b) => worldbookPositionV2(a.raw) - worldbookPositionV2(b.raw)
             || worldbookOrderV2(b.raw) - worldbookOrderV2(a.raw)
             || worldbookUidNumber(a) - worldbookUidNumber(b)
             || Number(a.displayIndex ?? 0) - Number(b.displayIndex ?? 0));
@@ -3540,8 +3540,7 @@
     }
 
     function currentWorldbookView() {
-        // There is no second manual ordering model: manager and AI context use
-        // the same SillyTavern-compatible Priority comparator.
+        // Manager and AI context use the same position-first comparator.
         return sortWorldbookRecords(worldbookEntries);
     }
 
