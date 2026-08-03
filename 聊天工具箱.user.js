@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.7
+// @version      1.0.8
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.7';
+    const VERSION = '1.0.8';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -21,6 +21,8 @@
     const LEGACY_INSTANCE_KEYS = ['__ChatToolbox_v080__', '__ChatToolbox_v020__'];
     const STORAGE_KEY = 'chat-toolbox-v020-settings';
     const MAX_RESULTS = 2000;
+    const THEATER_MAX_CONCURRENT = 3;
+    const THEATER_TIMEOUT_SEC = 300;
 
     let doc = document;
     let host = window;
@@ -80,10 +82,13 @@
     let rewriteWorldBooks = [];
     let rewriteWorldBook = '';
     const rewriteWorldEntryCache = new Map();
-    let theaterLoading = false;
     let theaterResult = '';
     let theaterCurrentId = '';
+    let theaterCurrentPrompt = '';
     let theaterHistory = [];
+    const theaterTasks = new Map();
+    let theaterTaskSequence = 0;
+    let theaterTaskTicker = null;
     let theaterWorldPickerOpen = false;
     let theaterWorldLoading = false;
     let theaterWorldError = '';
@@ -220,6 +225,7 @@
             },
             theater: {
                 channelId: 'main',
+                systemPrompt: defaultTheaterSystemPrompt(),
                 prompt: '',
                 contextFloors: 6,
                 contextTags: '',
@@ -347,6 +353,7 @@
             next.rewrite.channelId = validChannel(rewriteChannelId) ? rewriteChannelId : 'main';
             next.rewrite.systemPrompt = typeof stored.rewrite?.systemPrompt === 'string' ? stored.rewrite.systemPrompt : base.rewrite.systemPrompt;
             next.theater.channelId = validChannel(theaterChannelId) ? theaterChannelId : 'main';
+            next.theater.systemPrompt = typeof stored.theater?.systemPrompt === 'string' ? stored.theater.systemPrompt : base.theater.systemPrompt;
             next.theater.presets = Array.isArray(stored.theater?.presets) ? stored.theater.presets : [];
             next.theater.worldPresets = (Array.isArray(stored.theater?.worldPresets) ? stored.theater.worldPresets : [])
                 .map(normalizeTheaterWorldPreset)
@@ -373,6 +380,7 @@
             },
             theater: {
                 channelId: settings.theater.channelId || 'main',
+                systemPrompt: String(settings.theater.systemPrompt ?? defaultTheaterSystemPrompt()),
                 presets: Array.isArray(settings.theater.presets) ? settings.theater.presets : [],
                 worldPresets: (Array.isArray(settings.theater.worldPresets) ? settings.theater.worldPresets : [])
                     .map(normalizeTheaterWorldPreset)
@@ -422,6 +430,10 @@
 
     function defaultRewriteSystemPrompt() {
         return '你是中文小说的精确段落改写器。理解给出的剧情和设定，但只改写明确列出的段落；不得续写、删改事实、改变人物关系或段落顺序。每个 replacement 必须对应一个原段落，可以保留段内换行，但不要额外创建段落。只输出 JSON：{"changes":[{"paragraph":2,"replacement":"改写后的完整段落"}]}。必须为每个请求段落返回一项，不要输出分析或 Markdown。';
+    }
+
+    function defaultTheaterSystemPrompt() {
+        return '你是一个独立的小剧场生成器。只在插件内回答用户提出的 IF 线、角色想法或幕后片段，不创建新聊天楼层，不改变主线事实。请明确区分已知剧情与假设内容。';
     }
 
     function infoButton(key, extraClass = '', inline = false) {
@@ -1451,17 +1463,66 @@
         return { 'Content-Type': 'application/json' };
     }
 
-    async function stProxyJson(path, body, { timeoutSec = 120 } = {}) {
+    function requestAbortError(message = '请求已取消') {
+        const error = new Error(message);
+        error.name = 'AbortError';
+        return error;
+    }
+
+    function waitForAbortable(promise, { signal = null, timeoutSec = 0 } = {}) {
+        if (!signal && !(Number(timeoutSec) > 0)) return promise;
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            let timer = null;
+            const cleanup = () => {
+                if (timer) host.clearTimeout(timer);
+                signal?.removeEventListener?.('abort', onAbort);
+            };
+            const settle = (callback, value) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                callback(value);
+            };
+            const onAbort = () => settle(reject, requestAbortError());
+            if (signal?.aborted) return onAbort();
+            signal?.addEventListener?.('abort', onAbort, { once: true });
+            const seconds = Number(timeoutSec);
+            if (seconds > 0) {
+                timer = host.setTimeout(
+                    () => settle(reject, new Error(`请求超过 ${Math.round(seconds)} 秒，已自动取消`)),
+                    seconds * 1000,
+                );
+            }
+            Promise.resolve(promise).then(
+                (value) => settle(resolve, value),
+                (error) => settle(reject, error),
+            );
+        });
+    }
+
+    async function stProxyJson(path, body, { timeoutSec = 120, signal = null } = {}) {
         const Controller = host.AbortController || globalThis.AbortController;
         const controller = typeof Controller === 'function' ? new Controller() : null;
         const timeoutMs = Math.max(10, Math.min(600, Number(timeoutSec) || 120)) * 1000;
-        const timer = controller ? host.setTimeout(() => controller.abort(), timeoutMs) : null;
+        let timedOut = false;
+        let externallyAborted = false;
+        const abortFromSignal = () => {
+            externallyAborted = true;
+            controller?.abort();
+        };
+        if (signal?.aborted) abortFromSignal();
+        else signal?.addEventListener?.('abort', abortFromSignal, { once: true });
+        const timer = controller ? host.setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+        }, timeoutMs) : null;
         try {
             const response = await (host.fetch || fetch)(path, {
                 method: 'POST',
                 headers: stRequestHeaders(),
                 body: JSON.stringify(body),
-                ...(controller ? { signal: controller.signal } : {}),
+                ...(controller ? { signal: controller.signal } : signal ? { signal } : {}),
             });
             const raw = await response.text();
             let json = {};
@@ -1472,15 +1533,19 @@
             }
             return json;
         } catch (error) {
-            if (error?.name === 'AbortError') throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动取消`);
+            if (error?.name === 'AbortError' && externallyAborted) throw requestAbortError();
+            if (error?.name === 'AbortError' && timedOut) throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动取消`);
             throw error;
         } finally {
             if (timer) host.clearTimeout(timer);
+            signal?.removeEventListener?.('abort', abortFromSignal);
         }
     }
 
-    async function callAiText(feature, messages) {
-        const channel = selectedChannel(feature);
+    async function callAiText(feature, messages, options = {}) {
+        const channel = Object.prototype.hasOwnProperty.call(options, 'channelOverride')
+            ? options.channelOverride
+            : selectedChannel(feature);
         if (!channel) {
             const context = getContext();
             const generateRaw = context.generateRaw || host.generateRaw || host.SillyTavern?.generateRaw;
@@ -1496,10 +1561,16 @@
                 .map((message) => ({ role: String(message?.role || 'user'), content: contentBlockText(message?.content) }))
                 .filter((message) => message.content.trim());
             if (!conversation.length) throw new Error('没有可发送给模型的提示词');
-            const output = await generateRaw.call(context, {
+            const generation = generateRaw.call(context, {
                 prompt: conversation,
                 systemPrompt,
                 responseLength: feature === 'theater' ? 4096 : 8192,
+            });
+            // SillyTavern 的 generateRaw 暂未接收独立 AbortSignal；这里会立即
+            // 停止等待被取消的单个任务，并忽略其迟到结果，不触发全局停止事件。
+            const output = await waitForAbortable(generation, {
+                signal: options.signal,
+                timeoutSec: options.timeoutSec,
             });
             return apiOutputText(output);
         }
@@ -1515,6 +1586,9 @@
             stream: false,
             presence_penalty: 0,
             frequency_penalty: 0,
+        }, {
+            timeoutSec: options.timeoutSec || channel.timeoutSec || 120,
+            signal: options.signal,
         });
         return apiOutputText(json);
     }
@@ -2698,16 +2772,15 @@
         syncTheaterSelectionUi();
     }
 
-    async function collectTheaterNativePresetEntries() {
-        if (!theaterNativePresetName || !settings.theater.nativePresetEntryIds?.length) return '';
-        if (!theaterNativePresetEntries.length) {
-            await loadTheaterNativePresets({ name: theaterNativePresetName });
+    async function collectTheaterNativePresetEntries(config = settings.theater) {
+        const presetName = String(config.nativePresetName || theaterNativePresetName || '');
+        const selected = new Set((config.nativePresetEntryIds || []).map(String));
+        if (!presetName || !selected.size) return '';
+        const entries = Array.isArray(config.nativePresetEntries) ? config.nativePresetEntries : theaterNativePresetEntries;
+        if (!entries.length) {
+            throw new Error(`酒馆预设“${presetName}”的条目还未读取完成，请稍后重试`);
         }
-        if (!theaterNativePresetEntries.length && theaterNativePresetError) {
-            throw new Error(`读取酒馆预设“${theaterNativePresetName}”失败：${theaterNativePresetError}`);
-        }
-        const selected = new Set((settings.theater.nativePresetEntryIds || []).map(String));
-        return theaterNativePresetEntries.filter((entry) => selected.has(String(entry.id)) && entry.content?.trim())
+        return entries.filter((entry) => selected.has(String(entry.id)) && entry.content?.trim())
             .map((entry) => `【酒馆预设 · ${entry.name} · ${entry.raw?.role || 'system'}】\n${entry.content.trim()}`)
             .join('\n\n');
     }
@@ -2726,8 +2799,8 @@
         return `<div class="ctb-theater-native-picker"><div class="ctb-inline ctb-theater-native-toolbar"><select class="ctb-input" id="ctb-theater-native-preset">${options}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-native-presets" title="刷新"><i class="fa-solid fa-rotate"></i></button>${theaterNativePresetName ? `<span class="ctb-selection-count" data-theater-native-selected-count>已选 ${selected.size} 条</span><button type="button" class="ctb-button" data-action="select-theater-native-preset-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-native-preset">清空</button>` : ''}</div>${list}</div>`;
     }
 
-    function theaterSelectedWorldKeys() {
-        return new Set((settings.theater?.worldEntries || []).map((item) => worldEntrySelectionKey(item.world, item.uid)));
+    function theaterSelectedWorldKeys(selections = settings.theater?.worldEntries || []) {
+        return new Set(selections.map((item) => worldEntrySelectionKey(item.world, item.uid)));
     }
 
     async function fetchTheaterWorldEntries(world, { force = false } = {}) {
@@ -2870,10 +2943,9 @@
         return order;
     }
 
-    async function collectTheaterWorldEntries() {
-        const selections = settings.theater?.worldEntries || [];
+    async function collectTheaterWorldEntries(selections = settings.theater?.worldEntries || []) {
         if (!selections.length) return '';
-        const selected = theaterSelectedWorldKeys();
+        const selected = theaterSelectedWorldKeys(selections);
         const output = [];
         for (const world of orderedTheaterWorldBookNames(selections)) {
             let entries;
@@ -2933,10 +3005,10 @@
         }
     }
 
-    function theaterCharacterAndPersona() {
+    function theaterCharacterAndPersona(config = settings.theater) {
         const context = getContext();
         const parts = [];
-        if (settings.theater.includeCharacter !== false) {
+        if (config.includeCharacter !== false) {
             const characterId = context.characterId ?? context.this_chid ?? host.this_chid;
             const card = context.characters?.[characterId] || host.characters?.[characterId];
             if (card) {
@@ -2949,7 +3021,7 @@
                 if (text) parts.push(`【角色卡】\n${text}`);
             }
         }
-        if (settings.theater.includePersona !== false) {
+        if (config.includePersona !== false) {
             try {
                 const persona = String(context.substituteParams?.('{{persona}}') || '').trim();
                 if (persona) parts.push(`【用户设定】\n${persona}`);
@@ -2958,26 +3030,49 @@
         return parts;
     }
 
-    async function buildTheaterMessages() {
-        const prompt = String(settings.theater.prompt || '').trim();
-        if (!prompt) throw new Error('请先输入小剧场主题或问题');
-        const limit = Math.max(0, Math.min(50, Number(settings.theater.contextFloors) || 0));
-        const tags = parseTags(settings.theater.contextTags);
+    function theaterRequestSnapshot() {
+        const config = settings.theater;
+        const channel = selectedChannel('theater');
+        return {
+            prompt: String(config.prompt || ''),
+            systemPrompt: String(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultTheaterSystemPrompt()),
+            contextFloors: Number(config.contextFloors) || 0,
+            contextTags: String(config.contextTags || ''),
+            includeCharacter: config.includeCharacter !== false,
+            includePersona: config.includePersona !== false,
+            worldEntries: normalizeWorldEntrySelections(config.worldEntries),
+            nativePresetName: String(config.nativePresetName || theaterNativePresetName || ''),
+            nativePresetEntryIds: (config.nativePresetEntryIds || []).map(String),
+            nativePresetEntries: theaterNativePresetEntries.map((entry) => ({
+                id: String(entry.id),
+                name: String(entry.name || ''),
+                content: String(entry.content || ''),
+                raw: { role: String(entry.raw?.role || 'system') },
+            })),
+            channelOverride: channel ? cloneChannel(channel) : null,
+        };
+    }
+
+    async function buildTheaterMessages(config = settings.theater) {
+        const prompt = String(config.prompt || '').trim();
+        const limit = Math.max(0, Math.min(50, Number(config.contextFloors) || 0));
+        const tags = parseTags(config.contextTags);
         const historyRows = limit > 0 ? getRows().slice(-limit) : [];
         const history = historyRows.map((row) => {
             const text = extractTags(row.text, tags).trim();
             return text ? `${row.isUser ? '用户' : row.name}（#${row.id}）：${text}` : '';
         }).filter(Boolean).join('\n\n');
-        const nativePresetEntries = await collectTheaterNativePresetEntries();
-        const worldEntries = await collectTheaterWorldEntries();
+        const nativePresetEntries = await collectTheaterNativePresetEntries(config);
+        const worldEntries = await collectTheaterWorldEntries(normalizeWorldEntrySelections(config.worldEntries));
         const contextParts = [
-            ...theaterCharacterAndPersona(),
+            ...theaterCharacterAndPersona(config),
             nativePresetEntries ? `【用户选择的酒馆原生预设条目】\n${nativePresetEntries}` : '',
             worldEntries ? `【用户选择的世界书条目】\n${worldEntries}` : '',
             history ? `【最近上下文】\n${history}` : '',
         ].filter(Boolean);
-        const system = '你是一个独立的小剧场生成器。只在插件内回答用户提出的 IF 线、角色想法或幕后片段，不创建新聊天楼层，不改变主线事实。请明确区分已知剧情与假设内容。';
-        const user = [...contextParts, `【小剧场请求】\n${prompt}`].join('\n\n');
+        const system = String(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultTheaterSystemPrompt()).trim();
+        const request = prompt || '请根据以上设定与上下文，自行选择一个合适的片段生成小剧场。';
+        const user = [...contextParts, `【小剧场请求】\n${request}`].join('\n\n');
         return [{ role: 'system', content: system }, { role: 'user', content: user }];
     }
 
@@ -3018,28 +3113,90 @@
         renderPanel();
     }
 
-    async function runTheater() {
-        if (theaterLoading) return;
-        theaterLoading = true;
-        theaterResult = '';
+    function formatTheaterElapsed(startedAt) {
+        const total = Math.max(0, Math.floor((Date.now() - Number(startedAt || Date.now())) / 1000));
+        const minutes = Math.floor(total / 60);
+        const seconds = total % 60;
+        return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+
+    function updateTheaterTaskClocks() {
+        if (!root || root.hidden) return;
+        root.querySelectorAll('[data-theater-task-elapsed]').forEach((node) => {
+            const task = theaterTasks.get(String(node.dataset.theaterTaskElapsed || ''));
+            if (task) node.textContent = `已用 ${formatTheaterElapsed(task.startedAt)} / 最长 05:00`;
+        });
+    }
+
+    function updateTheaterTaskTicker() {
+        if (theaterTasks.size && !theaterTaskTicker) {
+            theaterTaskTicker = host.setInterval(updateTheaterTaskClocks, 1000);
+        } else if (!theaterTasks.size && theaterTaskTicker) {
+            host.clearInterval(theaterTaskTicker);
+            theaterTaskTicker = null;
+        }
+        updateTheaterTaskClocks();
+    }
+
+    function runTheater() {
+        if (theaterTasks.size >= THEATER_MAX_CONCURRENT) {
+            return notify(`一次最多同时生成 ${THEATER_MAX_CONCURRENT} 个小剧场，请等待或取消一个任务`, 'warning');
+        }
+        const Controller = host.AbortController || globalThis.AbortController;
+        const snapshot = theaterRequestSnapshot();
+        const task = {
+            id: `theater-task-${Date.now().toString(36)}-${(++theaterTaskSequence).toString(36)}`,
+            number: theaterTaskSequence,
+            prompt: String(snapshot.prompt || ''),
+            startedAt: Date.now(),
+            controller: typeof Controller === 'function' ? new Controller() : null,
+            cancelled: false,
+            status: 'running',
+        };
+        theaterTasks.set(task.id, task);
+        updateTheaterTaskTicker();
         renderPanel();
+        void executeTheaterTask(task, snapshot);
+    }
+
+    async function executeTheaterTask(task, snapshot) {
         try {
-            const messages = await buildTheaterMessages();
-            const output = await callAiText('theater', messages);
+            const messages = await buildTheaterMessages(snapshot);
+            const output = await callAiText('theater', messages, {
+                channelOverride: snapshot.channelOverride,
+                signal: task.controller?.signal || null,
+                timeoutSec: THEATER_TIMEOUT_SEC,
+            });
+            if (task.cancelled) return;
             theaterResult = String(output || '').trim();
             if (!theaterResult) throw new Error('API 返回了空文本');
             theaterCurrentId = `theater-result-${Date.now().toString(36)}`;
-            const item = { id: theaterCurrentId, prompt: settings.theater.prompt, output: theaterResult, time: new Date().toLocaleString() };
+            theaterCurrentPrompt = task.prompt;
+            const item = { id: theaterCurrentId, prompt: task.prompt, output: theaterResult, time: new Date().toLocaleString() };
             theaterHistory = [item, ...(theaterHistory || [])].slice(0, 20);
             // 最近记录只存在当前页面会话；只有点击星标才写入插件设置。
-            notify('小剧场生成完成；未收藏的记录会在刷新后清除', 'success');
+            notify(`小剧场任务 #${task.number} 生成完成；未收藏的记录会在刷新后清除`, 'success');
         } catch (error) {
+            if (task.cancelled || error?.name === 'AbortError') {
+                notify(`小剧场任务 #${task.number} 已取消`, 'info');
+                return;
+            }
             console.error('[聊天工具箱] 小剧场生成失败', error);
-            notify(`小剧场生成失败：${error?.message || String(error)}`, 'error');
+            notify(`小剧场任务 #${task.number} 生成失败：${error?.message || String(error)}`, 'error');
         } finally {
-            theaterLoading = false;
+            theaterTasks.delete(task.id);
+            updateTheaterTaskTicker();
             renderPanel();
         }
+    }
+
+    function cancelTheaterTask(id) {
+        const task = theaterTasks.get(String(id || ''));
+        if (!task || task.cancelled) return;
+        task.cancelled = true;
+        task.status = 'cancelling';
+        task.controller?.abort();
+        renderPanel();
     }
 
     function theaterFavorites() {
@@ -3217,6 +3374,16 @@
         return `${presetControls}<div class="ctb-world-picker-summary"><button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-theater-world-picker" data-theater-world-picker-button><i class="fa-solid fa-book-open"></i> 世界书条目 <span data-theater-world-selected-count>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button><button type="button" class="ctb-button" data-action="clear-theater-world-selection" data-theater-world-clear${selections.length ? '' : ' hidden'}>清空</button></div><div class="ctb-world-selected-summary" data-theater-world-selection-summary${selections.length ? '' : ' hidden'}>${summaries.map(({ world, count }) => `<span title="${escapeHTML(world)}">${escapeHTML(world)} · 已选 ${count} 条</span>`).join('')}</div>${theaterWorldPickerOpen ? `<div class="ctb-world-picker"><div class="ctb-inline ctb-world-book-row"><select class="ctb-input" id="ctb-theater-world-book">${books || '<option value="">没有世界书</option>'}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-world-books" title="刷新"><i class="fa-solid fa-rotate"></i></button><button type="button" class="ctb-button" data-action="close-theater-world-picker">完成</button></div>${theaterWorldBook ? `<div class="ctb-inline ctb-world-bulk"><span>${escapeHTML(theaterWorldBook)} · ${entries.length} 条</span><button type="button" class="ctb-button" data-action="select-theater-world-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-world-book">清空本书</button></div>` : ''}${list}</div>` : ''}`;
     }
 
+    function renderTheaterTaskList() {
+        const tasks = [...theaterTasks.values()].sort((a, b) => a.startedAt - b.startedAt);
+        if (!tasks.length) return '';
+        return `<div class="ctb-theater-task-list">${tasks.map((task) => {
+            const title = task.prompt.trim() || '未填写请求（按上下文自动生成）';
+            const status = task.status === 'cancelling' ? '正在取消…' : '正在生成';
+            return `<div class="ctb-theater-task"><span class="ctb-theater-task-state"><span class="ctb-save-spinner"></span><strong>任务 #${task.number} · ${status}</strong><small title="${escapeHTML(title)}">${escapeHTML(title)}</small></span><span class="ctb-theater-task-side"><em data-theater-task-elapsed="${escapeHTML(task.id)}">已用 ${formatTheaterElapsed(task.startedAt)} / 最长 05:00</em><button type="button" class="ctb-button ctb-danger" data-action="cancel-theater-task" data-theater-task-id="${escapeHTML(task.id)}"${task.cancelled ? ' disabled' : ''}>取消</button></span></div>`;
+        }).join('')}</div>`;
+    }
+
     function renderTheaterTab() {
         const config = settings.theater;
         if (!theaterNativePresetLoadedOnce && !theaterNativePresetLoading) host.setTimeout(() => loadTheaterNativePresets(), 0);
@@ -3240,10 +3407,11 @@
         }).join('');
         return `<section class="ctb-section"><div class="ctb-section-title">独立小剧场 ${infoButton('theater-scope')}</div></section>
             <section class="ctb-section"><div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>${renderChannelSettings('theater')}</section>
+            <section class="ctb-section"><div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div><textarea class="ctb-input ctb-textarea ctb-system-prompt" id="ctb-theater-system" placeholder="控制小剧场的生成身份、边界与风格">${escapeHTML(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultTheaterSystemPrompt())}</textarea></section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场预设</div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-preset">${presetOptions}</select><input class="ctb-input" id="ctb-theater-preset-name" placeholder="预设名称" value="${escapeHTML(config.presetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-preset"${config.selectedPresetId ? '' : ' disabled'}>删除</button></div></section>
             <section class="ctb-section"><div class="ctb-section-title">酒馆原生预设</div>${renderTheaterNativePresetPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
-            <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="例如：如果这一刻没有人打断，角色会怎么想？">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterLoading ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterLoading ? '生成中…' : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div></section>
+            <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="可留空；留空时会根据已选设定和上下文自动生成">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterTasks.size >= THEATER_MAX_CONCURRENT ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterTasks.size >= THEATER_MAX_CONCURRENT ? `已达上限（${THEATER_MAX_CONCURRENT}/${THEATER_MAX_CONCURRENT}）` : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div>${renderTheaterTaskList()}</section>
             ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 · 字数 ${countCharacters(theaterResult)} <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
             <section class="ctb-section"><div class="ctb-section-title">记录 <span>${theaterHistoryView === 'favorites' ? '收藏夹' : '本次会话'}</span></div>
                 <div class="ctb-inline ctb-theater-history-tabs"><button type="button" class="ctb-scope${theaterHistoryView === 'recent' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="recent">最近</button><button type="button" class="ctb-scope${theaterHistoryView === 'favorites' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="favorites">★ 收藏夹</button></div>
@@ -3269,6 +3437,7 @@
         settings.theater.prompt = item.prompt || '';
         theaterResult = item.output || '';
         theaterCurrentId = item.id;
+        theaterCurrentPrompt = item.prompt || '';
         renderPanel();
     }
 
@@ -3295,6 +3464,7 @@
             theaterHistory = theaterHistory.filter((item) => String(item.id) !== String(id));
             if (String(theaterCurrentId) === String(id)) {
                 theaterCurrentId = '';
+                theaterCurrentPrompt = '';
                 theaterResult = '';
             }
         }
@@ -4988,9 +5158,7 @@
             #${ROOT_ID} .ctb-export-tag-option small{color:#898d92;}
             #${ROOT_ID} .ctb-channel-picker{margin-bottom:6px;} #${ROOT_ID} .ctb-channel-picker select{flex:1;}
             #${ROOT_ID} .ctb-channel-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:7px;border:1px solid #d1d3d7;border-radius:3px;background:#ededf0;}
-            #${ROOT_ID} .ctb-channel-grid>*:nth-child(2),#${ROOT_ID} .ctb-channel-grid>.ctb-model-row,#${ROOT_ID} .ctb-channel-grid>.ctb-inline:last-child{grid-column:1/-1;}
-            #${ROOT_ID} .ctb-channel-summary{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px;border:1px solid #d1d3d7;border-radius:3px;background:#ededf0;}
-            #${ROOT_ID} .ctb-channel-summary>div{display:flex;min-width:0;flex-direction:column;} #${ROOT_ID} .ctb-channel-summary strong,#${ROOT_ID} .ctb-channel-summary small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-channel-summary small{color:#85898e;font-size:10px;}
+            #${ROOT_ID} .ctb-channel-grid>*:nth-child(2),#${ROOT_ID} .ctb-channel-grid>.ctb-model-row,#${ROOT_ID} .ctb-channel-grid>.ctb-in…129 tokens truncated…#85898e;font-size:10px;}
             #${ROOT_ID} .ctb-channel-editor-actions{grid-column:1/-1;display:flex;justify-content:flex-end;gap:6px;}
             #${ROOT_ID} .ctb-model-row select{flex:1;}
             #${ROOT_ID} .ctb-mini-field{display:flex;align-items:center;gap:5px;min-width:0;color:#6f7277;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-mini-field .ctb-input{width:90px;}
@@ -5024,6 +5192,7 @@
             #${ROOT_ID} .ctb-confirm-actions{justify-content:flex-end;}
             #${ROOT_ID} .ctb-tabs{display:flex;overflow-x:auto;scrollbar-width:thin;} #${ROOT_ID} .ctb-tab{flex:0 0 calc(100% / var(--ctb-tab-count,4));min-width:92px;}
             #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-theater-render{display:block;min-height:1.2em;color:inherit;font:inherit;line-height:1.55;} #${ROOT_ID} .ctb-theater-history-list{max-height:365px;overflow:auto;padding-right:2px;scrollbar-width:thin;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;color:#6e7278;font-size:10px;} #${ROOT_ID} .ctb-theater-history-body{max-height:120px;overflow:hidden;color:#4e5257;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history-actions{justify-content:flex-end;flex-wrap:wrap;margin-top:6px;} #${ROOT_ID} .ctb-theater-history-tabs{margin:5px 0 7px;} #${ROOT_ID} .ctb-reader-overlay{position:fixed;inset:0;z-index:2147483150;display:grid;place-items:center;padding:10px;background:rgba(18,21,27,.5);} #${ROOT_ID} .ctb-reader-card{width:min(1100px,calc(100vw - 20px));height:calc(100vh - 20px);height:calc(100dvh - 20px);max-height:900px;display:flex;flex-direction:column;overflow:hidden;border:1px solid #bfc3c8;border-radius:4px;background:#f5f5f7;box-shadow:0 18px 48px rgba(0,0,0,.38);} #${ROOT_ID} .ctb-reader-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #d3d5d9;background:#fafafd;color:#4c5056;font-size:12px;font-weight:700;} #${ROOT_ID} .ctb-reader-content{flex:1;min-height:0;overflow:auto;padding:15px;background:#f0f0f2;color:#42464c;font:12px/1.65 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-reader-content .ctb-theater-render{min-height:100%;} 
+            #${ROOT_ID} .ctb-theater-task-list{display:grid;gap:5px;margin-top:8px;} #${ROOT_ID} .ctb-theater-task{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px;border:1px solid #cbd2d8;border-radius:4px;background:#edf0f3;} #${ROOT_ID} .ctb-theater-task-state{display:grid;min-width:0;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:2px 6px;color:#50565d;} #${ROOT_ID} .ctb-theater-task-state .ctb-save-spinner{grid-row:1/3;} #${ROOT_ID} .ctb-theater-task-state strong{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-state small{overflow:hidden;color:#747a82;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side{display:flex;align-items:center;gap:6px;flex:0 0 auto;} #${ROOT_ID} .ctb-theater-task-side em{color:#68717a;font-size:9px;font-style:normal;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side .ctb-button{padding:3px 7px;font-size:9px;}
             #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-selection-count{margin-left:auto;color:#64748b;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry.is-selected{background:#f1f6fb;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
             #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
             #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
@@ -5340,6 +5509,7 @@
         else if (id === 'ctb-rewrite-context-tags') settings.rewrite.contextTags = target.value;
         else if (id === 'ctb-rewrite-global') settings.rewrite.globalInstruction = target.value;
         else if (id === 'ctb-rewrite-system') settings.rewrite.systemPrompt = target.value;
+        else if (id === 'ctb-theater-system') settings.theater.systemPrompt = target.value;
         else if (id === 'ctb-theater-prompt') settings.theater.prompt = target.value;
         else if (id === 'ctb-theater-preset-name') settings.theater.presetName = target.value;
         else if (id === 'ctb-theater-world-preset-name') settings.theater.worldPresetName = target.value;
@@ -5383,7 +5553,7 @@
             if (paragraph) paragraph.instruction = target.value;
             return;
         }
-        if (id === 'ctb-post-edit-system' || id === 'ctb-post-edit-rules' || id === 'ctb-rewrite-system') saveSettings();
+        if (id === 'ctb-post-edit-system' || id === 'ctb-post-edit-rules' || id === 'ctb-rewrite-system' || id === 'ctb-theater-system') saveSettings();
     }
 
     async function handleChange(event) {
@@ -5699,6 +5869,7 @@
             case 'save-theater-preset': return saveTheaterPreset();
             case 'delete-theater-preset': return deleteTheaterPreset();
             case 'run-theater': return runTheater();
+            case 'cancel-theater-task': return cancelTheaterTask(data.theaterTaskId);
             case 'preview-theater-prompt': return previewTheaterPrompt();
             case 'close-theater-preview': theaterPromptPreview = null; return renderPanel();
             case 'set-theater-history-view': theaterHistoryView = data.theaterView === 'favorites' ? 'favorites' : 'recent'; return renderPanel();
@@ -5711,7 +5882,7 @@
                 return renderPanel();
             }
             case 'open-theater-current-reader':
-                theaterReader = { title: settings.theater.prompt || '小剧场阅读', output: theaterResult };
+                theaterReader = { title: theaterCurrentPrompt || settings.theater.prompt || '小剧场阅读', output: theaterResult };
                 return renderPanel();
             case 'close-theater-reader': theaterReader = null; return renderPanel();
             case 'refresh-worldbook':
@@ -5912,6 +6083,10 @@
         }
         commandHandler = null;
         theaterReader = null;
+        for (const task of theaterTasks.values()) task.controller?.abort();
+        theaterTasks.clear();
+        if (theaterTaskTicker) host.clearInterval(theaterTaskTicker);
+        theaterTaskTicker = null;
         theaterRenderCache.clear();
         theaterHistory = [];
         doc.getElementById(STYLE_ID)?.remove();
