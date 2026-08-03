@@ -4,11 +4,11 @@
 
 ## 当前版本
 
-- 当前稳定版：**v1.0.5**
+- 当前稳定版：**v1.0.6**
 - 原生扩展清单：[manifest.json](./manifest.json)
 - Userscript 兼容入口：[聊天工具箱.user.js](./聊天工具箱.user.js)
-- 版本归档：[versions/v1.0.5/聊天工具箱-v1.0.5.user.js](./versions/v1.0.5/聊天工具箱-v1.0.5.user.js)
-- 上一稳定版：[versions/v1.0.4/聊天工具箱-v1.0.4.user.js](./versions/v1.0.4/聊天工具箱-v1.0.4.user.js)
+- 版本归档：[versions/v1.0.6/聊天工具箱-v1.0.6.user.js](./versions/v1.0.6/聊天工具箱-v1.0.6.user.js)
+- 上一稳定版：[versions/v1.0.5/聊天工具箱-v1.0.5.user.js](./versions/v1.0.5/聊天工具箱-v1.0.5.user.js)
 - 历史版本：[versions/v0.9.10/聊天工具箱-v0.9.10.user.js](./versions/v0.9.10/聊天工具箱-v0.9.10.user.js)
 - 历史版本：[versions/v0.9.9/聊天工具箱-v0.9.9.user.js](./versions/v0.9.9/聊天工具箱-v0.9.9.user.js)
 - 历史版本：[versions/v0.9.8/聊天工具箱-v0.9.8.user.js](./versions/v0.9.8/聊天工具箱-v0.9.8.user.js)
@@ -62,6 +62,7 @@
 
 | 版本 | 说明 |
 | --- | --- |
+| v1.0.6 | 修正世界书条目顺序：先按角色前、角色后、作者注释、深度、示例等 position 分组，同组再按 Order 降序；UID 仅作为并列时的稳定次序；保留小剧场世界书选择预设。 |
 | v1.0.5 | 修正世界书默认 Priority 排序：蓝灯常驻、绿灯普通、关闭条目分组后按 Order 降序和 UID 升序；小剧场新增独立世界书选择预设。 |
 | v1.0.4 | 清理一条被固定背景覆盖的无效 CSS 声明；保留必要的移动端视口回退和全部功能行为。 |
 | v1.0.3 | 三个“实际发送预览”显示实际发送消息总字数；小剧场本次结果显示字数。 |
