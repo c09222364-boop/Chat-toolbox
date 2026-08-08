@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.10
+// @version      1.0.11
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.10';
+    const VERSION = '1.0.11';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -1254,8 +1254,6 @@
         const innerStart = match.index + openingLength;
         return {
             tag,
-            fullStart: match.index,
-            fullEnd: match.index + match[0].length,
             innerStart,
             innerEnd: innerStart + match[1].length,
             content: match[1],
@@ -2139,7 +2137,6 @@
                 uid,
                 comment: String(value.comment || value.name || keys.join('、') || `条目 ${uid}`),
                 content: String(value.content ?? ''),
-                disabled: value.disable === true || value.enabled === false,
                 raw: value,
             };
         });
@@ -2349,7 +2346,7 @@
                     <div class="ctb-review-compare ctb-post-review-grid">
                         <div><small>原文</small><p>${escapeHTML(review.original)}</p></div>
                         <div><small>修改原因</small><p>${escapeHTML(review.reason || '未提供修改原因')}</p></div>
-                        <div><small>修改后</small>${postEditReviewEditingIndex === index ? `<textarea class="ctb-input ctb-review-edit" id="ctb-post-edit-review-revised-${index}">${escapeHTML(review.replacement)}</textarea>` : `<p class="ctb-review-plain">${escapeHTML(review.replacement)}</p>`}</div>
+                        <div><small>修改后</small>${postEditReviewEditingIndex === index ? `<textarea class="ctb-input ctb-review-edit" id="ctb-post-edit-review-revised-${index}">${escapeHTML(review.replacement)}</textarea>` : `<p>${escapeHTML(review.replacement)}</p>`}</div>
                     </div>
                     <div class="ctb-inline"><button type="button" class="ctb-button ctb-primary" data-action="post-edit-decision" data-review-index="${index}" data-decision="accept">采用这段</button><button type="button" class="ctb-button" data-action="post-edit-decision" data-review-index="${index}" data-decision="reject">不采用</button><button type="button" class="ctb-button" data-action="toggle-post-edit-review-editor" data-review-index="${index}">${postEditReviewEditingIndex === index ? '完成编辑' : '编辑'}</button></div>
                 </div>`).join('')}
@@ -3246,7 +3243,7 @@
                     table{max-width:100%;border-collapse:collapse}
                     pre{overflow:auto;white-space:pre-wrap;word-break:break-word}
                     a{color:#5b8366}
-                </style><div class="ctb-theater-document">${rendered.html}</div>`;
+                </style><div>${rendered.html}</div>`;
             } catch (error) {
                 console.warn('[聊天工具箱] 小剧场渲染失败，已回退纯文本', error);
                 container.textContent = value;
@@ -3527,7 +3524,7 @@
             value.uid = uid;
             const displayIndex = worldbookDisplayIndexV2(value, index);
             value.displayIndex = displayIndex;
-            return { uid: String(uid), sourceKey: String(key), raw: value, displayIndex };
+            return { uid: String(uid), raw: value, displayIndex };
         });
     }
 
@@ -3799,7 +3796,7 @@
             .filter((record) => worldbookGroupKeyV2(record) === worldbookGroupKeyV2({ raw }))
             .reduce((max, record) => Math.max(max, Number(record.raw?.order) || 0), 0);
         raw.order = maxOrder + 1;
-        worldbookEntries.push({ uid: String(uid), sourceKey: String(uid), raw, displayIndex });
+        worldbookEntries.push({ uid: String(uid), raw, displayIndex });
         worldbookEditingUid = String(uid);
         worldbookDraft = deepClone(raw);
         worldbookDraftDirty = false;
@@ -3949,7 +3946,7 @@
             raw.uid = uid;
             raw.comment = `${originalName}（副本）`;
             raw.displayIndex = nextDisplayIndex + offset;
-            worldbookEntries.push({ uid: String(uid), sourceKey: String(uid), raw, displayIndex: raw.displayIndex });
+            worldbookEntries.push({ uid: String(uid), raw, displayIndex: raw.displayIndex });
             copiedIds.push(String(uid));
         });
         worldbookSelected = new Set(copiedIds);
@@ -3982,7 +3979,7 @@
                 raw.uid = uid;
                 raw.comment = name;
                 raw.displayIndex = displayIndex++;
-                records.push({ uid: String(uid), sourceKey: String(uid), raw, displayIndex: raw.displayIndex });
+                records.push({ uid: String(uid), raw, displayIndex: raw.displayIndex });
             });
             await saveWorldInfoDocument(target, { ...document, entries: serializeWorldbookRecords(records) }, { immediate: true, refreshList: false, verify: true });
             theaterWorldEntryCache.delete(target);
@@ -4129,7 +4126,7 @@
                         <span class="ctb-worldbook-word-count" title="正文字符数">${worldbookWordCountV2(record)} 字</span>
                     </div>
                     <button type="button" class="ctb-worldbook-entry-toggle" data-action="toggle-worldbook-entry" data-worldbook-uid="${escapeHTML(record.uid)}" aria-expanded="${expanded ? 'true' : 'false'}">
-                        <span class="ctb-worldbook-entry-main"><strong class="ctb-worldbook-name">${escapeHTML(worldbookRecordLabel(record))}</strong></span>
+                        <span class="ctb-worldbook-entry-main"><strong>${escapeHTML(worldbookRecordLabel(record))}</strong></span>
                         <span class="ctb-worldbook-chevron" aria-hidden="true"><svg viewBox="0 0 16 16" focusable="false"><path d="M3.5 6 8 10.5 12.5 6"></path></svg></span>
                     </button>
                 </div>
@@ -4230,16 +4227,8 @@
      * 旧版把新条目追加到每一组 prompt_order，导致顺序错乱；这里所有插入、
      * 移动都只操作主顺序，删除时再清理其它组中已经失效的引用。
      */
-    function presetTransferMode() {
-        return presetTransferModeValue;
-    }
-
-    function presetTransferLoadMode() {
-        return presetTransferLoadModeValue;
-    }
-
     function presetTransferEntryMatchesLoadMode(entry) {
-        return presetTransferLoadMode() === 'all' || Boolean(entry?.inserted && entry?.enabled);
+        return presetTransferLoadModeValue === 'all' || Boolean(entry?.inserted && entry?.enabled);
     }
 
     function presetEntryArrayInfo(document) {
@@ -4311,26 +4300,21 @@
             const content = presetEntryDisplayContent(raw);
             records.push({
                 id: safeId,
-                index,
-                orderIndex: orderItem?.__ctbOrderIndex ?? -1,
                 raw: deepClone(raw),
                 name: presetEntryDisplayName(raw, index),
                 content,
                 marker: Boolean(raw?.marker),
-                systemPrompt: Boolean(raw?.system_prompt),
                 enabled: orderItem ? orderItem.enabled !== false : raw?.enabled !== false,
                 inserted: Boolean(inserted),
-                locked: Boolean(raw?.marker),
             });
         };
         if (main?.order?.length) {
-            main.order.forEach((orderItem, orderIndex) => {
+            main.order.forEach((orderItem) => {
                 const id = String(orderItem?.identifier ?? orderItem?.id ?? orderItem?.uid ?? '');
                 if (!id || seen.has(id)) return;
                 const found = byId.get(id);
                 if (!found) return;
-                const order = { ...orderItem, __ctbOrderIndex: orderIndex };
-                append(found.raw, found.index, id, order, true);
+                append(found.raw, found.index, id, orderItem, true);
                 seen.add(id);
             });
         }
@@ -4429,7 +4413,7 @@
     function presetSelectedRecords() {
         const selected = presetTransferSourceEntries.filter((entry) => presetTransferSelected.has(String(entry.id)));
         // Marker rows are structural entries, not user-transferable prompts.
-        return selected.filter((entry) => !entry.locked);
+        return selected.filter((entry) => !entry.marker);
     }
 
     function presetInsertIndex(order, anchor) {
@@ -4479,7 +4463,7 @@
             const names = presetTransferNames(manager);
             if (!names.length) throw new Error('没有读取到可用预设');
             presetTransferSource = names.includes(presetTransferSource) ? presetTransferSource : names[0];
-            if (presetTransferMode() === 'single') {
+            if (presetTransferModeValue === 'single') {
                 presetTransferTarget = '';
             } else {
                 presetTransferTarget = names.includes(presetTransferTarget) && presetTransferTarget !== presetTransferSource
@@ -4525,7 +4509,7 @@
     }
 
     async function swapPresetTransferSides() {
-        if (presetTransferMode() !== 'dual' || !presetTransferTarget) return;
+        if (presetTransferModeValue !== 'dual' || !presetTransferTarget) return;
         const source = presetTransferSource;
         presetTransferSource = presetTransferTarget;
         presetTransferTarget = source;
@@ -4598,7 +4582,7 @@
     async function transferPresetEntries(mode) {
         const selected = presetSelectedRecords();
         if (!selected.length) return notify('请先勾选要处理的预设条目', 'warning');
-        if (presetTransferMode() === 'single') {
+        if (presetTransferModeValue === 'single') {
             presetTransferLoading = true;
             renderPanel();
             try {
@@ -4683,7 +4667,7 @@
         const entries = normalizedSide === 'target' ? presetTransferTargetEntries : presetTransferSourceEntries;
         const presetName = normalizedSide === 'target' ? presetTransferTarget : presetTransferSource;
         const entry = entries.find((item) => String(item.id) === String(id));
-        if (!entry || entry.locked) return notify('内置标记不能直接编辑', 'warning');
+        if (!entry || entry.marker) return notify('内置标记不能直接编辑', 'warning');
         presetTransferDraft = {
             id: String(entry.id),
             raw: deepClone(entry.raw),
@@ -4744,7 +4728,7 @@
         if (!rootEl) return;
         const count = presetTransferSelected.size;
         if (presetTransferAnchor?.kind === 'after' && presetTransferSelected.has(String(presetTransferAnchor.anchorId))) {
-            const replacement = presetTransferPlacementEntries().find((entry) => !entry.locked && !presetTransferSelected.has(String(entry.id)));
+            const replacement = presetTransferPlacementEntries().find((entry) => !entry.marker && !presetTransferSelected.has(String(entry.id)));
             presetTransferAnchor = replacement
                 ? { kind: presetTransferAnchor.kind, anchorId: String(replacement.id) }
                 : { kind: 'top', anchorId: '' };
@@ -4778,8 +4762,8 @@
             role: String(entry?.raw?.role || ''),
             enabled: entry?.enabled !== false,
         });
-        const left = new Map(source.filter((entry) => !entry.locked && nameKey(entry)).map((entry) => [nameKey(entry), entry]));
-        const right = new Map(target.filter((entry) => !entry.locked && nameKey(entry)).map((entry) => [nameKey(entry), entry]));
+        const left = new Map(source.filter((entry) => !entry.marker && nameKey(entry)).map((entry) => [nameKey(entry), entry]));
+        const right = new Map(target.filter((entry) => !entry.marker && nameKey(entry)).map((entry) => [nameKey(entry), entry]));
         const rows = [];
         left.forEach((entry, name) => {
             // A comparison is meaningful only when both presets contain the
@@ -4792,13 +4776,13 @@
     }
 
     function presetTransferPlacementEntries() {
-        const entries = presetTransferMode() === 'dual' ? presetTransferTargetEntries : presetTransferSourceEntries;
+        const entries = presetTransferModeValue === 'dual' ? presetTransferTargetEntries : presetTransferSourceEntries;
         return entries.filter(presetTransferEntryMatchesLoadMode);
     }
 
     function renderPresetPlacementControls() {
         const entries = presetTransferPlacementEntries();
-        const candidates = entries.filter((entry) => !entry.locked && !presetTransferSelected.has(String(entry.id)));
+        const candidates = entries.filter((entry) => !entry.marker && !presetTransferSelected.has(String(entry.id)));
         const requestedKind = presetTransferAnchor?.kind === 'after' ? 'after' : 'top';
         const needsReference = requestedKind === 'after';
         const currentReference = candidates.some((entry) => String(entry.id) === String(presetTransferAnchor?.anchorId || ''))
@@ -4807,7 +4791,7 @@
         const referenceOptions = candidates.length
             ? candidates.map((entry) => `<option value="${escapeHTML(entry.id)}"${String(entry.id) === currentReference ? ' selected' : ''}>${escapeHTML(entry.name || '未命名条目')}</option>`).join('')
             : '<option value="">没有可用目标条目</option>';
-        const placementScope = presetTransferMode() === 'dual' ? '目标预设' : '当前预设';
+        const placementScope = presetTransferModeValue === 'dual' ? '目标预设' : '当前预设';
         const placeButton = (kind, label) => `<button type="button" class="ctb-button ctb-placement-choice${requestedKind === kind ? ' is-active' : ''}" data-action="set-preset-anchor" data-preset-anchor-kind="${kind}" data-preset-anchor-id="${kind === 'after' ? escapeHTML(currentReference) : ''}">${label}</button>`;
         return `<div class="ctb-preset-placement" aria-label="条目放置位置"><div class="ctb-preset-placement-label"><strong>放到哪里</strong><span>复制或移动后写入${placementScope}</span></div><div class="ctb-preset-placement-main"><div class="ctb-placement-choices">${placeButton('top', '列表开头')}${placeButton('after', '所选条目后')}</div>${needsReference ? `<label class="ctb-placement-reference"><span>插入到哪条后面</span><select class="ctb-input" id="ctb-preset-transfer-anchor" aria-label="插入到哪条后面"${candidates.length ? '' : ' disabled'}>${referenceOptions}</select></label>` : ''}</div></div>`;
     }
@@ -4826,8 +4810,8 @@
         if (!presetTransferLoadedOnce && !presetTransferLoading) host.setTimeout(() => loadPresetTransfer(), 0);
         let names = [];
         try { names = presetTransferNames(getPresetTransferManager()); } catch (_) {}
-        const mode = presetTransferMode();
-        const loadMode = presetTransferLoadMode();
+        const mode = presetTransferModeValue;
+        const loadMode = presetTransferLoadModeValue;
         const sourceOptions = names.map((name) => `<option value="${escapeHTML(name)}"${name === presetTransferSource ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
         const targetOptions = names.filter((name) => name !== presetTransferSource).map((name) => `<option value="${escapeHTML(name)}"${name === presetTransferTarget ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
         const query = presetTransferSearch.trim().toLowerCase();
@@ -4835,16 +4819,16 @@
             && (!query || `${entry.name}\n${entry.content}\n${entry.id}`.toLowerCase().includes(query)));
         const source = filterEntries(presetTransferSourceEntries);
         const target = filterEntries(presetTransferTargetEntries);
-        const renderLoadFilter = (side) => `<select class="ctb-input ctb-preset-load-filter" id="ctb-preset-transfer-load-${side}" aria-label="预设条目加载范围"><option value="all"${loadMode === 'all' ? ' selected' : ''}>加载全部条目</option><option value="enabled"${loadMode === 'enabled' ? ' selected' : ''}>仅加载已启用</option></select>`;
+        const renderLoadFilter = (side) => `<select class="ctb-input" id="ctb-preset-transfer-load-${side}" aria-label="预设条目加载范围"><option value="all"${loadMode === 'all' ? ' selected' : ''}>加载全部条目</option><option value="enabled"${loadMode === 'enabled' ? ' selected' : ''}>仅加载已启用</option></select>`;
         const renderRows = (rows, side, { selectable = false } = {}) => {
             if (!rows.length) return `<div class="ctb-world-empty">${loadMode === 'enabled' ? '没有已启用且符合条件的条目。' : '没有符合条件的条目。'}</div>`;
             const body = rows.slice(0, presetTransferVisibleLimit).map((entry) => {
                 const id = String(entry.id);
                 const checked = presetTransferSelected.has(id);
-                const expanded = !entry.locked && presetTransferDraft?.surface !== 'compare' && presetTransferDraft?.side === side && String(presetTransferDraft?.id) === id;
-                const checkbox = selectable ? `<input type="checkbox" data-preset-entry-id="${escapeHTML(id)}"${checked ? ' checked' : ''}${entry.locked ? ' disabled' : ''}>` : '';
-                const toggleAttrs = entry.locked ? ' disabled' : ` data-action="toggle-preset-entry" data-preset-entry-id="${escapeHTML(id)}" data-preset-side="${side}" aria-expanded="${expanded ? 'true' : 'false'}"`;
-                return `<article class="ctb-preset-entry${checked ? ' is-selected' : ''}${entry.locked ? ' is-locked' : ''}${expanded ? ' is-expanded' : ''}">
+                const expanded = !entry.marker && presetTransferDraft?.surface !== 'compare' && presetTransferDraft?.side === side && String(presetTransferDraft?.id) === id;
+                const checkbox = selectable ? `<input type="checkbox" data-preset-entry-id="${escapeHTML(id)}"${checked ? ' checked' : ''}${entry.marker ? ' disabled' : ''}>` : '';
+                const toggleAttrs = entry.marker ? ' disabled' : ` data-action="toggle-preset-entry" data-preset-entry-id="${escapeHTML(id)}" data-preset-side="${side}" aria-expanded="${expanded ? 'true' : 'false'}"`;
+                return `<article class="ctb-preset-entry${checked ? ' is-selected' : ''}${entry.marker ? ' is-locked' : ''}${expanded ? ' is-expanded' : ''}">
                     <div class="ctb-preset-entry-head">${checkbox}<button type="button" class="ctb-preset-entry-title"${toggleAttrs}>${escapeHTML(entry.name)}</button><span class="ctb-preset-entry-status">${entry.inserted ? (entry.enabled ? '启用' : '停用') : '未加入主顺序'}</span><button type="button" class="ctb-preset-entry-chevron"${toggleAttrs} aria-label="${expanded ? '收起' : '展开'} ${escapeHTML(entry.name)}"><svg viewBox="0 0 16 16" focusable="false"><path d="M3.5 6 8 10.5 12.5 6"></path></svg></button></div>
                     ${expanded ? `<div class="ctb-preset-entry-editor">${renderPresetDraftFields()}</div>` : ''}
                 </article>`;
@@ -4887,7 +4871,6 @@
         panelScrollState.set(tab, {
             bodyTop: body?.scrollTop || 0,
             bodyLeft: body?.scrollLeft || 0,
-            tabsLeft: tabs?.scrollLeft || 0,
             nodes,
         });
     }
