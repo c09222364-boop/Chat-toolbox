@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.9
+// @version      1.0.10
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.9';
+    const VERSION = '1.0.10';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -89,6 +89,7 @@
     let theaterNativePresetName = '';
     let theaterNativePresetEntries = [];
     let theaterNativePresetError = '';
+    let theaterNativeSelectionInitializedFor = '';
     let worldbookLoading = false;
     let worldbookLoadedOnce = false;
     let worldbookSaving = false;
@@ -164,6 +165,7 @@
         'post-edit-overview': '对所选 AI 楼层做一次低成本的完整词句修订，不带入其他楼层；结果先对照审核，确认后才保存。',
         'post-edit-scope': '填写 content 时，会自动读取并只替换所选楼层 <content> 与 </content> 之间的文字；标签本身和楼层其他内容都保留。',
         'channel-main': '“跟随酒馆主接口”不需要重复填写地址和密钥；自定义渠道通过酒馆的 OpenAI 兼容代理请求。',
+        'channel-custom': '小剧场只使用自定义渠道，避免酒馆主接口或反向代理超时返回错误页面；酒馆原生提示词预设仍可独立选择。',
         'system-cache': '这里的提示词只保存在聊天工具箱的插件设置缓存中，不会写入聊天记录；留空时使用内置默认提示词。',
         'theater-scope': '小剧场只在插件里独立生成和保存最近结果，不会插入聊天楼层，也不会改动原聊天。',
         'worldbook-save': '世界书编辑采用先在界面修改、再一次保存的方式。移动条目时会先保存目标世界书，确认成功后才从来源删除。',
@@ -196,7 +198,7 @@
                 presets: [],
             },
             theater: {
-                channelId: 'main',
+                channelId: '',
                 streaming: false,
                 systemPrompt: defaultTheaterSystemPrompt(),
                 prompt: '',
@@ -315,13 +317,14 @@
                 }));
             }
             const validChannel = (id) => id === 'main' || next.ai.channels.some((channel) => channel.id === id);
+            const validCustomChannel = (id) => next.ai.channels.some((channel) => channel.id === id);
             const postChannelId = String(stored.postEdit?.channelId || (stored.postEdit?.endpoint ? next.ai.channels[0]?.id : 'main'));
-            const theaterChannelId = String(stored.theater?.channelId || 'main');
+            const theaterChannelId = String(stored.theater?.channelId || '');
             next.postEdit.channelId = validChannel(postChannelId) ? postChannelId : 'main';
             next.postEdit.systemPrompt = typeof stored.postEdit?.systemPrompt === 'string' ? stored.postEdit.systemPrompt : base.postEdit.systemPrompt;
             next.postEdit.rules = typeof stored.postEdit?.rules === 'string' ? stored.postEdit.rules : '';
             next.postEdit.presets = Array.isArray(stored.postEdit?.presets) ? stored.postEdit.presets : [];
-            next.theater.channelId = validChannel(theaterChannelId) ? theaterChannelId : 'main';
+            next.theater.channelId = validCustomChannel(theaterChannelId) ? theaterChannelId : '';
             next.theater.systemPrompt = typeof stored.theater?.systemPrompt === 'string' ? stored.theater.systemPrompt : base.theater.systemPrompt;
             next.theater.presets = Array.isArray(stored.theater?.presets) ? stored.theater.presets : [];
             next.theater.worldPresets = (Array.isArray(stored.theater?.worldPresets) ? stored.theater.worldPresets : [])
@@ -344,7 +347,7 @@
                 presets: Array.isArray(settings.postEdit.presets) ? settings.postEdit.presets : [],
             },
             theater: {
-                channelId: settings.theater.channelId || 'main',
+                channelId: settings.theater.channelId || '',
                 systemPrompt: String(settings.theater.systemPrompt ?? defaultTheaterSystemPrompt()),
                 presets: Array.isArray(settings.theater.presets) ? settings.theater.presets : [],
                 worldPresets: (Array.isArray(settings.theater.worldPresets) ? settings.theater.worldPresets : [])
@@ -1400,7 +1403,7 @@
     }
 
     function selectedChannel(feature) {
-        const id = settings[feature]?.channelId || 'main';
+        const id = settings[feature]?.channelId || (feature === 'theater' ? '' : 'main');
         return id === 'main' ? null : channelById(id);
     }
 
@@ -2275,9 +2278,12 @@
 
     function renderChannelSettings(feature) {
         const featureSettings = settings[feature];
-        const currentId = featureSettings.channelId || 'main';
+        const customOnly = feature === 'theater';
+        const currentId = featureSettings.channelId || (customOnly ? '' : 'main');
         const current = channelById(currentId);
-        const options = [`<option value="main"${currentId === 'main' || !current ? ' selected' : ''}>跟随酒馆主接口</option>`]
+        const options = [customOnly
+            ? `<option value=""${!current ? ' selected' : ''}>请选择自定义渠道…</option>`
+            : `<option value="main"${currentId === 'main' || !current ? ' selected' : ''}>跟随酒馆主接口</option>`]
             .concat((settings.ai.channels || []).map((channel) => `<option value="${escapeHTML(channel.id)}"${currentId === channel.id ? ' selected' : ''}>${escapeHTML(channel.name || '未命名渠道')}</option>`))
             .join('');
         const editor = channelEditor?.feature === feature ? channelEditor : null;
@@ -2399,13 +2405,18 @@
             settings.theater.nativePresetName = theaterNativePresetName;
             if (theaterNativePresetName) {
                 const document = await loadPresetTransferDocument(manager, theaterNativePresetName);
-                theaterNativePresetEntries = presetTransferRecords(document).filter((entry) => !entry.locked);
-                const known = new Set(theaterNativePresetEntries.map((entry) => String(entry.id)));
+                theaterNativePresetEntries = presetTransferRecords(document);
+                const selectable = theaterNativePresetEntries.filter((entry) => !entry.marker);
+                const known = new Set(selectable.map((entry) => String(entry.id)));
                 const saved = (settings.theater.nativePresetEntryIds || []).map(String).filter((id) => known.has(id));
-                settings.theater.nativePresetEntryIds = saved.length ? saved : theaterNativePresetEntries.filter((entry) => entry.inserted && entry.enabled).map((entry) => String(entry.id));
+                settings.theater.nativePresetEntryIds = theaterNativeSelectionInitializedFor === theaterNativePresetName
+                    ? saved
+                    : saved.length ? saved : selectable.filter((entry) => entry.inserted && entry.enabled).map((entry) => String(entry.id));
+                theaterNativeSelectionInitializedFor = theaterNativePresetName;
             } else {
                 theaterNativePresetEntries = [];
                 settings.theater.nativePresetEntryIds = [];
+                theaterNativeSelectionInitializedFor = '';
             }
         } catch (error) {
             theaterNativePresetError = error.message || String(error);
@@ -2421,6 +2432,7 @@
         theaterNativePresetName = String(name || '');
         settings.theater.nativePresetName = theaterNativePresetName;
         settings.theater.nativePresetEntryIds = [];
+        theaterNativeSelectionInitializedFor = '';
         if (!theaterNativePresetName) {
             theaterNativePresetEntries = [];
             theaterNativePresetError = '';
@@ -2435,29 +2447,52 @@
         const current = new Set((settings.theater.nativePresetEntryIds || []).map(String));
         if (selected) current.add(key); else current.delete(key);
         settings.theater.nativePresetEntryIds = [...current];
+        theaterNativeSelectionInitializedFor = theaterNativePresetName;
         syncTheaterSelectionUi();
     }
 
     function setTheaterNativePresetSelection(selected) {
         settings.theater.nativePresetEntryIds = selected
-            ? theaterNativePresetEntries.map((entry) => String(entry.id))
+            ? theaterNativePresetEntries.filter((entry) => !entry.marker).map((entry) => String(entry.id))
             : [];
+        theaterNativeSelectionInitializedFor = theaterNativePresetName;
         syncTheaterSelectionUi();
     }
 
     async function collectTheaterNativePresetEntries(config = settings.theater) {
         const presetName = String(config.nativePresetName || theaterNativePresetName || '');
         const selected = new Set((config.nativePresetEntryIds || []).map(String));
-        if (!presetName || !selected.size) return [];
+        if (!presetName) return [];
         const entries = Array.isArray(config.nativePresetEntries) ? config.nativePresetEntries : theaterNativePresetEntries;
         if (!entries.length) {
             throw new Error(`酒馆预设“${presetName}”的条目还未读取完成，请稍后重试`);
         }
-        return entries.filter((entry) => selected.has(String(entry.id)) && entry.content?.trim())
-            .map((entry) => ({
+        return entries.filter((entry) => entry.marker
+            ? entry.inserted !== false && entry.enabled !== false
+            : selected.has(String(entry.id)) && entry.content?.trim())
+            .map((entry) => entry.marker ? {
+                kind: 'marker',
+                identifier: String(entry.raw?.identifier ?? entry.id ?? ''),
+                name: String(entry.name || ''),
+            } : {
+                kind: 'message',
                 role: theaterMessageRole(entry.raw?.role),
                 content: `【酒馆预设 · ${entry.name}】\n${entry.content.trim()}`,
-            }));
+            });
+    }
+
+    function theaterNativeMarkerLabel(identifier, fallback = '') {
+        const labels = {
+            worldInfoBefore: '插入世界书（角色定义前）',
+            personaDescription: '插入用户设定',
+            charDescription: '插入角色描述',
+            charPersonality: '插入角色性格',
+            scenario: '插入场景',
+            worldInfoAfter: '插入世界书（角色定义后）',
+            dialogueExamples: '插入示例消息',
+            chatHistory: '插入聊天历史',
+        };
+        return labels[String(identifier || '')] || fallback || '预设占位符';
     }
 
     function renderTheaterNativePresetPicker() {
@@ -2469,9 +2504,12 @@
             : theaterNativePresetError
                 ? `<div class="ctb-world-empty ctb-world-error">${escapeHTML(theaterNativePresetError)}</div>`
                 : theaterNativePresetName && theaterNativePresetEntries.length
-                    ? `<div class="ctb-theater-native-entry-list" data-ctb-scroll-key="theater-native-entry-list">${theaterNativePresetEntries.map((entry) => `<label class="ctb-theater-native-entry${selected.has(String(entry.id)) ? ' is-selected' : ''}"><input type="checkbox" data-theater-native-entry-id="${escapeHTML(entry.id)}"${selected.has(String(entry.id)) ? ' checked' : ''}><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 140) || '（空条目）')}</small></span><em>${entry.enabled ? '启用' : '停用'}</em></label>`).join('')}</div>`
+                    ? `<div class="ctb-theater-native-entry-list" data-ctb-scroll-key="theater-native-entry-list">${theaterNativePresetEntries.map((entry) => entry.marker
+                        ? `<div class="ctb-theater-native-entry is-marker${entry.enabled ? '' : ' is-disabled'}"><i class="fa-solid fa-code-branch"></i><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(theaterNativeMarkerLabel(entry.raw?.identifier, entry.name))}</small></span><em>${entry.enabled ? '占位' : '停用'}</em></div>`
+                        : `<label class="ctb-theater-native-entry${selected.has(String(entry.id)) ? ' is-selected' : ''}"><input type="checkbox" data-theater-native-entry-id="${escapeHTML(entry.id)}"${selected.has(String(entry.id)) ? ' checked' : ''}><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 140) || '（空条目）')}</small></span><em>${entry.enabled ? '启用' : '停用'}</em></label>`).join('')}</div>`
                     : '<div class="ctb-world-empty">选择一个预设后可勾选要带入小剧场的条目。</div>';
-        return `<div class="ctb-theater-native-picker"><div class="ctb-inline ctb-theater-native-toolbar"><select class="ctb-input" id="ctb-theater-native-preset">${options}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-native-presets" title="刷新"><i class="fa-solid fa-rotate"></i></button>${theaterNativePresetName ? `<span class="ctb-selection-count" data-theater-native-selected-count>已选 ${selected.size} 条</span><button type="button" class="ctb-button" data-action="select-theater-native-preset-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-native-preset">清空</button>` : ''}</div>${list}</div>`;
+        const selectedCount = theaterNativePresetEntries.filter((entry) => !entry.marker && selected.has(String(entry.id))).length;
+        return `<div class="ctb-theater-native-picker"><div class="ctb-inline ctb-theater-native-toolbar"><select class="ctb-input" id="ctb-theater-native-preset">${options}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-native-presets" title="刷新"><i class="fa-solid fa-rotate"></i></button>${theaterNativePresetName ? `<span class="ctb-selection-count" data-theater-native-selected-count>已选 ${selectedCount} 条</span><button type="button" class="ctb-button" data-action="select-theater-native-preset-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-native-preset">清空</button>` : ''}</div>${list}</div>`;
     }
 
     function theaterSelectedWorldKeys(selections = settings.theater?.worldEntries || []) {
@@ -2671,7 +2709,10 @@
             input.closest('.ctb-theater-native-entry')?.classList.toggle('is-selected', input.checked);
         });
         const nativeCount = root.querySelector('[data-theater-native-selected-count]');
-        if (nativeCount) nativeCount.textContent = `已选 ${nativeSelected.size} 条`;
+        if (nativeCount) {
+            const visibleSelected = theaterNativePresetEntries.filter((entry) => !entry.marker && nativeSelected.has(String(entry.id))).length;
+            nativeCount.textContent = `已选 ${visibleSelected} 条`;
+        }
 
         const worldSelected = theaterSelectedWorldKeys();
         root.querySelectorAll('[data-theater-world-entry-uid]').forEach((input) => {
@@ -2721,34 +2762,57 @@
         const position = worldbookPositionV2(entry?.raw);
         return {
             role: position === 4 ? theaterMessageRole(entry?.raw?.role) : 'system',
-            content: `【世界书 · ${entry.world} · ${entry.comment} · ${theaterWorldPositionLabel(entry)}】\n${entry.content.trim()}`,
+            content: `【世界书 · ${entry.world} · ${entry.comment} · ${theaterWorldPositionLabel(entry)}】\n${theaterSubstituteText(entry.content.trim())}`,
         };
     }
 
-    function theaterCharacterAndPersona(config = settings.theater) {
+    function theaterSubstituteText(value) {
+        const text = String(value || '');
+        try {
+            return String(getContext().substituteParams?.(text) ?? text);
+        } catch (_) {
+            return text;
+        }
+    }
+
+    function theaterCardField(card, key) {
+        return String(card?.data?.[key] ?? card?.[key] ?? '').trim();
+    }
+
+    function theaterCharacterContext(config = settings.theater) {
         const context = getContext();
-        let character = null;
-        let persona = null;
+        const result = {
+            charDescription: [],
+            charPersonality: [],
+            scenario: [],
+            personaDescription: [],
+            dialogueExamples: [],
+        };
         if (config.includeCharacter !== false) {
             const characterId = context.characterId ?? context.this_chid ?? host.this_chid;
             const card = context.characters?.[characterId] || host.characters?.[characterId];
             if (card) {
-                const text = [
-                    card.name ? `角色名：${card.name}` : '',
-                    card.description ? `角色描述：${card.description}` : '',
-                    card.personality ? `性格：${card.personality}` : '',
-                    card.scenario ? `场景：${card.scenario}` : '',
-                ].filter(Boolean).join('\n');
-                if (text) character = { role: 'system', content: `【角色卡】\n${text}` };
+                const name = theaterCardField(card, 'name');
+                const description = theaterSubstituteText(theaterCardField(card, 'description'));
+                const personality = theaterSubstituteText(theaterCardField(card, 'personality'));
+                const scenario = theaterSubstituteText(theaterCardField(card, 'scenario'));
+                const examples = theaterSubstituteText(theaterCardField(card, 'mes_example'));
+                if (name || description) result.charDescription.push({
+                    role: 'system',
+                    content: `【角色描述】\n${[name ? `角色名：${name}` : '', description].filter(Boolean).join('\n')}`,
+                });
+                if (personality) result.charPersonality.push({ role: 'system', content: `【角色性格】\n${personality}` });
+                if (scenario) result.scenario.push({ role: 'system', content: `【场景】\n${scenario}` });
+                if (examples) result.dialogueExamples.push({ role: 'system', content: `【角色示例对话】\n${examples}` });
             }
         }
         if (config.includePersona !== false) {
             try {
                 const personaText = String(context.substituteParams?.('{{persona}}') || '').trim();
-                if (personaText) persona = { role: 'system', content: `【用户设定】\n${personaText}` };
+                if (personaText) result.personaDescription.push({ role: 'system', content: `【用户设定】\n${personaText}` });
             } catch (_) {}
         }
-        return { character, persona };
+        return result;
     }
 
     function insertTheaterDepthMessages(history, entries) {
@@ -2787,7 +2851,15 @@
                 id: String(entry.id),
                 name: String(entry.name || ''),
                 content: String(entry.content || ''),
-                raw: { role: String(entry.raw?.role || 'system') },
+                marker: Boolean(entry.marker),
+                enabled: entry.enabled !== false,
+                inserted: entry.inserted !== false,
+                raw: {
+                    identifier: String(entry.raw?.identifier ?? entry.id ?? ''),
+                    role: String(entry.raw?.role || 'system'),
+                    marker: Boolean(entry.raw?.marker),
+                    system_prompt: Boolean(entry.raw?.system_prompt),
+                },
             })),
             channelOverride: channel ? cloneChannel(channel) : null,
         };
@@ -2806,26 +2878,49 @@
                 : row.isUser ? 'user' : 'assistant';
             return { role, content: text };
         }).filter(Boolean);
-        const nativePresetEntries = await collectTheaterNativePresetEntries(config);
+        const nativeLayout = await collectTheaterNativePresetEntries(config);
         const worldEntries = await collectTheaterWorldEntries(normalizeWorldEntrySelections(config.worldEntries));
-        const { character, persona } = theaterCharacterAndPersona(config);
-        const worldBefore = worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === 0).map(theaterWorldMessage);
-        const worldAfter = worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === 1).map(theaterWorldMessage);
-        const worldDepth = worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === 4);
-        const worldAnchored = worldEntries
-            .filter((entry) => ![0, 1, 4].includes(worldbookPositionV2(entry.raw)))
-            .map(theaterWorldMessage);
+        const character = theaterCharacterContext(config);
+        const worldAt = (position) => worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === position);
+        const worldMessagesAt = (position) => worldAt(position).map(theaterWorldMessage);
+        const historyWithDepth = insertTheaterDepthMessages(history, worldAt(4));
+        const markerMessages = new Map([
+            ['worldInfoBefore', worldMessagesAt(0)],
+            ['personaDescription', character.personaDescription],
+            ['charDescription', character.charDescription],
+            ['charPersonality', character.charPersonality],
+            ['scenario', character.scenario],
+            ['worldInfoAfter', worldMessagesAt(1)],
+            ['dialogueExamples', [...worldMessagesAt(5), ...character.dialogueExamples, ...worldMessagesAt(6)]],
+            ['chatHistory', [...worldMessagesAt(2), ...historyWithDepth, ...worldMessagesAt(3), ...worldMessagesAt(7)]],
+        ]);
+        const presetEntries = Array.isArray(config.nativePresetEntries) ? config.nativePresetEntries : theaterNativePresetEntries;
+        const knownMarkers = new Set(presetEntries
+            .filter((entry) => entry.marker || entry.raw?.marker)
+            .map((entry) => String(entry.raw?.identifier ?? entry.id ?? ''))
+            .filter(Boolean));
+        const expandedPreset = [];
+        const expandedMarkers = new Set();
+        for (const item of nativeLayout) {
+            if (item.kind === 'marker') {
+                expandedPreset.push(...(markerMessages.get(item.identifier) || []));
+                expandedMarkers.add(item.identifier);
+            } else {
+                expandedPreset.push({ role: item.role, content: theaterSubstituteText(item.content) });
+            }
+        }
+        // Custom presets may omit some standard markers. Only those genuinely
+        // absent get a canonical fallback; an existing but disabled marker stays disabled.
+        const fallbackOrder = ['worldInfoBefore', 'personaDescription', 'charDescription', 'charPersonality', 'scenario', 'worldInfoAfter', 'dialogueExamples', 'chatHistory'];
+        const fallback = fallbackOrder.flatMap((identifier) => (
+            expandedMarkers.has(identifier) || knownMarkers.has(identifier) ? [] : (markerMessages.get(identifier) || [])
+        ));
         const system = String(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultTheaterSystemPrompt()).trim();
         const request = prompt || '请根据以上设定与上下文，自行选择一个合适的片段生成小剧场。';
         return [
             ...(system ? [{ role: 'system', content: system }] : []),
-            ...nativePresetEntries,
-            ...worldBefore,
-            ...(character ? [character] : []),
-            ...worldAfter,
-            ...(persona ? [persona] : []),
-            ...worldAnchored,
-            ...insertTheaterDepthMessages(history, worldDepth),
+            ...expandedPreset,
+            ...fallback,
             { role: 'user', content: `【小剧场请求】\n${request}` },
         ];
     }
@@ -2844,7 +2939,7 @@
             nativePresetName: String(config.nativePresetName || ''),
             nativePresetEntryIds: (config.nativePresetEntryIds || []).map(String),
             worldEntries: normalizeWorldEntrySelections(config.worldEntries),
-            channelId: config.channelId || 'main',
+            channelId: config.channelId || '',
         };
         if (!preset) {
             preset = { id: `theater-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, name, ...data };
@@ -2919,6 +3014,9 @@
     function runTheater() {
         if (theaterTasks.size >= THEATER_MAX_CONCURRENT) {
             return notify(`一次最多同时生成 ${THEATER_MAX_CONCURRENT} 个小剧场，请等待或取消一个任务`, 'warning');
+        }
+        if (!selectedChannel('theater')) {
+            return notify('请先选择或新建一个小剧场自定义渠道', 'warning');
         }
         const Controller = host.AbortController || globalThis.AbortController;
         const snapshot = theaterRequestSnapshot();
@@ -3223,12 +3321,12 @@
             </article>`;
         }).join('');
         return `<section class="ctb-section"><div class="ctb-section-title">独立小剧场 ${infoButton('theater-scope')}</div></section>
-            <section class="ctb-section"><div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>${renderChannelSettings('theater')}<label class="ctb-check ctb-theater-stream-option"><input id="ctb-theater-streaming" type="checkbox"${config.streaming === true ? ' checked' : ''}${customChannelSelected ? '' : ' disabled'}> 流式传输 <small>${customChannelSelected ? '接口不支持时自动回退完整返回' : '仅自定义渠道可用'}</small></label></section>
+            <section class="ctb-section"><div class="ctb-section-title">自定义生成渠道 ${infoButton('channel-custom')}</div>${renderChannelSettings('theater')}<label class="ctb-check ctb-theater-stream-option"><input id="ctb-theater-streaming" type="checkbox"${config.streaming === true ? ' checked' : ''}${customChannelSelected ? '' : ' disabled'}> 流式传输 <small>${customChannelSelected ? '接口不支持时自动回退完整返回' : '请先选择或新建渠道'}</small></label></section>
             <section class="ctb-section"><div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div><textarea class="ctb-input ctb-textarea ctb-system-prompt" id="ctb-theater-system" placeholder="控制小剧场的生成身份、边界与风格">${escapeHTML(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultTheaterSystemPrompt())}</textarea></section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场预设</div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-preset">${presetOptions}</select><input class="ctb-input" id="ctb-theater-preset-name" placeholder="预设名称" value="${escapeHTML(config.presetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-preset"${config.selectedPresetId ? '' : ' disabled'}>删除</button></div></section>
             <section class="ctb-section"><div class="ctb-section-title">酒馆原生预设</div>${renderTheaterNativePresetPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
-            <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="可留空；留空时会根据已选设定和上下文自动生成">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterTasks.size >= THEATER_MAX_CONCURRENT ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterTasks.size >= THEATER_MAX_CONCURRENT ? `已达上限（${THEATER_MAX_CONCURRENT}/${THEATER_MAX_CONCURRENT}）` : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div>${renderTheaterTaskList()}</section>
+            <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="可留空；留空时会根据已选设定和上下文自动生成">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${!customChannelSelected || theaterTasks.size >= THEATER_MAX_CONCURRENT ? ' disabled' : ''} title="${customChannelSelected ? '' : '请先选择或新建自定义渠道'}"><i class="fa-solid fa-wand-magic-sparkles"></i> ${!customChannelSelected ? '请选择自定义渠道' : theaterTasks.size >= THEATER_MAX_CONCURRENT ? `已达上限（${THEATER_MAX_CONCURRENT}/${THEATER_MAX_CONCURRENT}）` : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div>${renderTheaterTaskList()}</section>
             ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 · 正文字数 ${theaterOutputCharacterCount(theaterResult)} <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
             <section class="ctb-section"><div class="ctb-section-title">记录 <span>${theaterHistoryView === 'favorites' ? '收藏夹' : '本次会话'}</span></div>
                 <div class="ctb-inline ctb-theater-history-tabs"><button type="button" class="ctb-scope${theaterHistoryView === 'recent' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="recent">最近</button><button type="button" class="ctb-scope${theaterHistoryView === 'favorites' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="favorites">★ 收藏夹</button></div>
@@ -5006,7 +5104,7 @@
             #${ROOT_ID} .ctb-tabs{display:flex;overflow-x:auto;scrollbar-width:thin;} #${ROOT_ID} .ctb-tab{flex:0 0 calc(100% / var(--ctb-tab-count,4));min-width:92px;}
             #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-theater-render{display:block;min-height:1.2em;color:inherit;font:inherit;line-height:1.55;} #${ROOT_ID} .ctb-theater-history-list{max-height:365px;overflow:auto;padding-right:2px;scrollbar-width:thin;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;color:#6e7278;font-size:10px;} #${ROOT_ID} .ctb-theater-history-body{max-height:120px;overflow:hidden;color:#4e5257;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history-actions{justify-content:flex-end;flex-wrap:wrap;margin-top:6px;} #${ROOT_ID} .ctb-theater-history-tabs{margin:5px 0 7px;} #${ROOT_ID} .ctb-reader-overlay{position:fixed;inset:0;z-index:2147483150;display:grid;place-items:center;padding:10px;background:rgba(18,21,27,.5);} #${ROOT_ID} .ctb-reader-card{width:min(1100px,calc(100vw - 20px));height:calc(100vh - 20px);height:calc(100dvh - 20px);max-height:900px;display:flex;flex-direction:column;overflow:hidden;border:1px solid #bfc3c8;border-radius:4px;background:#f5f5f7;box-shadow:0 18px 48px rgba(0,0,0,.38);} #${ROOT_ID} .ctb-reader-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #d3d5d9;background:#fafafd;color:#4c5056;font-size:12px;font-weight:700;} #${ROOT_ID} .ctb-reader-content{flex:1;min-height:0;overflow:auto;padding:15px;background:#f0f0f2;color:#42464c;font:12px/1.65 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-reader-content .ctb-theater-render{min-height:100%;} 
             #${ROOT_ID} .ctb-theater-stream-option{display:flex;margin-top:7px;gap:5px;} #${ROOT_ID} .ctb-theater-stream-option small{color:#777d84;font-size:9px;} #${ROOT_ID} .ctb-theater-task-list{display:grid;gap:5px;margin-top:8px;} #${ROOT_ID} .ctb-theater-task{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 8px;border:1px solid #cbd2d8;border-radius:4px;background:#edf0f3;} #${ROOT_ID} .ctb-theater-task-state{display:grid;min-width:0;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:2px 6px;color:#50565d;} #${ROOT_ID} .ctb-theater-task-state .ctb-save-spinner{grid-row:1/3;} #${ROOT_ID} .ctb-theater-task-state strong{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-state small{overflow:hidden;color:#747a82;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side{display:flex;align-items:center;gap:6px;flex:0 0 auto;} #${ROOT_ID} .ctb-theater-task-side em{color:#68717a;font-size:9px;font-style:normal;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side .ctb-button{padding:3px 7px;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live{grid-column:1/-1;min-width:0;padding-top:5px;border-top:1px solid #d5dbe0;} #${ROOT_ID} .ctb-theater-task-live small{display:block;margin-bottom:3px;color:#68717a;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live pre{max-height:170px;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#4f555c;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);}
-            #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-selection-count{margin-left:auto;color:#64748b;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry.is-selected{background:#f1f6fb;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
+            #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-selection-count{margin-left:auto;color:#64748b;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry.is-selected{background:#f1f6fb;} #${ROOT_ID} .ctb-theater-native-entry.is-marker{background:#f8fafc;cursor:default;} #${ROOT_ID} .ctb-theater-native-entry.is-marker>i{margin-top:2px;color:#6b879d;text-align:center;} #${ROOT_ID} .ctb-theater-native-entry.is-disabled{opacity:.48;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
             #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
             #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
             #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.62;}
@@ -5477,7 +5575,7 @@
             renderPanel();
         } else if (id === 'ctb-theater-channel') {
             settings.theater.channelId = target.value;
-            if (target.value === 'main') settings.theater.streaming = false;
+            if (!selectedChannel('theater')) settings.theater.streaming = false;
             channelEditor = null;
             saveSettings();
             renderPanel();
@@ -5515,14 +5613,17 @@
                 settings.theater.worldEntries = normalizeWorldEntrySelections(preset.worldEntries);
                 settings.theater.selectedWorldPresetId = '';
                 settings.theater.worldPresetName = '';
-                settings.theater.channelId = preset.channelId || 'main';
-                if (settings.theater.channelId === 'main') settings.theater.streaming = false;
+                const presetChannelId = String(preset.channelId || '');
+                settings.theater.channelId = channelById(presetChannelId) ? presetChannelId : '';
+                if (!settings.theater.channelId) settings.theater.streaming = false;
                 theaterNativePresetName = settings.theater.nativePresetName;
+                theaterNativeSelectionInitializedFor = theaterNativePresetName;
             } else {
                 settings.theater.presetName = '';
                 settings.theater.nativePresetName = '';
                 settings.theater.nativePresetEntryIds = [];
                 theaterNativePresetName = '';
+                theaterNativeSelectionInitializedFor = '';
             }
             saveSettings();
             if (settings.theater.nativePresetName) await loadTheaterNativePresets({ name: settings.theater.nativePresetName });
@@ -5587,10 +5688,10 @@
             case 'cancel-channel': return cancelChannelEditor();
             case 'delete-channel': {
                 const index = settings.ai.channels.findIndex((channel) => channel.id === data.channelId);
-                if (index < 0 || !host.confirm('确定删除这个生成渠道吗？引用它的 AI 功能都会改为跟随酒馆主接口。')) return;
+                if (index < 0 || !host.confirm('确定删除这个生成渠道吗？词句修改会改为跟随酒馆主接口；小剧场需要重新选择自定义渠道。')) return;
                 settings.ai.channels.splice(index, 1);
                 if (settings.postEdit.channelId === data.channelId) settings.postEdit.channelId = 'main';
-                if (settings.theater.channelId === data.channelId) settings.theater.channelId = 'main';
+                if (settings.theater.channelId === data.channelId) settings.theater.channelId = '';
                 channelEditor = null;
                 saveSettings();
                 return renderPanel();
