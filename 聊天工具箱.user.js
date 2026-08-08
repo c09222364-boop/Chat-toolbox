@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.8
-// @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、逐段改写、小剧场、世界书管理与预设条目转移
+// @version      1.0.9
+// @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const VERSION = '1.0.8';
+    const VERSION = '1.0.9';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -70,18 +70,6 @@
     let postEditPreviewLoading = false;
     let channelLoadingId = '';
     let channelEditor = null;
-    let rewriteDraft = null;
-    let rewriteLoading = false;
-    let rewriteReview = [];
-    let rewriteApplyLoading = false;
-    let rewritePromptPreview = null;
-    let rewritePreviewLoading = false;
-    let rewriteWorldPickerOpen = false;
-    let rewriteWorldLoading = false;
-    let rewriteWorldError = '';
-    let rewriteWorldBooks = [];
-    let rewriteWorldBook = '';
-    const rewriteWorldEntryCache = new Map();
     let theaterResult = '';
     let theaterCurrentId = '';
     let theaterCurrentPrompt = '';
@@ -175,9 +163,6 @@
         'undo': '撤销只保留本次页面会话的最后一次操作，不会写进聊天文件；刷新或重开页面后失效。',
         'post-edit-overview': '对所选 AI 楼层做一次低成本的完整词句修订，不带入其他楼层；结果先对照审核，确认后才保存。',
         'post-edit-scope': '填写 content 时，会自动读取并只替换所选楼层 <content> 与 </content> 之间的文字；标签本身和楼层其他内容都保留。',
-        'rewrite-scope': '逐段改写会结合选定的历史、角色卡、用户设定和世界书理解剧情，但 API 只返回段落补丁。每段都要由你采用或忽略，未采用的段落不会变化。',
-        'rewrite-context': '发送顺序固定为：角色卡 → 用户设定 → 你手动勾选的世界书具体条目 → 所选楼层之前最近 N 楼。这里只发送明确勾选的条目，不会自动混入整本世界书或其他已触发条目。',
-        'rewrite-floor-tag': '楼层决定要改写哪一条 AI 回复；正文标签只截取该楼层对应标签内的文字，标签本身与其余内容不会交给模型改写。',
         'channel-main': '“跟随酒馆主接口”不需要重复填写地址和密钥；自定义渠道通过酒馆的 OpenAI 兼容代理请求。',
         'system-cache': '这里的提示词只保存在聊天工具箱的插件设置缓存中，不会写入聊天记录；留空时使用内置默认提示词。',
         'theater-scope': '小剧场只在插件里独立生成和保存最近结果，不会插入聊天楼层，也不会改动原聊天。',
@@ -192,7 +177,6 @@
                 search: true,
                 export: true,
                 postEdit: true,
-                rewrite: true,
                 theater: true,
                 worldbook: true,
                 presetTransfer: true,
@@ -211,20 +195,9 @@
                 presetName: '',
                 presets: [],
             },
-            rewrite: {
-                channelId: 'main',
-                tag: 'content',
-                floor: '',
-                systemPrompt: defaultRewriteSystemPrompt(),
-                contextFloors: 4,
-                contextTags: '',
-                includeCharacter: true,
-                includePersona: true,
-                worldEntries: [],
-                globalInstruction: '',
-            },
             theater: {
                 channelId: 'main',
+                streaming: false,
                 systemPrompt: defaultTheaterSystemPrompt(),
                 prompt: '',
                 contextFloors: 6,
@@ -247,11 +220,10 @@
 
     const MODULES = Object.freeze([
         { key: 'search', tab: 'search', label: '查找/替换' },
-        { key: 'export', tab: 'export', label: '文本导出' },
-        { key: 'postEdit', tab: 'post-edit', label: '词句修改' },
-        { key: 'rewrite', tab: 'rewrite', label: '段落改写' },
-        { key: 'theater', tab: 'theater', label: '小剧场' },
         { key: 'worldbook', tab: 'worldbook', label: '世界书管理' },
+        { key: 'theater', tab: 'theater', label: '小剧场' },
+        { key: 'postEdit', tab: 'post-edit', label: '词句修改' },
+        { key: 'export', tab: 'export', label: '文本导出' },
         { key: 'presetTransfer', tab: 'preset-transfer', label: '预设条目转移' },
     ]);
 
@@ -344,14 +316,11 @@
             }
             const validChannel = (id) => id === 'main' || next.ai.channels.some((channel) => channel.id === id);
             const postChannelId = String(stored.postEdit?.channelId || (stored.postEdit?.endpoint ? next.ai.channels[0]?.id : 'main'));
-            const rewriteChannelId = String(stored.rewrite?.channelId || 'main');
             const theaterChannelId = String(stored.theater?.channelId || 'main');
             next.postEdit.channelId = validChannel(postChannelId) ? postChannelId : 'main';
             next.postEdit.systemPrompt = typeof stored.postEdit?.systemPrompt === 'string' ? stored.postEdit.systemPrompt : base.postEdit.systemPrompt;
             next.postEdit.rules = typeof stored.postEdit?.rules === 'string' ? stored.postEdit.rules : '';
             next.postEdit.presets = Array.isArray(stored.postEdit?.presets) ? stored.postEdit.presets : [];
-            next.rewrite.channelId = validChannel(rewriteChannelId) ? rewriteChannelId : 'main';
-            next.rewrite.systemPrompt = typeof stored.rewrite?.systemPrompt === 'string' ? stored.rewrite.systemPrompt : base.rewrite.systemPrompt;
             next.theater.channelId = validChannel(theaterChannelId) ? theaterChannelId : 'main';
             next.theater.systemPrompt = typeof stored.theater?.systemPrompt === 'string' ? stored.theater.systemPrompt : base.theater.systemPrompt;
             next.theater.presets = Array.isArray(stored.theater?.presets) ? stored.theater.presets : [];
@@ -373,10 +342,6 @@
                 systemPrompt: String(settings.postEdit.systemPrompt ?? defaultPostEditSystemPrompt()),
                 rules: String(settings.postEdit.rules || ''),
                 presets: Array.isArray(settings.postEdit.presets) ? settings.postEdit.presets : [],
-            },
-            rewrite: {
-                channelId: settings.rewrite.channelId || 'main',
-                systemPrompt: String(settings.rewrite.systemPrompt ?? defaultRewriteSystemPrompt()),
             },
             theater: {
                 channelId: settings.theater.channelId || 'main',
@@ -426,10 +391,6 @@
 
     function defaultPostEditSystemPrompt() {
         return '你是中文文学文本的词句修订器。逐段检查正文，只修改词句表达，不续写剧情，不新增或删减事实、人物、事件、对白含义与段落顺序。对每一段都给出修改原因，并返回可直接替换的完整修订正文。只输出 JSON，不输出 Markdown。';
-    }
-
-    function defaultRewriteSystemPrompt() {
-        return '你是中文小说的精确段落改写器。理解给出的剧情和设定，但只改写明确列出的段落；不得续写、删改事实、改变人物关系或段落顺序。每个 replacement 必须对应一个原段落，可以保留段内换行，但不要额外创建段落。只输出 JSON：{"changes":[{"paragraph":2,"replacement":"改写后的完整段落"}]}。必须为每个请求段落返回一项，不要输出分析或 Markdown。';
     }
 
     function defaultTheaterSystemPrompt() {
@@ -1542,6 +1503,128 @@
         }
     }
 
+    function chatStreamPiece(payload) {
+        if (!payload || typeof payload !== 'object') return '';
+        const choice = Array.isArray(payload.choices) ? payload.choices[0] : null;
+        const content = choice?.delta?.content;
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) return content.map((part) => part?.text || part?.content || '').join('');
+        if (typeof choice?.text === 'string') return choice.text;
+        if (typeof payload?.delta?.text === 'string') return payload.delta.text;
+        if (typeof payload?.delta?.content === 'string') return payload.delta.content;
+        const gemini = payload?.candidates?.[0]?.content?.parts;
+        if (Array.isArray(gemini)) return gemini.filter((part) => !part?.thought).map((part) => part?.text || '').join('');
+        return '';
+    }
+
+    function streamErrorMessage(payload) {
+        if (!payload || typeof payload !== 'object') return '';
+        return String(payload?.error?.message || payload?.error || payload?.message || '').trim();
+    }
+
+    async function stProxyChatStream(body, { timeoutSec = AI_REQUEST_TIMEOUT_SEC, signal = null, onUpdate = null } = {}) {
+        const Controller = host.AbortController || globalThis.AbortController;
+        const controller = typeof Controller === 'function' ? new Controller() : null;
+        const timeoutMs = Math.max(10, Math.min(600, Number(timeoutSec) || AI_REQUEST_TIMEOUT_SEC)) * 1000;
+        let timedOut = false;
+        let externallyAborted = false;
+        let receivedText = false;
+        const abortFromSignal = () => {
+            externallyAborted = true;
+            controller?.abort();
+        };
+        if (signal?.aborted) abortFromSignal();
+        else signal?.addEventListener?.('abort', abortFromSignal, { once: true });
+        const timer = controller ? host.setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+        }, timeoutMs) : null;
+        try {
+            const response = await (host.fetch || fetch)('/api/backends/chat-completions/generate', {
+                method: 'POST',
+                headers: stRequestHeaders(),
+                body: JSON.stringify({ ...body, stream: true }),
+                ...(controller ? { signal: controller.signal } : signal ? { signal } : {}),
+            });
+            if (!response.ok) {
+                const raw = await response.text();
+                let detail = raw.slice(0, 500);
+                try {
+                    const parsed = raw ? JSON.parse(raw) : {};
+                    detail = streamErrorMessage(parsed) || detail;
+                } catch (_) {}
+                const error = new Error(detail || `流式请求失败（HTTP ${response.status}）`);
+                error.streamFallbackAllowed = [400, 404, 405, 415, 422, 501].includes(response.status);
+                throw error;
+            }
+            const type = String(response.headers?.get?.('content-type') || '').toLowerCase();
+            if (type.includes('application/json')) {
+                return apiOutputText(await response.json());
+            }
+            if (!response.body?.getReader) {
+                const error = new Error('当前浏览器或接口没有提供可读取的流');
+                error.streamFallbackAllowed = true;
+                throw error;
+            }
+            const Decoder = host.TextDecoder || globalThis.TextDecoder;
+            if (typeof Decoder !== 'function') throw new Error('当前浏览器不支持流式文本解码');
+            const reader = response.body.getReader();
+            const decoder = new Decoder('utf-8');
+            let buffer = '';
+            let output = '';
+            let finished = false;
+            const consume = (rawData) => {
+                const raw = String(rawData || '').trim();
+                if (!raw) return;
+                if (raw === '[DONE]') {
+                    finished = true;
+                    return;
+                }
+                let payload;
+                try { payload = JSON.parse(raw); }
+                catch (_) { return; }
+                const detail = streamErrorMessage(payload);
+                if (payload?.error && detail) throw new Error(detail);
+                const piece = chatStreamPiece(payload);
+                if (!piece) return;
+                receivedText = true;
+                output += piece;
+                if (typeof onUpdate === 'function') onUpdate(output, piece);
+            };
+            while (!finished) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                let newline;
+                while ((newline = buffer.indexOf('\n')) >= 0) {
+                    const line = buffer.slice(0, newline).replace(/\r$/, '');
+                    buffer = buffer.slice(newline + 1);
+                    if (line.startsWith('data:')) consume(line.slice(5));
+                    else if (line.trim().startsWith('{')) consume(line);
+                    if (finished) break;
+                }
+            }
+            buffer += decoder.decode();
+            const tail = buffer.trim();
+            if (!finished && tail) consume(tail.startsWith('data:') ? tail.slice(5) : tail);
+            if (!output.trim()) {
+                const error = new Error('流式连接已结束，但没有收到正文');
+                error.streamFallbackAllowed = !receivedText;
+                throw error;
+            }
+            return output;
+        } catch (error) {
+            if (error?.name === 'AbortError' && externallyAborted) throw requestAbortError();
+            if (error?.name === 'AbortError' && timedOut) throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动取消`);
+            const normalizedError = error instanceof Error ? error : new Error(String(error));
+            if (receivedText) normalizedError.streamFallbackAllowed = false;
+            throw normalizedError;
+        } finally {
+            if (timer) host.clearTimeout(timer);
+            signal?.removeEventListener?.('abort', abortFromSignal);
+        }
+    }
+
     async function callAiText(feature, messages, options = {}) {
         const channel = Object.prototype.hasOwnProperty.call(options, 'channelOverride')
             ? options.channelOverride
@@ -1550,21 +1633,23 @@
             const context = getContext();
             const generateRaw = context.generateRaw || host.generateRaw || host.SillyTavern?.generateRaw;
             if (typeof generateRaw !== 'function') throw new Error('当前酒馆版本没有公开“跟随主接口”的生成方法，请添加自定义渠道');
-            const normalized = Array.isArray(messages) ? messages : [];
-            const systemPrompt = normalized
-                .filter((message) => message?.role === 'system')
-                .map((message) => contentBlockText(message?.content))
-                .filter(Boolean)
-                .join('\n\n');
-            const conversation = normalized
-                .filter((message) => message?.role !== 'system')
+            const normalized = (Array.isArray(messages) ? messages : [])
                 .map((message) => ({ role: String(message?.role || 'user'), content: contentBlockText(message?.content) }))
                 .filter((message) => message.content.trim());
+            // generateRaw's dedicated systemPrompt is always prepended. Move
+            // only the first system message there; keep later system injections
+            // inside the conversation so world-info depth/order is preserved.
+            const firstSystem = normalized[0]?.role === 'system' ? normalized[0].content : '';
+            const systemPrompt = firstSystem;
+            const conversation = firstSystem ? normalized.slice(1) : normalized;
             if (!conversation.length) throw new Error('没有可发送给模型的提示词');
             const generation = generateRaw.call(context, {
                 prompt: conversation,
                 systemPrompt,
-                responseLength: feature === 'theater' ? 4096 : 8192,
+                // generateRaw temporarily mutates the global response length.
+                // Theater tasks may run concurrently, so keep the user's main
+                // interface limit instead of racing that global singleton.
+                ...(feature === 'postEdit' ? { responseLength: 8192 } : {}),
             });
             // SillyTavern 的 generateRaw 暂未接收独立 AbortSignal；这里会立即
             // 停止等待被取消的单个任务，并忽略其迟到结果，不触发全局停止事件。
@@ -1575,7 +1660,7 @@
             return apiOutputText(output);
         }
         if (!channel.model) throw new Error('请先拉取并选择模型');
-        const json = await stProxyJson('/api/backends/chat-completions/generate', {
+        const requestBody = {
             chat_completion_source: 'openai',
             reverse_proxy: normalizeProxyUrl(channel.url),
             proxy_password: String(channel.key || ''),
@@ -1583,9 +1668,26 @@
             messages,
             temperature: Math.max(0, Math.min(2, Number(channel.temperature) || 0)),
             max_tokens: Math.max(256, Math.min(32768, Number(channel.maxTokens) || 4096)),
-            stream: false,
             presence_penalty: 0,
             frequency_penalty: 0,
+        };
+        if (feature === 'theater' && options.streaming === true) {
+            try {
+                options.onMode?.('connecting');
+                return await stProxyChatStream(requestBody, {
+                    timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
+                    signal: options.signal,
+                    onUpdate: options.onUpdate,
+                });
+            } catch (error) {
+                if (!error?.streamFallbackAllowed || options.signal?.aborted) throw error;
+                console.warn('[聊天工具箱] 小剧场流式请求不可用，回退完整返回', error);
+                options.onMode?.('fallback');
+            }
+        }
+        const json = await stProxyJson('/api/backends/chat-completions/generate', {
+            ...requestBody,
+            stream: false,
         }, {
             timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
             signal: options.signal,
@@ -1669,6 +1771,51 @@
             .filter(Boolean);
     }
 
+    function postEditParagraphId(number) {
+        return `P${String(Math.max(1, Number(number) || 1)).padStart(4, '0')}`;
+    }
+
+    function postEditParagraphRecords(value) {
+        return postEditParagraphs(value).map((text, index) => ({
+            id: postEditParagraphId(index + 1),
+            paragraph: index + 1,
+            text,
+        }));
+    }
+
+    function postEditComparableText(value) {
+        return normalizeBlankLines(String(value ?? ''))
+            .replace(/\u00a0/g, ' ')
+            .trim();
+    }
+
+    function resolvePostEditParagraph(item, fallbackIndex, records) {
+        const rawId = typeof item === 'object' && item
+            ? item.id ?? item.paragraph_id ?? item.paragraphId
+            : '';
+        const idMatch = String(rawId ?? '').trim().match(/^P?0*(\d+)$/i);
+        const byId = idMatch ? records[Number(idMatch[1]) - 1] : null;
+        const suppliedOriginal = typeof item === 'object' && item
+            ? item.original ?? item.before ?? item.source
+            : '';
+        const comparableOriginal = postEditComparableText(suppliedOriginal);
+        if (comparableOriginal) {
+            const exact = records.filter((record) => postEditComparableText(record.text) === comparableOriginal);
+            // The copied source text is a stronger locator than a model-invented
+            // paragraph number.  Only use it when the match is unique, so repeated
+            // paragraphs can never silently redirect a patch.
+            if (exact.length === 1) return exact[0];
+            if (byId && postEditComparableText(byId.text) === comparableOriginal) return byId;
+        }
+        if (byId) return byId;
+        const rawParagraph = typeof item === 'object' && item
+            ? item.paragraph ?? item.index ?? item.paragraph_number
+            : fallbackIndex + 1;
+        const paragraphMatch = String(rawParagraph ?? '').trim().match(/^P?0*(\d+)$/i);
+        const paragraph = paragraphMatch ? Number(paragraphMatch[1]) : Number(rawParagraph);
+        return Number.isInteger(paragraph) ? records[paragraph - 1] || null : null;
+    }
+
     function postEditParagraphRanges(value) {
         const source = String(value ?? '');
         const ranges = [];
@@ -1711,7 +1858,8 @@
     }
 
     function parsePostEditResult(value, originalContent) {
-        const originalParagraphs = postEditParagraphs(originalContent);
+        const records = postEditParagraphRecords(originalContent);
+        const originalParagraphs = records.map((record) => record.text);
         const parsed = parseLooseJson(value);
         const rawItems = Array.isArray(parsed)
             ? parsed
@@ -1735,24 +1883,31 @@
                 })).filter((item) => item.original !== item.replacement),
             };
         }
-        const reviews = (rawItems || []).map((item, index) => {
-            const paragraph = Number(item?.paragraph ?? item?.index ?? item?.paragraph_number ?? index + 1);
-            if (!Number.isInteger(paragraph) || paragraph < 1 || paragraph > originalParagraphs.length) return null;
-            // The source of truth is always the locally loaded paragraph.  A
-            // model-provided `original` may contain surrounding context and
-            // must never change which text is replaced.
-            const original = originalParagraphs[paragraph - 1];
+        const reviewsByParagraph = new Map();
+        for (const [index, item] of (rawItems || []).entries()) {
+            const record = resolvePostEditParagraph(item, index, records);
+            if (!record) continue;
+            const paragraph = record.paragraph;
+            const original = record.text;
             const replacement = cleanPostEditOutput(typeof item === 'string'
                 ? item
                 : item?.revised ?? item?.replacement ?? item?.after ?? '', '');
-            return {
+            if (!replacement || replacement === original) continue;
+            const review = {
+                id: record.id,
                 paragraph,
                 original,
                 reason: String(item?.reason ?? item?.why ?? '未提供修改原因'),
                 replacement,
                 decision: 'pending',
             };
-        }).filter((item) => item?.original && item.replacement !== item.original);
+            const existing = reviewsByParagraph.get(paragraph);
+            if (existing && existing.replacement !== review.replacement) {
+                throw new Error(`模型对 ${record.id} 返回了两份不同修改，已阻止错位；请重新生成`);
+            }
+            reviewsByParagraph.set(paragraph, review);
+        }
+        const reviews = [...reviewsByParagraph.values()].sort((a, b) => a.paragraph - b.paragraph);
         const fullText = typeof parsed === 'string'
             ? parsed
             : parsed?.full_text ?? parsed?.fullText ?? parsed?.revised_text ?? parsed?.revisedText;
@@ -1766,11 +1921,14 @@
         // Use a complete draft only when it keeps the same paragraph count.
         // Otherwise rebuild it from validated patches so one malformed field
         // cannot make the whole operation fail.
-        let fullRevised = candidate
-            && postEditParagraphs(candidate).length === originalParagraphs.length
-            && (!reviews.length || candidate !== originalContent)
-            ? candidate
-            : patched;
+        // When validated paragraph patches exist, they are the only source of
+        // truth for the full preview.  A model-provided full_text may look valid
+        // while shifting one paragraph, so it must not override stable IDs.
+        let fullRevised = reviews.length
+            ? patched
+            : candidate && postEditParagraphs(candidate).length === originalParagraphs.length
+                ? candidate
+                : patched;
         if (!reviews.length && candidate && candidate !== originalContent) {
             const candidateParagraphs = postEditParagraphs(candidate);
             if (candidateParagraphs.length === originalParagraphs.length) {
@@ -1793,11 +1951,13 @@
 
     function buildPostEditRequest() {
         const config = settings.postEdit;
+        const paragraphs = postEditParagraphRecords(postEditDraft?.originalContent || '');
+        const paragraphPayload = paragraphs.map((record) => ({ id: record.id, text: record.text }));
         return [
             { role: 'system', content: String(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultPostEditSystemPrompt()).trim() },
             {
                 role: 'user',
-                content: `【修改规则】\n${String(config.rules || '').trim()}\n\n【正文】\n${postEditDraft?.originalContent || ''}\n\n【返回要求】\n只输出一个合法 JSON 对象，不要 Markdown、解释或代码围栏。保持原段落数量和顺序；未修改的段落也可省略。字符串中的换行必须使用 \\n。\n{"paragraphs":[{"paragraph":1,"original":"原段落","reason":"修改原因","revised":"修改后的完整段落"}],"full_text":"完整修改后的正文"}`,
+                content: `【修改规则】\n${String(config.rules || '').trim()}\n\n【正文段落】\n下面每段都有不可更改的稳定 ID。只修改段内词句，不得合并、拆分、调换或重新编号。\n${JSON.stringify({ paragraphs: paragraphPayload }, null, 2)}\n\n【返回要求】\n只输出一个合法 JSON 对象，不要 Markdown、解释或代码围栏。只返回确实修改的段落；每项必须原样复制对应 id 和 original。字符串中的换行必须使用 \\n。\n{"paragraphs":[{"id":"P0001","original":"原段落","reason":"修改原因","revised":"修改后的完整段落"}]}`,
             },
         ];
     }
@@ -1809,7 +1969,7 @@
     function buildPromptPreview(messages) {
         const items = Array.isArray(messages) ? messages : [];
         return {
-            text: items.map((message, index) => `===== ${index + 1}. ${message.role === 'system' ? 'SYSTEM' : 'USER'} =====\n${message.content}`).join('\n\n'),
+            text: items.map((message, index) => `===== ${index + 1}. ${String(message?.role || 'user').toUpperCase()} =====\n${message.content}`).join('\n\n'),
             characters: items.reduce((total, message) => total + countCharacters(message?.content), 0),
         };
     }
@@ -1866,12 +2026,6 @@
             postEditPreviewLoading = false;
             renderPanel();
         }
-    }
-
-    function renderDiffPair(before, after, { emptyAfter = '（删除本段）' } = {}) {
-        const left = String(before ?? '');
-        const right = String(after ?? '');
-        return `<div class="ctb-diff-pair"><div><small>原文</small><p>${escapeHTML(left) || '<em>（空）</em>'}</p></div><div><small>修改后</small><p>${right ? escapeHTML(right) : `<em>${escapeHTML(emptyAfter)}</em>`}</p></div></div>`;
     }
 
     async function runPostEdit() {
@@ -1967,76 +2121,8 @@
         }
     }
 
-    function splitRewriteParagraphs(content) {
-        const lines = String(content ?? '').replace(/\r\n?/g, '\n').split('\n');
-        const paragraphs = [];
-        let startLine = -1;
-        const flush = (endLine) => {
-            if (startLine < 0) return;
-            paragraphs.push({
-                number: paragraphs.length + 1,
-                startLine,
-                endLine,
-                text: lines.slice(startLine, endLine).join('\n'),
-                selected: true,
-                instruction: '',
-            });
-            startLine = -1;
-        };
-        lines.forEach((line, lineIndex) => {
-            if (line.trim()) {
-                if (startLine < 0) startLine = lineIndex;
-            } else {
-                flush(lineIndex);
-            }
-        });
-        flush(lines.length);
-        return { lines, paragraphs };
-    }
-
-    function prepareRewriteFloor({ silent = false } = {}) {
-        const selected = assistantAtFloor(settings.rewrite.floor);
-        if (!selected) {
-            if (!silent) notify('没有找到该楼层的 AI 回复', 'warning');
-            return false;
-        }
-        try {
-            const match = postEditTagMatch(selected.text, settings.rewrite.tag);
-            if (!match) {
-                if (!silent) notify(`楼层 #${selected.id} 中没有找到 <${settings.rewrite.tag || 'content'}>…</${settings.rewrite.tag || 'content'}>`, 'warning');
-                return false;
-            }
-            const split = splitRewriteParagraphs(match.content);
-            if (!split.paragraphs.length) throw new Error('标签正文中没有可改写的段落');
-            rewriteDraft = {
-                rawIndex: selected.rawIndex,
-                floor: selected.id,
-                tag: match.tag,
-                originalFull: selected.text,
-                originalContent: match.content,
-                lines: split.lines,
-                paragraphs: split.paragraphs,
-            };
-            rewriteReview = [];
-            rewritePromptPreview = null;
-            settings.rewrite.floor = String(selected.id);
-            if (!silent) {
-                renderPanel();
-                notify(`已读取楼层 #${selected.id}，共 ${split.paragraphs.length} 段`, 'success');
-            }
-            return true;
-        } catch (error) {
-            if (!silent) notify(error.message, 'error');
-            return false;
-        }
-    }
-
     function worldEntrySelectionKey(world, uid) {
         return `${String(world)}\u0000${String(uid)}`;
-    }
-
-    function selectedWorldEntryKeys() {
-        return new Set((settings.rewrite.worldEntries || []).map((item) => worldEntrySelectionKey(item.world, item.uid)));
     }
 
     function normalizeWorldBookEntries(world, data) {
@@ -2054,325 +2140,6 @@
                 raw: value,
             };
         });
-    }
-
-    async function fetchRewriteWorldEntries(world, { force = false } = {}) {
-        const name = String(world || '').trim();
-        if (!name) return [];
-        if (!force && rewriteWorldEntryCache.has(name)) return rewriteWorldEntryCache.get(name);
-        const data = await stProxyJson('/api/worldinfo/get', { name });
-        const entries = normalizeWorldBookEntries(name, data);
-        rewriteWorldEntryCache.set(name, entries);
-        return entries;
-    }
-
-    async function loadRewriteWorldBooks({ force = false } = {}) {
-        if (rewriteWorldLoading) return;
-        rewriteWorldLoading = true;
-        rewriteWorldError = '';
-        renderPanel();
-        try {
-            if (force || !rewriteWorldBooks.length) {
-                rewriteWorldBooks = await getWorldBookNames(force);
-            }
-            const preferred = rewriteWorldBook
-                || settings.rewrite.worldEntries?.find((item) => rewriteWorldBooks.includes(item.world))?.world
-                || rewriteWorldBooks[0]
-                || '';
-            rewriteWorldBook = preferred;
-            if (preferred) await fetchRewriteWorldEntries(preferred, { force });
-        } catch (error) {
-            rewriteWorldError = error.message || String(error);
-        } finally {
-            rewriteWorldLoading = false;
-            renderPanel();
-        }
-    }
-
-    async function chooseRewriteWorldBook(name) {
-        rewriteWorldBook = String(name || '');
-        rewriteWorldError = '';
-        if (!rewriteWorldBook) return renderPanel();
-        rewriteWorldLoading = true;
-        renderPanel();
-        try {
-            await fetchRewriteWorldEntries(rewriteWorldBook);
-        } catch (error) {
-            rewriteWorldError = error.message || String(error);
-        } finally {
-            rewriteWorldLoading = false;
-            renderPanel();
-        }
-    }
-
-    function setRewriteWorldEntrySelected(world, uid, selected) {
-        const key = worldEntrySelectionKey(world, uid);
-        const existing = settings.rewrite.worldEntries || [];
-        settings.rewrite.worldEntries = selected
-            ? (existing.some((item) => worldEntrySelectionKey(item.world, item.uid) === key)
-                ? existing
-                : [...existing, { world: String(world), uid: String(uid) }])
-            : existing.filter((item) => worldEntrySelectionKey(item.world, item.uid) !== key);
-        syncRewriteSelectionUi();
-    }
-
-    function setCurrentWorldBookSelection(selected) {
-        if (!rewriteWorldBook) return;
-        const entries = rewriteWorldEntryCache.get(rewriteWorldBook) || [];
-        const currentWorld = String(rewriteWorldBook);
-        const otherWorlds = (settings.rewrite.worldEntries || []).filter((item) => item.world !== currentWorld);
-        settings.rewrite.worldEntries = selected
-            ? [...otherWorlds, ...entries.map((entry) => ({ world: entry.world, uid: entry.uid }))]
-            : otherWorlds;
-        syncRewriteSelectionUi();
-    }
-
-    function syncRewriteSelectionUi() {
-        if (!root) return;
-        const selected = selectedWorldEntryKeys();
-        root.querySelectorAll('[data-world-entry-uid]').forEach((input) => {
-            input.checked = selected.has(worldEntrySelectionKey(input.dataset.worldName, input.dataset.worldEntryUid));
-            input.closest('.ctb-world-entry')?.classList.toggle('is-selected', input.checked);
-        });
-        const count = root.querySelector('[data-rewrite-world-selected-count]');
-        if (count) count.textContent = selected.size ? `已选 ${selected.size} 条` : '未选择';
-        const button = root.querySelector('[data-rewrite-world-picker-button]');
-        button?.classList.toggle('ctb-primary-soft', selected.size > 0);
-        const clear = root.querySelector('[data-rewrite-world-clear]');
-        if (clear) clear.hidden = selected.size === 0;
-        const summary = root.querySelector('[data-rewrite-world-selection-summary]');
-        if (summary) {
-            summary.hidden = selected.size === 0;
-            summary.innerHTML = (settings.rewrite.worldEntries || [])
-                .map((item) => `<span title="${escapeHTML(worldEntryDisplayLabel(item))}">${escapeHTML(worldEntryDisplayLabel(item))}</span>`)
-                .join('');
-        }
-    }
-
-    function worldEntryDisplayLabel(selection) {
-        const cached = rewriteWorldEntryCache.get(selection.world) || [];
-        const entry = cached.find((item) => item.uid === String(selection.uid));
-        return `${selection.world} · ${entry?.comment || `条目 ${selection.uid}`}`;
-    }
-
-    async function collectSelectedWorldEntries() {
-        const selections = settings.rewrite.worldEntries || [];
-        if (!selections.length) return '';
-        const books = [...new Set(selections.map((item) => item.world))];
-        const loaded = new Map();
-        for (const world of books) {
-            try {
-                loaded.set(world, await fetchRewriteWorldEntries(world));
-            } catch (error) {
-                console.warn(`[聊天工具箱] 读取世界书“${world}”失败`, error);
-            }
-        }
-        return selections.map((selection) => {
-            const entry = (loaded.get(selection.world) || []).find((item) => item.uid === String(selection.uid));
-            if (!entry?.content.trim()) return '';
-            return `【${entry.world} · ${entry.comment} · UID ${entry.uid}】\n${entry.content.trim()}`;
-        }).filter(Boolean).join('\n\n');
-    }
-
-    async function collectRewriteContext(draft) {
-        const config = settings.rewrite;
-        const context = getContext();
-        const historyLimit = Math.max(0, Math.min(50, Number(config.contextFloors) || 0));
-        const contextTags = parseTags(config.contextTags);
-        const history = getRows()
-            .slice(0, draft.rawIndex)
-            .slice(-historyLimit)
-            .map((row) => {
-                const text = extractTags(row.text, contextTags).trim();
-                return text ? `${row.isUser ? '用户' : row.name}（#${row.id}）：${text}` : '';
-            })
-            .filter(Boolean)
-            .join('\n\n');
-        let character = '';
-        let persona = '';
-        let worldEntries = '';
-        if (config.includeCharacter) {
-            const characterId = context.characterId ?? context.this_chid ?? host.this_chid;
-            const card = context.characters?.[characterId] || host.characters?.[characterId];
-            if (card) {
-                character = [
-                    card.name ? `角色名：${card.name}` : '',
-                    card.description ? `角色描述：${card.description}` : '',
-                    card.personality ? `性格：${card.personality}` : '',
-                    card.scenario ? `场景：${card.scenario}` : '',
-                ].filter(Boolean).join('\n');
-            }
-        }
-        if (config.includePersona) {
-            try { persona = String(context.substituteParams?.('{{persona}}') || ''); } catch (_) {}
-        }
-        worldEntries = await collectSelectedWorldEntries();
-        return { history, character, persona, worldEntries };
-    }
-
-    function rewriteSystemPrompt() {
-        return String(typeof settings.rewrite?.systemPrompt === 'string' ? settings.rewrite.systemPrompt : defaultRewriteSystemPrompt()).trim();
-    }
-
-    async function buildRewriteRequest(draft) {
-        const globalInstruction = String(settings.rewrite.globalInstruction || '').trim();
-        const selected = draft.paragraphs
-            .filter((paragraph) => paragraph.selected)
-            .map((paragraph) => ({
-                paragraph,
-                instruction: String(paragraph.instruction || '').trim() || globalInstruction,
-            }))
-            .filter((item) => item.instruction);
-        if (!selected.length) throw new Error('没有填写改写要求；留空的段落不会修改');
-        const story = await collectRewriteContext(draft);
-        const requested = selected.map(({ paragraph, instruction }) => ({
-            paragraph: paragraph.number,
-            text: paragraph.text,
-            instruction,
-        }));
-        const contextParts = [
-            story.character ? `【角色卡】\n${story.character}` : '',
-            story.persona ? `【用户设定】\n${story.persona}` : '',
-            story.worldEntries ? `【用户选择的世界书条目】\n${story.worldEntries}` : '',
-            story.history ? `【最近上下文】\n${story.history}` : '',
-            `【待改写段落】\n${JSON.stringify(requested, null, 2)}`,
-        ].filter(Boolean);
-        return [
-            { role: 'system', content: rewriteSystemPrompt() },
-            { role: 'user', content: contextParts.join('\n\n') },
-        ];
-    }
-
-    async function previewRewritePrompt() {
-        if (rewritePreviewLoading) return;
-        if (!rewriteDraft && !prepareRewriteFloor({ silent: true })) return notify('请先读取要改写的 AI 楼层', 'warning');
-        rewritePreviewLoading = true;
-        renderPanel();
-        try {
-            const messages = await buildRewriteRequest(rewriteDraft);
-            rewritePromptPreview = buildPromptPreview(messages);
-        } catch (error) {
-            rewritePromptPreview = null;
-            notify(`无法生成发送预览：${error.message}`, 'error');
-        } finally {
-            rewritePreviewLoading = false;
-            renderPanel();
-        }
-    }
-
-    function parseRewritePatch(value) {
-        let text = String(value ?? '').trim();
-        const answer = text.match(/<answer\b[^>]*>([\s\S]*?)<\/answer>/i);
-        if (answer) text = answer[1].trim();
-        text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-        const start = text.indexOf('{');
-        const end = text.lastIndexOf('}');
-        if (start >= 0 && end > start) text = text.slice(start, end + 1);
-        let parsed;
-        try { parsed = JSON.parse(text); }
-        catch (error) { throw new Error(`模型没有返回有效的 JSON 段落补丁：${error.message}`); }
-        if (!Array.isArray(parsed?.changes)) throw new Error('模型返回中缺少 changes 数组');
-        return parsed.changes;
-    }
-
-    async function runRewrite() {
-        if (rewriteLoading) return;
-        if (!rewriteDraft && !prepareRewriteFloor({ silent: true })) return notify('请先读取要改写的 AI 楼层', 'warning');
-        const globalInstruction = String(settings.rewrite.globalInstruction || '').trim();
-        const selected = rewriteDraft.paragraphs.filter((paragraph) => (
-            paragraph.selected && (String(paragraph.instruction || '').trim() || globalInstruction)
-        ));
-        if (!selected.length) return notify('没有填写改写要求；留空的段落不会修改', 'warning');
-        rewriteLoading = true;
-        rewriteReview = [];
-        renderPanel();
-        try {
-            const messages = await buildRewriteRequest(rewriteDraft);
-            rewritePromptPreview = buildPromptPreview(messages);
-            const output = await callAiText('rewrite', messages);
-            const changes = parseRewritePatch(output);
-            const byNumber = new Map(selected.map((paragraph) => [paragraph.number, paragraph]));
-            const reviewByParagraph = new Map();
-            changes.forEach((change) => {
-                const number = Number(change?.paragraph);
-                const paragraph = byNumber.get(number);
-                if (!paragraph || typeof change?.replacement !== 'string') return;
-                const replacement = change.replacement.trim();
-                if (replacement === paragraph.text) return;
-                reviewByParagraph.set(number, {
-                    paragraph: number,
-                    original: paragraph.text,
-                    replacement,
-                    decision: 'pending',
-                });
-            });
-            rewriteReview = Array.from(reviewByParagraph.values());
-            if (!rewriteReview.length) throw new Error('没有得到可审核的段落补丁（返回段落可能包含换行或编号无效）');
-            notify(`已生成 ${rewriteReview.length} 段改写，请逐段采用或忽略`, 'success');
-        } catch (error) {
-            rewriteReview = [];
-            notify(`逐段改写失败：${error.message}`, 'error');
-        } finally {
-            rewriteLoading = false;
-            renderPanel();
-        }
-    }
-
-    async function applyRewrite() {
-        if (rewriteApplyLoading || !rewriteDraft) return;
-        const accepted = rewriteReview.filter((item) => item.decision === 'accept');
-        if (!accepted.length) return notify('还没有选择要采用的段落', 'warning');
-        const message = getChat()[rewriteDraft.rawIndex];
-        if (!message) return notify('原楼层已经不存在', 'error');
-        const before = messageText(message);
-        if (before !== rewriteDraft.originalFull) return notify('原楼层在读取后发生了变化，请重新读取', 'error');
-        rewriteApplyLoading = true;
-        renderPanel();
-        try {
-            const lines = [...rewriteDraft.lines];
-            [...accepted].sort((a, b) => {
-                const pa = rewriteDraft.paragraphs.find((item) => item.number === a.paragraph);
-                const pb = rewriteDraft.paragraphs.find((item) => item.number === b.paragraph);
-                return (pb?.startLine ?? 0) - (pa?.startLine ?? 0);
-            }).forEach((review) => {
-                const paragraph = rewriteDraft.paragraphs.find((item) => item.number === review.paragraph);
-                if (paragraph) lines.splice(paragraph.startLine, paragraph.endLine - paragraph.startLine, review.replacement);
-            });
-            const revisedContent = normalizeBlankLines(lines.join('\n'));
-            const match = postEditTagMatch(before, rewriteDraft.tag);
-            if (!match) throw new Error(`原楼层中已经找不到 <${rewriteDraft.tag}> 标签`);
-            const after = before.slice(0, match.innerStart) + revisedContent + before.slice(match.innerEnd);
-            if (after === before) throw new Error('采用后的内容没有变化');
-            setMessageText(message, after);
-            const saved = await saveChat();
-            if (!saved) {
-                setMessageText(message, before);
-                throw new Error('酒馆没有返回可用的保存结果');
-            }
-            const verified = await verifySavedEntries([{ rawIndex: rewriteDraft.rawIndex, field: 'mes', after, normalize: false }]);
-            if (verified === false) {
-                setMessageText(message, before);
-                throw new Error('聊天文件回读结果与改写内容不一致');
-            }
-            rememberUndo([{ rawIndex: rewriteDraft.rawIndex, field: 'mes', before }], `逐段改写 #${rewriteDraft.floor}`, true);
-            refreshVisibleMessage(rewriteDraft.rawIndex);
-            emitMessageEdited(rewriteDraft.rawIndex);
-            emitMessageUpdated(rewriteDraft.rawIndex);
-            rewriteDraft.originalFull = after;
-            rewriteDraft.originalContent = revisedContent;
-            const split = splitRewriteParagraphs(revisedContent);
-            rewriteDraft.lines = split.lines;
-            rewriteDraft.paragraphs = split.paragraphs;
-            rewriteReview = [];
-            notify(`已采用 ${accepted.length} 段并保存楼层 #${rewriteDraft.floor}`, 'success');
-        } catch (error) {
-            setMessageText(message, before);
-            refreshVisibleMessage(rewriteDraft.rawIndex);
-            notify(`采用改写失败：${error.message}`, 'error');
-        } finally {
-            rewriteApplyLoading = false;
-            renderPanel();
-        }
     }
 
     function showPanel(tab = activeTab) {
@@ -2570,10 +2337,10 @@
         const presetOptions = [`<option value="">选择规则预设…</option>`].concat((config.presets || []).map((preset) => `<option value="${escapeHTML(preset.id)}"${config.selectedPresetId === preset.id ? ' selected' : ''}>${escapeHTML(preset.name)}</option>`)).join('');
         const reviewList = postEditReview.length ? `<section class="ctb-section">
             <div class="ctb-section-title">逐段审核 <span>${acceptedCount} / ${postEditReview.length} 段将采用</span></div>
-            <div class="ctb-rewrite-reviews">
-                ${postEditReview.map((review, index) => `<div class="ctb-rewrite-review${review.decision === 'accept' ? ' is-accepted' : review.decision === 'reject' ? ' is-rejected' : ''}">
-                    <div class="ctb-rewrite-review-title"><span>P${review.paragraph}</span><span>${review.decision === 'accept' ? '将采用' : review.decision === 'reject' ? '不采用' : '等待决定'}</span></div>
-                    <div class="ctb-rewrite-compare ctb-post-review-grid">
+            <div class="ctb-review-list">
+                ${postEditReview.map((review, index) => `<div class="ctb-review-item${review.decision === 'accept' ? ' is-accepted' : review.decision === 'reject' ? ' is-rejected' : ''}">
+                    <div class="ctb-review-title"><span>P${review.paragraph}</span><span>${review.decision === 'accept' ? '将采用' : review.decision === 'reject' ? '不采用' : '等待决定'}</span></div>
+                    <div class="ctb-review-compare ctb-post-review-grid">
                         <div><small>原文</small><p>${escapeHTML(review.original)}</p></div>
                         <div><small>修改原因</small><p>${escapeHTML(review.reason || '未提供修改原因')}</p></div>
                         <div><small>修改后</small>${postEditReviewEditingIndex === index ? `<textarea class="ctb-input ctb-review-edit" id="ctb-post-edit-review-revised-${index}">${escapeHTML(review.replacement)}</textarea>` : `<p class="ctb-review-plain">${escapeHTML(review.replacement)}</p>`}</div>
@@ -2581,7 +2348,7 @@
                     <div class="ctb-inline"><button type="button" class="ctb-button ctb-primary" data-action="post-edit-decision" data-review-index="${index}" data-decision="accept">采用这段</button><button type="button" class="ctb-button" data-action="post-edit-decision" data-review-index="${index}" data-decision="reject">不采用</button><button type="button" class="ctb-button" data-action="toggle-post-edit-review-editor" data-review-index="${index}">${postEditReviewEditingIndex === index ? '完成编辑' : '编辑'}</button></div>
                 </div>`).join('')}
             </div>
-            <div class="ctb-inline ctb-rewrite-final"><button type="button" class="ctb-button" data-action="post-edit-all" data-decision="accept">全部采用</button><button type="button" class="ctb-button" data-action="post-edit-all" data-decision="reject">全部不采用</button><button type="button" class="ctb-button ctb-primary" data-action="apply-post-edit"${acceptedCount && !postEditLoading ? '' : ' disabled'}>${postEditLoading ? '保存中…' : `采用 ${acceptedCount} 段并保存`}</button></div>
+            <div class="ctb-inline ctb-review-actions"><button type="button" class="ctb-button" data-action="post-edit-all" data-decision="accept">全部采用</button><button type="button" class="ctb-button" data-action="post-edit-all" data-decision="reject">全部不采用</button><button type="button" class="ctb-button ctb-primary" data-action="apply-post-edit"${acceptedCount && !postEditLoading ? '' : ' disabled'}>${postEditLoading ? '保存中…' : `采用 ${acceptedCount} 段并保存`}</button></div>
         </section>` : '';
         return `
             <section class="ctb-section">
@@ -2617,100 +2384,6 @@
                 <div class="ctb-post-column"><div class="ctb-post-label">原正文</div><pre class="ctb-post-text">${renderPostEditParagraphPreview(draft.originalContent, changedParagraphs)}</pre></div>
                 <div class="ctb-post-column"><div class="ctb-post-label ctb-post-label-actions"><span>完整修改后（备用总稿）</span>${revised ? `<button type="button" class="ctb-review-expand" data-action="toggle-post-edit-editor" title="${postEditEditing ? '完成编辑' : '编辑修改后正文'}" aria-label="${postEditEditing ? '完成编辑' : '编辑修改后正文'}"><i class="fa-solid ${postEditEditing ? 'fa-check' : 'fa-pen'}"></i></button>` : ''}</div>${postEditEditing ? `<textarea class="ctb-input ctb-post-text ctb-post-edit-textarea" id="ctb-post-edit-revised">${escapeHTML(revised)}</textarea>` : `<pre class="ctb-post-text">${revised ? renderPostEditParagraphPreview(revised, changedParagraphs) : '点击“调用 API 修改”后显示结果。'}</pre>`}</div>
              </section>` : '<div class="ctb-results ctb-results-empty">先选择楼层并读取正文，再调用 API 生成修改预览。</div>'}
-            ${reviewList}`;
-    }
-
-    function renderRewriteWorldPicker() {
-        const selections = settings.rewrite.worldEntries || [];
-        const selectedKeys = selectedWorldEntryKeys();
-        const entries = rewriteWorldEntryCache.get(rewriteWorldBook) || [];
-        const summary = `<div class="ctb-world-selected-summary" data-rewrite-world-selection-summary${selections.length ? '' : ' hidden'}>${selections.map((item) => `<span title="${escapeHTML(worldEntryDisplayLabel(item))}">${escapeHTML(worldEntryDisplayLabel(item))}</span>`).join('')}</div>`;
-        const bookOptions = rewriteWorldBooks.map((name) => `<option value="${escapeHTML(name)}"${name === rewriteWorldBook ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
-        const entryList = rewriteWorldLoading
-            ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>'
-            : rewriteWorldError
-                ? `<div class="ctb-world-empty ctb-world-error">${escapeHTML(rewriteWorldError)}</div>`
-                : !rewriteWorldBooks.length
-                    ? '<div class="ctb-world-empty">没有读取到世界书。</div>'
-                    : entries.length
-                        ? `<div class="ctb-world-entry-list" data-ctb-scroll-key="rewrite-world-entry-list">${entries.map((entry) => {
-                            const checked = selectedKeys.has(worldEntrySelectionKey(entry.world, entry.uid));
-                            const preview = entry.content.trim().replace(/\s+/g, ' ').slice(0, 110);
-                            return `<label class="ctb-world-entry${checked ? ' is-selected' : ''}">
-                                <input type="checkbox" data-world-entry-uid="${escapeHTML(entry.uid)}" data-world-name="${escapeHTML(entry.world)}"${checked ? ' checked' : ''}>
-                                <span class="ctb-world-entry-main"><strong>${escapeHTML(entry.comment)}</strong><small>${escapeHTML(preview || '（空条目）')}</small></span>
-                                <span class="ctb-world-entry-meta">UID ${escapeHTML(entry.uid)}${entry.disabled ? ' · 酒馆中已禁用' : ''}</span>
-                            </label>`;
-                        }).join('')}</div>`
-                        : '<div class="ctb-world-empty">这本世界书没有条目。</div>';
-        return `
-            <div class="ctb-world-picker-summary">
-                <button type="button" class="ctb-button${selections.length ? ' ctb-primary-soft' : ''}" data-action="toggle-rewrite-world-picker" data-rewrite-world-picker-button><i class="fa-solid fa-book-open"></i> 选择世界书具体条目 <span data-rewrite-world-selected-count>${selections.length ? `已选 ${selections.length} 条` : '未选择'}</span></button>
-                <button type="button" class="ctb-button" data-action="clear-rewrite-world-selection" data-rewrite-world-clear${selections.length ? '' : ' hidden'}>清空全部</button>
-            </div>
-            ${summary}
-            ${rewriteWorldPickerOpen ? `<div class="ctb-world-picker">
-                <div class="ctb-inline ctb-world-book-row">
-                    <select class="ctb-input" id="ctb-rewrite-world-book">${bookOptions || '<option value="">没有世界书</option>'}</select>
-                    <button type="button" class="ctb-icon-button" data-action="refresh-rewrite-world-books" title="重新读取世界书"><i class="fa-solid fa-rotate"></i></button>
-                    <button type="button" class="ctb-button" data-action="close-rewrite-world-picker">完成</button>
-                </div>
-                ${rewriteWorldBook && !rewriteWorldLoading ? `<div class="ctb-inline ctb-world-bulk"><span>${escapeHTML(rewriteWorldBook)} · ${entries.length} 条</span><button type="button" class="ctb-button" data-action="select-rewrite-world-book-all">全选本书</button><button type="button" class="ctb-button" data-action="clear-rewrite-world-book">清空本书</button></div>` : ''}
-                ${entryList}
-            </div>` : ''}`;
-    }
-
-    function renderRewriteTab() {
-        const config = settings.rewrite || defaults().rewrite;
-        const draft = rewriteDraft;
-        const acceptedCount = rewriteReview.filter((item) => item.decision === 'accept').length;
-        const paragraphList = draft ? `<div class="ctb-rewrite-list">
-            ${draft.paragraphs.map((paragraph, index) => `<div class="ctb-rewrite-paragraph">
-                <label class="ctb-rewrite-select"><input type="checkbox" data-action="rewrite-selected" data-paragraph-index="${index}"${paragraph.selected ? ' checked' : ''}><span>P${paragraph.number}</span></label>
-                <div class="ctb-rewrite-source">${escapeHTML(paragraph.text)}</div>
-                <input class="ctb-input" data-action="rewrite-instruction" data-paragraph-index="${index}" placeholder="本段要求（留空且无整体要求 = 不修改）" value="${escapeHTML(paragraph.instruction || '')}">
-            </div>`).join('')}
-        </div>` : '<div class="ctb-results ctb-results-empty">先读取一个 AI 楼层，再选择要改写的段落。</div>';
-        const reviewList = rewriteReview.length ? `<section class="ctb-section">
-            <div class="ctb-section-title">逐段审核 <span>${acceptedCount} / ${rewriteReview.length} 段将采用</span></div>
-            <div class="ctb-rewrite-reviews">
-                ${rewriteReview.map((review, index) => `<div class="ctb-rewrite-review${review.decision === 'accept' ? ' is-accepted' : review.decision === 'reject' ? ' is-rejected' : ''}">
-                    <div class="ctb-rewrite-review-title"><span>P${review.paragraph}</span><span>${review.decision === 'accept' ? '将采用' : review.decision === 'reject' ? '不采用' : '等待决定'}</span></div>
-                    ${renderDiffPair(review.original, review.replacement)}
-                    <div class="ctb-inline"><button type="button" class="ctb-button ctb-primary" data-action="rewrite-decision" data-review-index="${index}" data-decision="accept">采用这段</button><button type="button" class="ctb-button" data-action="rewrite-decision" data-review-index="${index}" data-decision="reject">不采用</button></div>
-                </div>`).join('')}
-            </div>
-            <div class="ctb-inline ctb-rewrite-final"><button type="button" class="ctb-button" data-action="rewrite-all" data-decision="accept">全部采用</button><button type="button" class="ctb-button" data-action="rewrite-all" data-decision="reject">全部不采用</button><button type="button" class="ctb-button ctb-primary" data-action="apply-rewrite"${acceptedCount && !rewriteApplyLoading ? '' : ' disabled'}>${rewriteApplyLoading ? '保存中…' : `采用 ${acceptedCount} 段并保存`}</button></div>
-        </section>` : '';
-        return `
-            <section class="ctb-section">
-                <div class="ctb-section-title">精确到段落的 AI 改写 ${infoButton('rewrite-scope')}</div>
-            </section>
-            <section class="ctb-section">
-                <div class="ctb-section-title">楼层与正文范围 ${infoButton('rewrite-floor-tag')}</div>
-                <div class="ctb-inline"><input class="ctb-input" id="ctb-rewrite-floor" type="number" min="0" placeholder="楼层号（留空=最新 AI）" value="${escapeHTML(config.floor || '')}"><input class="ctb-input" id="ctb-rewrite-tag" placeholder="content" value="${escapeHTML(config.tag || 'content')}"><button type="button" class="ctb-button" data-action="prepare-rewrite">读取楼层</button></div>
-            </section>
-            <section class="ctb-section">
-                <div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>
-                ${renderChannelSettings('rewrite')}
-            </section>
-            <section class="ctb-section">
-                <div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div>
-                <textarea class="ctb-input ctb-textarea ctb-system-prompt" id="ctb-rewrite-system" placeholder="控制段落改写的输出格式和边界">${escapeHTML(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultRewriteSystemPrompt())}</textarea>
-            </section>
-            <section class="ctb-section">
-                <div class="ctb-section-title">剧情与设定 ${infoButton('rewrite-context')}</div>
-                <div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-rewrite-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 4)}"></label><label class="ctb-check"><input id="ctb-rewrite-character" type="checkbox"${config.includeCharacter ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-rewrite-persona" type="checkbox"${config.includePersona ? ' checked' : ''}> 用户设定</label></div>
-                ${renderRewriteWorldPicker()}
-                <input class="ctb-input ctb-context-tags" id="ctb-rewrite-context-tags" placeholder="上下文标签筛选（留空=整层；例如 content, small_theater）" value="${escapeHTML(config.contextTags || '')}">
-                <textarea class="ctb-input ctb-textarea ctb-rewrite-global" id="ctb-rewrite-global" placeholder="整体改写要求（留空且本段也留空 = 该段完全不修改）">${escapeHTML(config.globalInstruction || '')}</textarea>
-            </section>
-            <section class="ctb-section">
-                <div class="ctb-section-title">段落选择 ${draft ? `<span>共 ${draft.paragraphs.length} 段</span>` : ''}</div>
-                ${paragraphList}
-                ${draft ? `<div class="ctb-inline ctb-rewrite-generate"><button type="button" class="ctb-button" data-action="rewrite-select-all" data-selected="true">全选</button><button type="button" class="ctb-button" data-action="rewrite-select-all" data-selected="false">全不选</button><button type="button" class="ctb-button" data-action="preview-rewrite-prompt"${rewritePreviewLoading ? ' disabled' : ''}><i class="fa-solid fa-eye"></i> ${rewritePreviewLoading ? '整理中…' : '预览发送内容'}</button><button type="button" class="ctb-button ctb-primary" data-action="run-rewrite"${rewriteLoading ? ' disabled' : ''}>${rewriteLoading ? '正在理解剧情并生成…' : '生成段落补丁'}</button></div>` : ''}
-            </section>
-            ${rewritePromptPreview ? `<section class="ctb-section ctb-prompt-preview"><div class="ctb-section-title"><span>实际发送预览 · 总字数 ${rewritePromptPreview.characters}</span><button type="button" class="ctb-review-expand" data-action="close-rewrite-preview" title="关闭预览" aria-label="关闭预览">×</button></div><pre>${escapeHTML(rewritePromptPreview.text)}</pre></section>` : ''}
             ${reviewList}`;
     }
 
@@ -2775,14 +2448,16 @@
     async function collectTheaterNativePresetEntries(config = settings.theater) {
         const presetName = String(config.nativePresetName || theaterNativePresetName || '');
         const selected = new Set((config.nativePresetEntryIds || []).map(String));
-        if (!presetName || !selected.size) return '';
+        if (!presetName || !selected.size) return [];
         const entries = Array.isArray(config.nativePresetEntries) ? config.nativePresetEntries : theaterNativePresetEntries;
         if (!entries.length) {
             throw new Error(`酒馆预设“${presetName}”的条目还未读取完成，请稍后重试`);
         }
         return entries.filter((entry) => selected.has(String(entry.id)) && entry.content?.trim())
-            .map((entry) => `【酒馆预设 · ${entry.name} · ${entry.raw?.role || 'system'}】\n${entry.content.trim()}`)
-            .join('\n\n');
+            .map((entry) => ({
+                role: theaterMessageRole(entry.raw?.role),
+                content: `【酒馆预设 · ${entry.name}】\n${entry.content.trim()}`,
+            }));
     }
 
     function renderTheaterNativePresetPicker() {
@@ -2944,10 +2619,11 @@
     }
 
     async function collectTheaterWorldEntries(selections = settings.theater?.worldEntries || []) {
-        if (!selections.length) return '';
+        if (!selections.length) return [];
         const selected = theaterSelectedWorldKeys(selections);
         const output = [];
-        for (const world of orderedTheaterWorldBookNames(selections)) {
+        const books = orderedTheaterWorldBookNames(selections);
+        for (const [bookIndex, world] of books.entries()) {
             let entries;
             try {
                 // fetchTheaterWorldEntries already applies the exact manager
@@ -2956,12 +2632,25 @@
             } catch (error) {
                 throw new Error(`读取世界书“${world}”失败：${error?.message || String(error)}`);
             }
-            for (const entry of entries) {
+            for (const [entryIndex, entry] of entries.entries()) {
                 if (!selected.has(worldEntrySelectionKey(entry.world, entry.uid))) continue;
-                if (entry.content.trim()) output.push(`【${entry.world} · ${entry.comment}】\n${entry.content.trim()}`);
+                if (entry.content.trim()) output.push({ ...entry, bookIndex, entryIndex });
             }
         }
-        return output.join('\n\n');
+        // SillyTavern builds activated World Info by prompt position first,
+        // then by depth (for @D), then by insertion Order.  Sorting globally
+        // here prevents multi-book checkbox order from changing the prompt.
+        return output.sort((a, b) => {
+            const positionCompare = worldbookPositionV2(a.raw) - worldbookPositionV2(b.raw);
+            if (positionCompare) return positionCompare;
+            if (worldbookPositionV2(a.raw) === 4) {
+                const depthCompare = worldbookDepthV2(b.raw) - worldbookDepthV2(a.raw);
+                if (depthCompare) return depthCompare;
+            }
+            return worldbookOrderV2(a.raw) - worldbookOrderV2(b.raw)
+                || a.bookIndex - b.bookIndex
+                || a.entryIndex - b.entryIndex;
+        });
     }
 
     function theaterWorldSelectionCounts() {
@@ -3005,9 +2694,41 @@
         }
     }
 
+    function theaterMessageRole(value, fallback = 'system') {
+        const numeric = Number(value);
+        if (numeric === 1) return 'user';
+        if (numeric === 2) return 'assistant';
+        if (numeric === 0) return 'system';
+        const role = String(value || '').toLowerCase();
+        if (role === 'user' || role === 'assistant' || role === 'system') return role;
+        if (role === 'ai' || role === 'bot' || role === 'character') return 'assistant';
+        return fallback;
+    }
+
+    function theaterWorldPositionLabel(entry) {
+        const position = worldbookPositionV2(entry?.raw);
+        if (position === 0) return '角色定义前';
+        if (position === 1) return '角色定义后';
+        if (position === 2) return '作者注释顶部';
+        if (position === 3) return '作者注释底部';
+        if (position === 4) return `聊天深度 ${worldbookDepthV2(entry?.raw)}`;
+        if (position === 5) return '示例消息前';
+        if (position === 6) return '示例消息后';
+        return '手动出口';
+    }
+
+    function theaterWorldMessage(entry) {
+        const position = worldbookPositionV2(entry?.raw);
+        return {
+            role: position === 4 ? theaterMessageRole(entry?.raw?.role) : 'system',
+            content: `【世界书 · ${entry.world} · ${entry.comment} · ${theaterWorldPositionLabel(entry)}】\n${entry.content.trim()}`,
+        };
+    }
+
     function theaterCharacterAndPersona(config = settings.theater) {
         const context = getContext();
-        const parts = [];
+        let character = null;
+        let persona = null;
         if (config.includeCharacter !== false) {
             const characterId = context.characterId ?? context.this_chid ?? host.this_chid;
             const card = context.characters?.[characterId] || host.characters?.[characterId];
@@ -3018,16 +2739,34 @@
                     card.personality ? `性格：${card.personality}` : '',
                     card.scenario ? `场景：${card.scenario}` : '',
                 ].filter(Boolean).join('\n');
-                if (text) parts.push(`【角色卡】\n${text}`);
+                if (text) character = { role: 'system', content: `【角色卡】\n${text}` };
             }
         }
         if (config.includePersona !== false) {
             try {
-                const persona = String(context.substituteParams?.('{{persona}}') || '').trim();
-                if (persona) parts.push(`【用户设定】\n${persona}`);
+                const personaText = String(context.substituteParams?.('{{persona}}') || '').trim();
+                if (personaText) persona = { role: 'system', content: `【用户设定】\n${personaText}` };
             } catch (_) {}
         }
-        return parts;
+        return { character, persona };
+    }
+
+    function insertTheaterDepthMessages(history, entries) {
+        const slots = new Map();
+        for (const entry of entries) {
+            const depth = Math.max(0, Math.floor(worldbookDepthV2(entry.raw)));
+            // ST depth 0 is after the newest history message; depth 1 is
+            // immediately before it.  The final theater request stays last.
+            const slot = Math.max(0, history.length - depth);
+            if (!slots.has(slot)) slots.set(slot, []);
+            slots.get(slot).push(theaterWorldMessage(entry));
+        }
+        const result = [];
+        for (let index = 0; index <= history.length; index += 1) {
+            result.push(...(slots.get(index) || []));
+            if (index < history.length) result.push(history[index]);
+        }
+        return result;
     }
 
     function theaterRequestSnapshot() {
@@ -3040,6 +2779,7 @@
             contextTags: String(config.contextTags || ''),
             includeCharacter: config.includeCharacter !== false,
             includePersona: config.includePersona !== false,
+            streaming: config.streaming === true,
             worldEntries: normalizeWorldEntrySelections(config.worldEntries),
             nativePresetName: String(config.nativePresetName || theaterNativePresetName || ''),
             nativePresetEntryIds: (config.nativePresetEntryIds || []).map(String),
@@ -3060,20 +2800,34 @@
         const historyRows = limit > 0 ? getRows().slice(-limit) : [];
         const history = historyRows.map((row) => {
             const text = extractTags(row.text, tags).trim();
-            return text ? `${row.isUser ? '用户' : row.name}（#${row.id}）：${text}` : '';
-        }).filter(Boolean).join('\n\n');
+            if (!text) return null;
+            const role = row.raw?.is_system || row.raw?.role === 'system'
+                ? 'system'
+                : row.isUser ? 'user' : 'assistant';
+            return { role, content: text };
+        }).filter(Boolean);
         const nativePresetEntries = await collectTheaterNativePresetEntries(config);
         const worldEntries = await collectTheaterWorldEntries(normalizeWorldEntrySelections(config.worldEntries));
-        const contextParts = [
-            ...theaterCharacterAndPersona(config),
-            nativePresetEntries ? `【用户选择的酒馆原生预设条目】\n${nativePresetEntries}` : '',
-            worldEntries ? `【用户选择的世界书条目】\n${worldEntries}` : '',
-            history ? `【最近上下文】\n${history}` : '',
-        ].filter(Boolean);
+        const { character, persona } = theaterCharacterAndPersona(config);
+        const worldBefore = worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === 0).map(theaterWorldMessage);
+        const worldAfter = worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === 1).map(theaterWorldMessage);
+        const worldDepth = worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === 4);
+        const worldAnchored = worldEntries
+            .filter((entry) => ![0, 1, 4].includes(worldbookPositionV2(entry.raw)))
+            .map(theaterWorldMessage);
         const system = String(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultTheaterSystemPrompt()).trim();
         const request = prompt || '请根据以上设定与上下文，自行选择一个合适的片段生成小剧场。';
-        const user = [...contextParts, `【小剧场请求】\n${request}`].join('\n\n');
-        return [{ role: 'system', content: system }, { role: 'user', content: user }];
+        return [
+            ...(system ? [{ role: 'system', content: system }] : []),
+            ...nativePresetEntries,
+            ...worldBefore,
+            ...(character ? [character] : []),
+            ...worldAfter,
+            ...(persona ? [persona] : []),
+            ...worldAnchored,
+            ...insertTheaterDepthMessages(history, worldDepth),
+            { role: 'user', content: `【小剧场请求】\n${request}` },
+        ];
     }
 
     function saveTheaterPreset() {
@@ -3128,6 +2882,30 @@
         });
     }
 
+    function theaterTaskStatusText(task) {
+        if (task.cancelled || task.status === 'cancelling') return '正在取消…';
+        if (task.status === 'connecting') return '正在连接流式响应';
+        if (task.status === 'streaming') return '流式接收中';
+        if (task.status === 'fallback') return '流式不可用，等待完整返回';
+        return '等待完整返回';
+    }
+
+    function updateTheaterTaskProgress(task) {
+        if (!root || !task) return;
+        root.querySelectorAll('[data-theater-task-status]').forEach((node) => {
+            if (node.dataset.theaterTaskStatus === task.id) node.textContent = theaterTaskStatusText(task);
+        });
+        root.querySelectorAll('[data-theater-task-live]').forEach((node) => {
+            if (node.dataset.theaterTaskLive === task.id) node.hidden = !task.output;
+        });
+        root.querySelectorAll('[data-theater-task-output]').forEach((node) => {
+            if (node.dataset.theaterTaskOutput === task.id) node.textContent = task.output || '';
+        });
+        root.querySelectorAll('[data-theater-task-count]').forEach((node) => {
+            if (node.dataset.theaterTaskCount === task.id) node.textContent = String(theaterOutputCharacterCount(task.output || ''));
+        });
+    }
+
     function updateTheaterTaskTicker() {
         if (theaterTasks.size && !theaterTaskTicker) {
             theaterTaskTicker = host.setInterval(updateTheaterTaskClocks, 1000);
@@ -3151,7 +2929,8 @@
             startedAt: Date.now(),
             controller: typeof Controller === 'function' ? new Controller() : null,
             cancelled: false,
-            status: 'running',
+            status: snapshot.channelOverride && snapshot.streaming ? 'connecting' : 'running',
+            output: '',
         };
         theaterTasks.set(task.id, task);
         updateTheaterTaskTicker();
@@ -3166,6 +2945,18 @@
                 channelOverride: snapshot.channelOverride,
                 signal: task.controller?.signal || null,
                 timeoutSec: AI_REQUEST_TIMEOUT_SEC,
+                streaming: snapshot.streaming === true,
+                onMode: (mode) => {
+                    if (task.cancelled) return;
+                    task.status = mode;
+                    updateTheaterTaskProgress(task);
+                },
+                onUpdate: (text) => {
+                    if (task.cancelled) return;
+                    task.status = 'streaming';
+                    task.output = String(text || '');
+                    updateTheaterTaskProgress(task);
+                },
             });
             if (task.cancelled) return;
             theaterResult = String(output || '').trim();
@@ -3288,6 +3079,32 @@
         }
     }
 
+    function theaterReadableText(value) {
+        const source = String(value || '').trim();
+        if (!source) return '';
+        try {
+            const rendered = cleanTheaterRichHtml(source);
+            const template = doc.createElement('template');
+            template.innerHTML = rendered.html;
+            template.content.querySelectorAll('script,style,link,meta').forEach((node) => node.remove());
+            template.content.querySelectorAll('br').forEach((node) => node.replaceWith(doc.createTextNode('\n')));
+            template.content.querySelectorAll('p,div,section,article,header,footer,aside,li,blockquote,pre,h1,h2,h3,h4,h5,h6,tr').forEach((node) => {
+                node.append(doc.createTextNode('\n'));
+            });
+            return String(template.content.textContent || '')
+                .replace(/\u00a0/g, ' ')
+                .replace(/[ \t]+\n/g, '\n')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+        } catch (_) {
+            return source.replace(/<[^>]+>/g, ' ').trim();
+        }
+    }
+
+    function theaterOutputCharacterCount(value) {
+        return Array.from(theaterReadableText(value).replace(/[\s\u200b-\u200d\ufeff]/g, '')).length;
+    }
+
     function theaterOutputSlot(value, extraClass = '') {
         const key = `theater-render-${++theaterRenderSequence}`;
         theaterRenderCache.set(key, String(value || ''));
@@ -3379,13 +3196,13 @@
         if (!tasks.length) return '';
         return `<div class="ctb-theater-task-list">${tasks.map((task) => {
             const title = task.prompt.trim() || '未填写请求（按上下文自动生成）';
-            const status = task.status === 'cancelling' ? '正在取消…' : '正在生成';
-            return `<div class="ctb-theater-task"><span class="ctb-theater-task-state"><span class="ctb-save-spinner"></span><strong>任务 #${task.number} · ${status}</strong><small title="${escapeHTML(title)}">${escapeHTML(title)}</small></span><span class="ctb-theater-task-side"><em data-theater-task-elapsed="${escapeHTML(task.id)}">已用 ${formatTheaterElapsed(task.startedAt)} / 最长 05:00</em><button type="button" class="ctb-button ctb-danger" data-action="cancel-theater-task" data-theater-task-id="${escapeHTML(task.id)}"${task.cancelled ? ' disabled' : ''}>取消</button></span></div>`;
+            return `<div class="ctb-theater-task"><span class="ctb-theater-task-state"><span class="ctb-save-spinner"></span><strong>任务 #${task.number} · <span data-theater-task-status="${escapeHTML(task.id)}">${escapeHTML(theaterTaskStatusText(task))}</span></strong><small title="${escapeHTML(title)}">${escapeHTML(title)}</small></span><span class="ctb-theater-task-side"><em data-theater-task-elapsed="${escapeHTML(task.id)}">已用 ${formatTheaterElapsed(task.startedAt)} / 最长 05:00</em><button type="button" class="ctb-button ctb-danger" data-action="cancel-theater-task" data-theater-task-id="${escapeHTML(task.id)}"${task.cancelled ? ' disabled' : ''}>取消</button></span><div class="ctb-theater-task-live" data-theater-task-live="${escapeHTML(task.id)}"${task.output ? '' : ' hidden'}><small>实时返回 · 正文字数 <span data-theater-task-count="${escapeHTML(task.id)}">${theaterOutputCharacterCount(task.output || '')}</span></small><pre data-theater-task-output="${escapeHTML(task.id)}">${escapeHTML(task.output || '')}</pre></div></div>`;
         }).join('')}</div>`;
     }
 
     function renderTheaterTab() {
         const config = settings.theater;
+        const customChannelSelected = Boolean(selectedChannel('theater'));
         if (!theaterNativePresetLoadedOnce && !theaterNativePresetLoading) host.setTimeout(() => loadTheaterNativePresets(), 0);
         const presetOptions = ['<option value="">选择小剧场预设…</option>'].concat((config.presets || []).map((preset) => `<option value="${escapeHTML(preset.id)}"${config.selectedPresetId === preset.id ? ' selected' : ''}>${escapeHTML(preset.name)}</option>`)).join('');
         const recent = theaterHistory || [];
@@ -3395,7 +3212,7 @@
             const favorite = isTheaterFavorite(item.id);
             const source = theaterHistoryView === 'favorites' ? 'favorite' : 'recent';
             return `<article class="ctb-theater-history">
-                <div class="ctb-theater-history-head"><span>${escapeHTML(item.time || '')} · ${escapeHTML(item.prompt || '').slice(0, 70)}</span><span>${favorite ? '★' : ''}</span></div>
+                <div class="ctb-theater-history-head"><span>${escapeHTML(item.time || '')} · 正文字数 ${theaterOutputCharacterCount(item.output || '')} · ${escapeHTML(item.prompt || '').slice(0, 70)}</span><span>${favorite ? '★' : ''}</span></div>
                 <div class="ctb-theater-history-body">${theaterPlainPreview(item.output || '')}</div>
                 <div class="ctb-inline ctb-theater-history-actions">
                     <button type="button" class="ctb-button" data-action="open-theater-reader" data-theater-source="${source}" data-theater-id="${escapeHTML(item.id)}">放大阅读</button>
@@ -3406,13 +3223,13 @@
             </article>`;
         }).join('');
         return `<section class="ctb-section"><div class="ctb-section-title">独立小剧场 ${infoButton('theater-scope')}</div></section>
-            <section class="ctb-section"><div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>${renderChannelSettings('theater')}</section>
+            <section class="ctb-section"><div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>${renderChannelSettings('theater')}<label class="ctb-check ctb-theater-stream-option"><input id="ctb-theater-streaming" type="checkbox"${config.streaming === true ? ' checked' : ''}${customChannelSelected ? '' : ' disabled'}> 流式传输 <small>${customChannelSelected ? '接口不支持时自动回退完整返回' : '仅自定义渠道可用'}</small></label></section>
             <section class="ctb-section"><div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div><textarea class="ctb-input ctb-textarea ctb-system-prompt" id="ctb-theater-system" placeholder="控制小剧场的生成身份、边界与风格">${escapeHTML(typeof config.systemPrompt === 'string' ? config.systemPrompt : defaultTheaterSystemPrompt())}</textarea></section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场预设</div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-preset">${presetOptions}</select><input class="ctb-input" id="ctb-theater-preset-name" placeholder="预设名称" value="${escapeHTML(config.presetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-preset"${config.selectedPresetId ? '' : ' disabled'}>删除</button></div></section>
             <section class="ctb-section"><div class="ctb-section-title">酒馆原生预设</div>${renderTheaterNativePresetPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="可留空；留空时会根据已选设定和上下文自动生成">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${theaterTasks.size >= THEATER_MAX_CONCURRENT ? ' disabled' : ''}><i class="fa-solid fa-wand-magic-sparkles"></i> ${theaterTasks.size >= THEATER_MAX_CONCURRENT ? `已达上限（${THEATER_MAX_CONCURRENT}/${THEATER_MAX_CONCURRENT}）` : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div>${renderTheaterTaskList()}</section>
-            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 · 字数 ${countCharacters(theaterResult)} <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
+            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 · 正文字数 ${theaterOutputCharacterCount(theaterResult)} <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
             <section class="ctb-section"><div class="ctb-section-title">记录 <span>${theaterHistoryView === 'favorites' ? '收藏夹' : '本次会话'}</span></div>
                 <div class="ctb-inline ctb-theater-history-tabs"><button type="button" class="ctb-scope${theaterHistoryView === 'recent' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="recent">最近</button><button type="button" class="ctb-scope${theaterHistoryView === 'favorites' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="favorites">★ 收藏夹</button></div>
                 <div class="ctb-theater-history-list" data-ctb-scroll-key="theater-history-list">${history || '<div class="ctb-results ctb-results-empty">这里还没有记录。</div>'}</div>
@@ -3911,7 +3728,6 @@
                 worldbookDraft = record ? deepClone(record.raw) : null;
                 worldbookEditingUid = record ? record.uid : '';
             }
-            rewriteWorldEntryCache.delete(worldbookBook);
             theaterWorldEntryCache.delete(worldbookBook);
             notify(`世界书“${worldbookBook}”已保存，共 ${worldbookEntries.length} 条`, 'success');
             return true;
@@ -4072,7 +3888,6 @@
             });
             await saveWorldInfoDocument(target, { ...document, entries: serializeWorldbookRecords(records) }, { immediate: true, refreshList: false, verify: true });
             theaterWorldEntryCache.delete(target);
-            rewriteWorldEntryCache.delete(target);
             notify(`已复制 ${selected.length} 个条目到“${target}”，条目设置均已保留`, 'success');
         } catch (error) {
             notify(`复制到目标世界书失败：${error.message}`, 'error');
@@ -5025,7 +4840,6 @@
             search: renderSearchTab,
             export: renderExportTab,
             'post-edit': renderPostEditTab,
-            rewrite: renderRewriteTab,
             theater: renderTheaterTab,
             worldbook: renderWorldbookTab,
             'preset-transfer': renderPresetTransferTab,
@@ -5165,17 +4979,14 @@
             #${ROOT_ID} .ctb-model-row select{flex:1;}
             #${ROOT_ID} .ctb-mini-field{display:flex;align-items:center;gap:5px;min-width:0;color:#6f7277;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-mini-field .ctb-input{width:90px;}
             #${ROOT_ID} .ctb-preset-row{margin-bottom:6px;} #${ROOT_ID} .ctb-preset-row select{max-width:150px;} #${ROOT_ID} .ctb-preset-row input{flex:1;} #${ROOT_ID} .ctb-world-preset-title{margin-top:9px;}
-            #${ROOT_ID} .ctb-context-row{flex-wrap:wrap;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;} #${ROOT_ID} .ctb-rewrite-global{height:62px;margin-top:6px;}
+            #${ROOT_ID} .ctb-context-row{flex-wrap:wrap;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;}
             #${ROOT_ID} .ctb-primary-soft{border-color:#91aa98;background:#e0e9e3;color:#4d6755;} #${ROOT_ID} .ctb-world-picker-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button:first-child{flex:1;justify-content:space-between;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button span{color:#7a817c;font-size:10px;font-weight:400;}
             #${ROOT_ID} .ctb-world-selected-summary{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;} #${ROOT_ID} .ctb-world-selected-summary span{max-width:100%;overflow:hidden;padding:3px 6px;border:1px solid #c9d2cc;border-radius:3px;background:#e5ebe7;color:#5c6860;font-size:10px;text-overflow:ellipsis;white-space:nowrap;}
             #${ROOT_ID} .ctb-world-picker{margin-top:6px;overflow:hidden;border:1px solid #cbd0cc;border-radius:3px;background:#e9ebeb;} #${ROOT_ID} .ctb-world-book-row{padding:6px;border-bottom:1px solid #cfd3d0;} #${ROOT_ID} .ctb-world-book-row select{flex:1;} #${ROOT_ID} .ctb-world-bulk{justify-content:flex-end;padding:5px 6px;border-bottom:1px solid #d3d6d4;color:#6d716f;font-size:10px;} #${ROOT_ID} .ctb-world-bulk>span{margin-right:auto;}
             #${ROOT_ID} .ctb-world-entry-list{max-height:230px;overflow:auto;} #${ROOT_ID} .ctb-world-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px;border-bottom:1px solid #d4d7d5;color:#555b57;cursor:pointer;} #${ROOT_ID} .ctb-world-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-world-entry.is-selected{background:#dfe8e1;} #${ROOT_ID} .ctb-world-entry-main{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-world-entry-main strong{overflow:hidden;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-world-entry-main small{overflow:hidden;color:#858a87;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-world-entry-meta{color:#8a8d8b;font-size:9px;white-space:nowrap;} #${ROOT_ID} .ctb-world-empty{display:flex;align-items:center;justify-content:center;gap:7px;min-height:70px;padding:10px;color:#858a87;font-size:10px;} #${ROOT_ID} .ctb-world-error{color:#985957;}
-            #${ROOT_ID} .ctb-rewrite-list{max-height:280px;overflow:auto;border:1px solid #cfd1d5;border-radius:3px;background:#ededf0;}
-            #${ROOT_ID} .ctb-rewrite-paragraph{display:grid;grid-template-columns:42px minmax(0,1fr);gap:5px 8px;padding:7px 8px;border-bottom:1px solid #d5d6da;} #${ROOT_ID} .ctb-rewrite-paragraph:last-child{border-bottom:0;}
-            #${ROOT_ID} .ctb-rewrite-select{grid-row:1/3;display:flex;align-items:flex-start;gap:4px;color:#6b6e73;font-size:10px;font-weight:700;} #${ROOT_ID} .ctb-rewrite-source{min-width:0;color:#4f5257;font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-word;}
-            #${ROOT_ID} .ctb-rewrite-generate,#${ROOT_ID} .ctb-rewrite-final{justify-content:flex-end;flex-wrap:wrap;margin-top:7px;}
-            #${ROOT_ID} .ctb-rewrite-reviews{display:grid;gap:6px;} #${ROOT_ID} .ctb-rewrite-review{overflow:hidden;border:1px solid #cfd1d5;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-rewrite-review.is-accepted,#${ROOT_ID} .ctb-rewrite-review.is-rejected{border-color:#cfd1d5;opacity:1;}
-            #${ROOT_ID} .ctb-rewrite-review-title{display:flex;justify-content:space-between;padding:5px 7px;border-bottom:1px solid #d3d5d8;color:#65696e;font-size:10px;font-weight:700;} #${ROOT_ID} .ctb-rewrite-compare{display:grid;grid-template-columns:1fr 1fr;} #${ROOT_ID} .ctb-rewrite-compare>div{min-width:0;padding:7px;} #${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:1px solid #d3d5d8;background:transparent;} #${ROOT_ID} .ctb-rewrite-compare small{color:#85898e;} #${ROOT_ID} .ctb-rewrite-compare p{margin:3px 0 0;color:#4e5156;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-rewrite-review>.ctb-inline{padding:0 7px 7px;}
+            #${ROOT_ID} .ctb-review-actions{justify-content:flex-end;flex-wrap:wrap;margin-top:7px;}
+            #${ROOT_ID} .ctb-review-list{display:grid;gap:6px;} #${ROOT_ID} .ctb-review-item{overflow:hidden;border:1px solid #cfd1d5;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-review-item.is-accepted,#${ROOT_ID} .ctb-review-item.is-rejected{border-color:#cfd1d5;opacity:1;}
+            #${ROOT_ID} .ctb-review-title{display:flex;justify-content:space-between;padding:5px 7px;border-bottom:1px solid #d3d5d8;color:#65696e;font-size:10px;font-weight:700;} #${ROOT_ID} .ctb-review-compare{display:grid;grid-template-columns:1fr 1fr;} #${ROOT_ID} .ctb-review-compare>div{min-width:0;padding:7px;} #${ROOT_ID} .ctb-review-compare>div+div{border-left:1px solid #d3d5d8;background:transparent;} #${ROOT_ID} .ctb-review-compare small{color:#85898e;} #${ROOT_ID} .ctb-review-compare p{margin:3px 0 0;color:#4e5156;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-review-item>.ctb-inline{padding:0 7px 7px;}
             #${ROOT_ID} .ctb-prompt-preview{padding:7px;border:1px solid #cfd3d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-prompt-preview .ctb-section-title{justify-content:space-between;} #${ROOT_ID} .ctb-prompt-preview pre{max-height:320px;overflow:auto;margin:0;padding:8px;background:#f3f3f5;color:#50545a;font:10px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;word-break:break-word;}
             #${ROOT_ID} .ctb-system-prompt{min-height:92px;height:92px;font:11px/1.45 var(--mainFontFamily,Arial,sans-serif);resize:vertical;}
             #${ROOT_ID} .ctb-post-review-grid{grid-template-columns:1fr 1fr 1fr;}
@@ -5194,7 +5005,7 @@
             #${ROOT_ID} .ctb-confirm-actions{justify-content:flex-end;}
             #${ROOT_ID} .ctb-tabs{display:flex;overflow-x:auto;scrollbar-width:thin;} #${ROOT_ID} .ctb-tab{flex:0 0 calc(100% / var(--ctb-tab-count,4));min-width:92px;}
             #${ROOT_ID} .ctb-theater-prompt{min-height:92px;height:92px;} #${ROOT_ID} .ctb-theater-actions{justify-content:flex-end;margin-top:7px;} #${ROOT_ID} .ctb-theater-result{max-height:360px;overflow:auto;margin:0;padding:9px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;color:#4e5257;font:11px/1.55 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-theater-render{display:block;min-height:1.2em;color:inherit;font:inherit;line-height:1.55;} #${ROOT_ID} .ctb-theater-history-list{max-height:365px;overflow:auto;padding-right:2px;scrollbar-width:thin;} #${ROOT_ID} .ctb-theater-history{margin-bottom:5px;border:1px solid #d0d2d6;border-radius:3px;background:#ececef;padding:6px 8px;} #${ROOT_ID} .ctb-theater-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;color:#6e7278;font-size:10px;} #${ROOT_ID} .ctb-theater-history-body{max-height:120px;overflow:hidden;color:#4e5257;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;} #${ROOT_ID} .ctb-theater-history-actions{justify-content:flex-end;flex-wrap:wrap;margin-top:6px;} #${ROOT_ID} .ctb-theater-history-tabs{margin:5px 0 7px;} #${ROOT_ID} .ctb-reader-overlay{position:fixed;inset:0;z-index:2147483150;display:grid;place-items:center;padding:10px;background:rgba(18,21,27,.5);} #${ROOT_ID} .ctb-reader-card{width:min(1100px,calc(100vw - 20px));height:calc(100vh - 20px);height:calc(100dvh - 20px);max-height:900px;display:flex;flex-direction:column;overflow:hidden;border:1px solid #bfc3c8;border-radius:4px;background:#f5f5f7;box-shadow:0 18px 48px rgba(0,0,0,.38);} #${ROOT_ID} .ctb-reader-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid #d3d5d9;background:#fafafd;color:#4c5056;font-size:12px;font-weight:700;} #${ROOT_ID} .ctb-reader-content{flex:1;min-height:0;overflow:auto;padding:15px;background:#f0f0f2;color:#42464c;font:12px/1.65 var(--mainFontFamily,Arial,sans-serif);word-break:break-word;} #${ROOT_ID} .ctb-reader-content .ctb-theater-render{min-height:100%;} 
-            #${ROOT_ID} .ctb-theater-task-list{display:grid;gap:5px;margin-top:8px;} #${ROOT_ID} .ctb-theater-task{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px;border:1px solid #cbd2d8;border-radius:4px;background:#edf0f3;} #${ROOT_ID} .ctb-theater-task-state{display:grid;min-width:0;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:2px 6px;color:#50565d;} #${ROOT_ID} .ctb-theater-task-state .ctb-save-spinner{grid-row:1/3;} #${ROOT_ID} .ctb-theater-task-state strong{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-state small{overflow:hidden;color:#747a82;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side{display:flex;align-items:center;gap:6px;flex:0 0 auto;} #${ROOT_ID} .ctb-theater-task-side em{color:#68717a;font-size:9px;font-style:normal;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side .ctb-button{padding:3px 7px;font-size:9px;}
+            #${ROOT_ID} .ctb-theater-stream-option{display:flex;margin-top:7px;gap:5px;} #${ROOT_ID} .ctb-theater-stream-option small{color:#777d84;font-size:9px;} #${ROOT_ID} .ctb-theater-task-list{display:grid;gap:5px;margin-top:8px;} #${ROOT_ID} .ctb-theater-task{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 8px;border:1px solid #cbd2d8;border-radius:4px;background:#edf0f3;} #${ROOT_ID} .ctb-theater-task-state{display:grid;min-width:0;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:2px 6px;color:#50565d;} #${ROOT_ID} .ctb-theater-task-state .ctb-save-spinner{grid-row:1/3;} #${ROOT_ID} .ctb-theater-task-state strong{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-state small{overflow:hidden;color:#747a82;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side{display:flex;align-items:center;gap:6px;flex:0 0 auto;} #${ROOT_ID} .ctb-theater-task-side em{color:#68717a;font-size:9px;font-style:normal;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side .ctb-button{padding:3px 7px;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live{grid-column:1/-1;min-width:0;padding-top:5px;border-top:1px solid #d5dbe0;} #${ROOT_ID} .ctb-theater-task-live small{display:block;margin-bottom:3px;color:#68717a;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live pre{max-height:170px;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#4f555c;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);}
             #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-selection-count{margin-left:auto;color:#64748b;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry.is-selected{background:#f1f6fb;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
             #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
             #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
@@ -5213,7 +5024,7 @@
             #${ROOT_ID} .ctb-preset-compare-side p{margin:2px 0 0;overflow:hidden;color:#5b6066;line-height:1.4;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:4;}
             #${ROOT_ID} .ctb-list-more{display:block;width:100%;border:0;border-top:1px solid #d1d4d7;background:#e1e3e5;color:#697078;padding:7px;cursor:pointer;font:10px var(--mainFontFamily,Arial,sans-serif);} #${ROOT_ID} .ctb-list-more:hover{background:#d8ddda;}
             #${SETTINGS_ID} .ctb-extension-settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 12px;padding:8px 15px 12px;} #${SETTINGS_ID} .ctb-extension-settings-title{grid-column:1/-1;font-weight:700;} #${SETTINGS_ID} label{display:flex;align-items:center;gap:6px;} #${SETTINGS_ID} input{width:16px;height:16px;accent-color:#7da287;}
-            @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-rewrite-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-rewrite-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
+            @media (max-width:560px){#${ROOT_ID} .ctb-tabs{padding:0 5px;}#${ROOT_ID} .ctb-tab{font-size:11px;}#${ROOT_ID} .ctb-post-preview,#${ROOT_ID} .ctb-channel-grid,#${ROOT_ID} .ctb-review-compare{grid-template-columns:1fr;}#${ROOT_ID} .ctb-post-preview>.ctb-section-title{grid-column:auto;}#${ROOT_ID} .ctb-channel-grid>*{grid-column:1!important;}#${ROOT_ID} .ctb-preset-row{flex-wrap:wrap;}#${ROOT_ID} .ctb-preset-row select{max-width:none;flex-basis:100%;}#${ROOT_ID} .ctb-review-compare>div+div{border-left:0;border-top:1px solid #d3d5d8;}#${ROOT_ID} .ctb-export-tag-options{grid-template-columns:1fr;}}
             @media (max-width:560px){#${ROOT_ID} .ctb-preset-transfer-grid,#${ROOT_ID} .ctb-preset-compare-row{grid-template-columns:1fr;}#${ROOT_ID} .ctb-manager-list,#${ROOT_ID} .ctb-preset-entry-list{max-height:250px;}#${ROOT_ID} .ctb-preset-compare-side{padding-left:0;border-left:0;border-top:1px solid #d5d7da;padding-top:4px;}#${ROOT_ID} .ctb-manager-savebar{margin-left:0;margin-right:0;padding-left:0;padding-right:0;}#${SETTINGS_ID} .ctb-extension-settings-grid{grid-template-columns:1fr;}}
 
             /* v0.9.1 manager redesign: light, readable, single-list editing and full-width comparison */
@@ -5496,7 +5307,9 @@
             if (postEditReview[index]) {
                 postEditReview[index].replacement = target.value;
                 if (postEditDraft) {
-                    const current = postEditReview.filter((item) => item.decision === 'accept');
+                    // The complete preview always shows every generated patch;
+                    // accept/reject only controls what is written on save.
+                    const current = postEditReview;
                     postEditDraft.revisedContent = postEditParagraphs(postEditDraft.originalContent).map((paragraph, paragraphIndex) => {
                         const item = current.find((review) => review.paragraph === paragraphIndex + 1);
                         return item ? item.replacement : paragraph;
@@ -5505,12 +5318,6 @@
             }
             return;
         }
-        else if (id === 'ctb-rewrite-floor') settings.rewrite.floor = target.value;
-        else if (id === 'ctb-rewrite-tag') settings.rewrite.tag = target.value;
-        else if (id === 'ctb-rewrite-context-floors') settings.rewrite.contextFloors = target.value;
-        else if (id === 'ctb-rewrite-context-tags') settings.rewrite.contextTags = target.value;
-        else if (id === 'ctb-rewrite-global') settings.rewrite.globalInstruction = target.value;
-        else if (id === 'ctb-rewrite-system') settings.rewrite.systemPrompt = target.value;
         else if (id === 'ctb-theater-system') settings.theater.systemPrompt = target.value;
         else if (id === 'ctb-theater-prompt') settings.theater.prompt = target.value;
         else if (id === 'ctb-theater-preset-name') settings.theater.presetName = target.value;
@@ -5550,12 +5357,8 @@
             else if (id.endsWith('-channel-temperature')) channel.temperature = target.value;
             else if (id.endsWith('-channel-tokens')) channel.maxTokens = target.value;
             return;
-        } else if (target.dataset.paragraphIndex !== undefined && target.dataset.action === 'rewrite-instruction') {
-            const paragraph = rewriteDraft?.paragraphs?.[Number(target.dataset.paragraphIndex)];
-            if (paragraph) paragraph.instruction = target.value;
-            return;
         }
-        if (id === 'ctb-post-edit-system' || id === 'ctb-post-edit-rules' || id === 'ctb-rewrite-system' || id === 'ctb-theater-system') saveSettings();
+        if (id === 'ctb-post-edit-system' || id === 'ctb-post-edit-rules' || id === 'ctb-theater-system') saveSettings();
     }
 
     async function handleChange(event) {
@@ -5569,10 +5372,6 @@
         else if (id === 'ctb-export-floor') ui.exportShowFloor = target.checked;
         else if (target.dataset.exportTag !== undefined) {
             setExportTagSelected(target.dataset.exportTag, target.checked);
-            return;
-        }
-        else if (target.dataset.worldEntryUid !== undefined) {
-            setRewriteWorldEntrySelected(target.dataset.worldName, target.dataset.worldEntryUid, target.checked);
             return;
         }
         else if (target.dataset.theaterWorldEntryUid !== undefined) {
@@ -5597,10 +5396,6 @@
             // Do not rebuild the panel here: rebuilding loses the list's
             // scroll position and made selecting an entry jump to the top.
             updatePresetTransferSelectionUi();
-            return;
-        }
-        else if (id === 'ctb-rewrite-world-book') {
-            await chooseRewriteWorldBook(target.value);
             return;
         }
         else if (id === 'ctb-theater-world-book') {
@@ -5680,13 +5475,9 @@
             channelEditor = null;
             saveSettings();
             renderPanel();
-        } else if (id === 'ctb-rewrite-channel') {
-            settings.rewrite.channelId = target.value;
-            channelEditor = null;
-            saveSettings();
-            renderPanel();
         } else if (id === 'ctb-theater-channel') {
             settings.theater.channelId = target.value;
+            if (target.value === 'main') settings.theater.streaming = false;
             channelEditor = null;
             saveSettings();
             renderPanel();
@@ -5701,14 +5492,12 @@
             }
             saveSettings();
             renderPanel();
-        } else if (id === 'ctb-rewrite-character') {
-            settings.rewrite.includeCharacter = target.checked;
-        } else if (id === 'ctb-rewrite-persona') {
-            settings.rewrite.includePersona = target.checked;
         } else if (id === 'ctb-theater-character') {
             settings.theater.includeCharacter = target.checked;
         } else if (id === 'ctb-theater-persona') {
             settings.theater.includePersona = target.checked;
+        } else if (id === 'ctb-theater-streaming') {
+            settings.theater.streaming = target.checked && Boolean(selectedChannel('theater'));
         } else if (id === 'ctb-theater-world-preset') {
             await selectTheaterWorldPreset(target.value);
         } else if (id === 'ctb-theater-preset') {
@@ -5727,6 +5516,7 @@
                 settings.theater.selectedWorldPresetId = '';
                 settings.theater.worldPresetName = '';
                 settings.theater.channelId = preset.channelId || 'main';
+                if (settings.theater.channelId === 'main') settings.theater.streaming = false;
                 theaterNativePresetName = settings.theater.nativePresetName;
             } else {
                 settings.theater.presetName = '';
@@ -5740,9 +5530,6 @@
         } else if (target.dataset.channelId && id.endsWith('-channel-model')) {
             const channel = channelEditor?.draft?.id === target.dataset.channelId ? channelEditor.draft : null;
             if (channel) channel.model = target.value;
-        } else if (target.dataset.action === 'rewrite-selected') {
-            const paragraph = rewriteDraft?.paragraphs?.[Number(target.dataset.paragraphIndex)];
-            if (paragraph) paragraph.selected = target.checked;
         }
     }
 
@@ -5803,7 +5590,6 @@
                 if (index < 0 || !host.confirm('确定删除这个生成渠道吗？引用它的 AI 功能都会改为跟随酒馆主接口。')) return;
                 settings.ai.channels.splice(index, 1);
                 if (settings.postEdit.channelId === data.channelId) settings.postEdit.channelId = 'main';
-                if (settings.rewrite.channelId === data.channelId) settings.rewrite.channelId = 'main';
                 if (settings.theater.channelId === data.channelId) settings.theater.channelId = 'main';
                 channelEditor = null;
                 saveSettings();
@@ -5828,32 +5614,6 @@
                 return renderPanel();
             case 'toggle-post-edit-editor': postEditEditing = !postEditEditing; return renderPanel();
             case 'clear-post-edit': postEditDraft = null; postEditEditing = false; postEditReview = []; postEditPromptPreview = null; postEditReviewEditingIndex = -1; return renderPanel();
-            case 'toggle-rewrite-world-picker':
-                rewriteWorldPickerOpen = !rewriteWorldPickerOpen;
-                if (rewriteWorldPickerOpen) return loadRewriteWorldBooks();
-                return renderPanel();
-            case 'refresh-rewrite-world-books': return loadRewriteWorldBooks({ force: true });
-            case 'close-rewrite-world-picker': rewriteWorldPickerOpen = false; return renderPanel();
-            case 'clear-rewrite-world-selection':
-                settings.rewrite.worldEntries = [];
-                return renderPanel();
-            case 'select-rewrite-world-book-all': return setCurrentWorldBookSelection(true);
-            case 'clear-rewrite-world-book': return setCurrentWorldBookSelection(false);
-            case 'prepare-rewrite': return prepareRewriteFloor();
-            case 'preview-rewrite-prompt': return previewRewritePrompt();
-            case 'close-rewrite-preview': rewritePromptPreview = null; return renderPanel();
-            case 'run-rewrite': return runRewrite();
-            case 'rewrite-select-all': {
-                rewriteDraft?.paragraphs?.forEach((paragraph) => { paragraph.selected = data.selected === 'true'; });
-                return renderPanel();
-            }
-            case 'rewrite-decision': {
-                const review = rewriteReview[Number(data.reviewIndex)];
-                if (review) review.decision = data.decision;
-                return renderPanel();
-            }
-            case 'rewrite-all': rewriteReview.forEach((review) => { review.decision = data.decision; }); return renderPanel();
-            case 'apply-rewrite': return applyRewrite();
             case 'toggle-theater-world-picker':
                 theaterWorldPickerOpen = !theaterWorldPickerOpen;
                 if (theaterWorldPickerOpen) return loadTheaterWorldBooks();
