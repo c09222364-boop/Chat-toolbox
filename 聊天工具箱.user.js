@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.13
+// @version      1.0.14
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.13';
+    const VERSION = '1.0.14';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -72,6 +72,9 @@
     let channelEditor = null;
     let theaterResult = '';
     let theaterCurrentId = '';
+    let theaterResultMayBeTruncated = false;
+    let theaterCurrentRequestMessages = [];
+    let theaterCurrentRequestSnapshot = null;
     let theaterHistory = [];
     const theaterTasks = new Map();
     let theaterTaskSequence = 0;
@@ -89,6 +92,7 @@
     let theaterNativePresetEntries = [];
     let theaterNativePresetError = '';
     let theaterNativeSelectionInitializedFor = '';
+    let theaterNativePresetPickerOpen = false;
     let worldbookLoading = false;
     let worldbookLoadedOnce = false;
     let worldbookSaving = false;
@@ -152,6 +156,8 @@
         exportClean: true,
         exportTagPickerOpen: false,
         exportTagOptions: [],
+        theaterContextTagPickerOpen: false,
+        theaterContextTagOptions: [],
     };
 
     const INFO = Object.freeze({
@@ -164,7 +170,7 @@
         'post-edit-overview': '用于修订一个 AI 楼层的词句。生成后可以逐段审核，采用的内容才会写回聊天。',
         'post-edit-scope': '用于指定要修订的正文标签。填写 content 时，只处理 <content> 标签内的文字；留空则处理整条正文。',
         'channel-main': '选择“跟随酒馆主接口”会使用酒馆当前连接；选择自定义渠道则使用单独填写的地址、密钥和模型。',
-        'channel-custom': '用于选择小剧场的生成接口。跟随酒馆主接口会使用酒馆当前模型和流式设置；也可以选择单独配置的自定义渠道。',
+        'channel-custom': '用于选择小剧场的生成接口。跟随酒馆主接口会使用酒馆当前模型和流式设置；自定义渠道可单独设置模型、流式传输和最大输出，长篇内容可把最大输出设为 16384。',
         'system-cache': '用于填写模型的身份、写作要求和输出格式。留空时使用默认提示词。',
         'theater-scope': '用于根据角色设定、世界书和最近聊天生成独立片段。结果只保存在工具箱中，不会加入聊天楼层。',
         'worldbook-save': '用于编辑世界书条目。修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
@@ -244,17 +250,21 @@
         if (!channel || typeof channel !== 'object') return null;
         const rawMaxTokens = Number(channel.maxTokens);
         const rawTimeout = Number(channel.timeoutSec);
+        const model = String(channel.model || '');
+        const defaultMaxTokens = /(?:claude|anthropic)/i.test(model) ? 16384 : 8192;
         return {
             id: String(channel.id || `channel-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`),
             name: String(channel.name || '自定义渠道'),
             url: String(channel.url || ''),
             key: String(channel.key || ''),
-            model: String(channel.model || ''),
+            model,
             models: Array.isArray(channel.models) ? [...new Set(channel.models.map(String).filter(Boolean))] : [],
             temperature: Math.max(0, Math.min(2, Number(channel.temperature) || 0)),
             // 65535 是旧版本的危险默认值，会让部分后端超时或拒绝请求。
+            // Claude 渠道曾默认只有 4096，长篇 HTML 很容易刚好在中途结束。
             maxTokens: !Number.isFinite(rawMaxTokens) || rawMaxTokens <= 0 || rawMaxTokens >= 65535
-                ? 4096
+                || (rawMaxTokens === 4096 && /(?:claude|anthropic)/i.test(model))
+                ? defaultMaxTokens
                 : Math.max(256, Math.min(32768, Math.round(rawMaxTokens))),
             timeoutSec: !Number.isFinite(rawTimeout) || rawTimeout <= 0
                 ? AI_REQUEST_TIMEOUT_SEC
@@ -1093,7 +1103,7 @@
         return parts.sort((a, b) => a.index - b.index).map((part) => part.content).join('\n\n');
     }
 
-    function scanExportTags() {
+    function collectPairedTagOptions() {
         const ignored = new Set(['a', 'b', 'blockquote', 'body', 'code', 'details', 'div', 'em', 'head', 'html', 'i', 'li', 'ol', 'p', 'pre', 'script', 'small', 'span', 'strong', 'style', 'summary', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'ul']);
         const map = new Map();
         for (const row of getRows()) {
@@ -1120,18 +1130,46 @@
                 map.set(key, total);
             });
         }
-        ui.exportTagOptions = Array.from(map.values()).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+        return Array.from(map.values()).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    }
+
+    function scanExportTags() {
+        ui.exportTagOptions = collectPairedTagOptions();
         ui.exportTagPickerOpen = true;
     }
 
-    function setExportTagSelected(name, selected) {
-        const current = parseTags(ui.exportTags);
+    function scanTheaterContextTags() {
+        ui.theaterContextTagOptions = collectPairedTagOptions();
+        ui.theaterContextTagPickerOpen = true;
+    }
+
+    function updateSelectedTags(value, name, selected) {
+        const current = parseTags(value);
         const key = String(name).toLocaleLowerCase();
         const next = current.filter((tag) => tag.toLocaleLowerCase() !== key);
         if (selected) next.push(name);
-        ui.exportTags = next.join(', ');
+        return next.join(', ');
+    }
+
+    function setExportTagSelected(name, selected) {
+        ui.exportTags = updateSelectedTags(ui.exportTags, name, selected);
         const input = root?.querySelector('#ctb-export-tags');
         if (input) input.value = ui.exportTags;
+    }
+
+    function setTheaterContextTagSelected(name, selected) {
+        settings.theater.contextTags = updateSelectedTags(settings.theater.contextTags, name, selected);
+        const input = root?.querySelector('#ctb-theater-context-tags');
+        if (input) input.value = settings.theater.contextTags;
+    }
+
+    function renderTagMultiSelector({ inputId, value, placeholder, scanAction, closeAction, dataAttribute, open, options }) {
+        const selected = new Set(parseTags(value).map((tag) => tag.toLocaleLowerCase()));
+        const picker = open ? `<div class="ctb-export-tag-picker">
+            <div class="ctb-export-tag-picker-head"><span>当前聊天中的成对标签</span><button type="button" class="ctb-button" data-action="${closeAction}">完成</button></div>
+            <div class="ctb-export-tag-options">${options.length ? options.map((item) => `<label class="ctb-export-tag-option"><input type="checkbox" ${dataAttribute}="${escapeHTML(item.name)}"${selected.has(item.name.toLocaleLowerCase()) ? ' checked' : ''}><span>${escapeHTML(item.name)}</span><small>${item.count} 处</small></label>`).join('') : '<div class="ctb-hint">当前聊天没有扫描到成对标签；仍可在上方手动填写。</div>'}</div>
+        </div>` : '';
+        return `<div class="ctb-export-tag-input"><input class="ctb-input" id="${inputId}" placeholder="${escapeHTML(placeholder)}" value="${escapeHTML(value)}"><button type="button" class="ctb-icon-button" data-action="${scanAction}" title="扫描当前聊天中的标签" aria-label="扫描当前聊天中的标签"><i class="fa-solid fa-wand-magic-sparkles"></i></button></div>${picker}`;
     }
 
     function cleanText(text) {
@@ -1346,6 +1384,25 @@
         throw new Error('API 响应中没有找到可用文本');
     }
 
+    function apiStopReason(payload) {
+        const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null;
+        return String(choice?.finish_reason
+            || choice?.stop_reason
+            || payload?.stop_reason
+            || payload?.stopReason
+            || payload?.delta?.stop_reason
+            || payload?.delta?.stopReason
+            || '').trim().toLowerCase();
+    }
+
+    function apiHitOutputLimit(payload) {
+        const reason = apiStopReason(payload);
+        return reason === 'length'
+            || reason === 'max_tokens'
+            || reason === 'max_output_tokens'
+            || reason.includes('max_token');
+    }
+
     function makeChannel(name = '自定义渠道') {
         return {
             id: `channel-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
@@ -1355,7 +1412,7 @@
             model: '',
             models: [],
             temperature: 0.2,
-            maxTokens: 4096,
+            maxTokens: 8192,
             timeoutSec: AI_REQUEST_TIMEOUT_SEC,
         };
     }
@@ -1558,7 +1615,7 @@
         return String(payload?.error?.message || payload?.error || payload?.message || '').trim();
     }
 
-    async function stProxyChatStream(body, { timeoutSec = AI_REQUEST_TIMEOUT_SEC, signal = null, onUpdate = null } = {}) {
+    async function stProxyChatStream(body, { timeoutSec = AI_REQUEST_TIMEOUT_SEC, signal = null, onUpdate = null, onLimit = null } = {}) {
         const Controller = host.AbortController || globalThis.AbortController;
         const controller = typeof Controller === 'function' ? new Controller() : null;
         const timeoutMs = Math.max(10, Math.min(600, Number(timeoutSec) || AI_REQUEST_TIMEOUT_SEC)) * 1000;
@@ -1595,7 +1652,9 @@
             }
             const type = String(response.headers?.get?.('content-type') || '').toLowerCase();
             if (type.includes('application/json')) {
-                return apiOutputText(await response.json());
+                const payload = await response.json();
+                if (apiHitOutputLimit(payload)) onLimit?.();
+                return apiOutputText(payload);
             }
             if (!response.body?.getReader) {
                 const error = new Error('当前浏览器或接口没有提供可读取的流');
@@ -1621,6 +1680,7 @@
                 catch (_) { return; }
                 const detail = streamErrorMessage(payload);
                 if (payload?.error && detail) throw new Error(detail);
+                if (apiHitOutputLimit(payload)) onLimit?.();
                 const piece = chatStreamPiece(payload);
                 if (!piece) return;
                 receivedText = true;
@@ -1710,6 +1770,7 @@
             );
             if (typeof response !== 'function') {
                 options.onMode?.('running');
+                if (apiHitOutputLimit(response)) options.onLimit?.();
                 return apiOutputText(response);
             }
 
@@ -1762,6 +1823,7 @@
                         timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
                         signal: options.signal,
                         onUpdate: options.onUpdate,
+                        onLimit: options.onLimit,
                     });
                 } catch (error) {
                     if (!error?.streamFallbackAllowed || options.signal?.aborted) throw error;
@@ -1791,6 +1853,7 @@
                 signal: options.signal,
                 timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
             });
+            if (apiHitOutputLimit(output)) options.onLimit?.();
             return apiOutputText(output);
         }
         if (!channel.model) throw new Error('请先拉取并选择模型');
@@ -1801,7 +1864,7 @@
             model: channel.model,
             messages,
             temperature: Math.max(0, Math.min(2, Number(channel.temperature) || 0)),
-            max_tokens: Math.max(256, Math.min(32768, Number(channel.maxTokens) || 4096)),
+            max_tokens: Math.max(256, Math.min(32768, Number(channel.maxTokens) || 8192)),
             presence_penalty: 0,
             frequency_penalty: 0,
             stream: feature === 'theater' && options.streaming === true,
@@ -1814,6 +1877,7 @@
                     timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
                     signal: options.signal,
                     onUpdate: options.onUpdate,
+                    onLimit: options.onLimit,
                 });
             } catch (error) {
                 if (!error?.streamFallbackAllowed || options.signal?.aborted) throw error;
@@ -1828,6 +1892,7 @@
             timeoutSec: options.timeoutSec || AI_REQUEST_TIMEOUT_SEC,
             signal: options.signal,
         });
+        if (apiHitOutputLimit(json)) options.onLimit?.();
         return apiOutputText(json);
     }
 
@@ -2381,11 +2446,16 @@
     }
 
     function renderExportTab() {
-        const selectedTags = new Set(parseTags(ui.exportTags).map((tag) => tag.toLocaleLowerCase()));
-        const tagPicker = ui.exportTagPickerOpen ? `<div class="ctb-export-tag-picker">
-            <div class="ctb-export-tag-picker-head"><span>当前聊天中的成对标签</span><button type="button" class="ctb-button" data-action="close-export-tags">完成</button></div>
-            <div class="ctb-export-tag-options">${ui.exportTagOptions.length ? ui.exportTagOptions.map((item) => `<label class="ctb-export-tag-option"><input type="checkbox" data-export-tag="${escapeHTML(item.name)}"${selectedTags.has(item.name.toLocaleLowerCase()) ? ' checked' : ''}><span>${escapeHTML(item.name)}</span><small>${item.count} 处</small></label>`).join('') : '<div class="ctb-hint">当前聊天没有扫描到可提取的成对标签；仍可在上方手动填写。</div>'}</div>
-        </div>` : '';
+        const tagSelector = renderTagMultiSelector({
+            inputId: 'ctb-export-tags',
+            value: ui.exportTags,
+            placeholder: '例如 content, small_theater',
+            scanAction: 'scan-export-tags',
+            closeAction: 'close-export-tags',
+            dataAttribute: 'data-export-tag',
+            open: ui.exportTagPickerOpen,
+            options: ui.exportTagOptions,
+        });
         return `
             <section class="ctb-section">
                 <div class="ctb-section-title">导出文件名</div>
@@ -2397,8 +2467,7 @@
             </section>
             <section class="ctb-section">
                 <div class="ctb-section-title">正文标签提取 ${infoButton('export-tags')}</div>
-                <div class="ctb-export-tag-input"><input class="ctb-input" id="ctb-export-tags" placeholder="例如 content, small_theater" value="${escapeHTML(ui.exportTags)}"><button type="button" class="ctb-icon-button" data-action="scan-export-tags" title="扫描当前聊天中的标签" aria-label="扫描当前聊天中的标签"><i class="fa-solid fa-wand-magic-sparkles"></i></button></div>
-                ${tagPicker}
+                ${tagSelector}
                 <div class="ctb-option-grid">
                     <label class="ctb-check"><input id="ctb-export-clean" type="checkbox"${ui.exportClean ? ' checked' : ''}> 阅读模式（去标签）</label>
                     <label class="ctb-check"><input id="ctb-export-user" type="checkbox"${ui.exportIncludeUser ? ' checked' : ''}> 包含用户发言</label>
@@ -2433,7 +2502,7 @@
                 </div>
                 <div class="ctb-inline">
                     <label class="ctb-mini-field">温度 <input class="ctb-input" id="ctb-${feature}-channel-temperature" data-channel-id="${escapeHTML(editing.id)}" type="number" min="0" max="2" step="0.1" value="${escapeHTML(editing.temperature ?? 0.2)}"></label>
-                    <label class="ctb-mini-field">最大输出 <input class="ctb-input" id="ctb-${feature}-channel-tokens" data-channel-id="${escapeHTML(editing.id)}" type="number" min="256" step="256" value="${escapeHTML(editing.maxTokens || 4096)}"></label>
+                    <label class="ctb-mini-field">最大输出 <input class="ctb-input" id="ctb-${feature}-channel-tokens" data-channel-id="${escapeHTML(editing.id)}" type="number" min="256" max="32768" step="256" value="${escapeHTML(editing.maxTokens || 8192)}"></label>
                 </div>
                 <div class="ctb-channel-editor-actions"><button type="button" class="ctb-button ctb-primary" data-action="save-channel">保存渠道</button><button type="button" class="ctb-button" data-action="cancel-channel">取消</button>${editor.isNew ? '' : `<button type="button" class="ctb-button ctb-danger" data-action="delete-channel" data-channel-id="${escapeHTML(editing.id)}">删除渠道</button>`}</div>
             </div>` : '';
@@ -2629,6 +2698,9 @@
         const selected = new Set((settings.theater.nativePresetEntryIds || []).map(String));
         const options = ['<option value="">不使用酒馆原生预设</option>']
             .concat(theaterNativePresetNames.map((name) => `<option value="${escapeHTML(name)}"${name === theaterNativePresetName ? ' selected' : ''}>${escapeHTML(name)}</option>`)).join('');
+        const selectedCount = theaterNativePresetEntries.filter((entry) => !entry.marker && selected.has(String(entry.id))).length;
+        const summary = `<div class="ctb-world-picker-summary"><button type="button" class="ctb-button${theaterNativePresetName ? ' ctb-primary-soft' : ''}" data-action="toggle-theater-native-preset-picker"><i class="fa-solid fa-list-check"></i> 酒馆原生预设 <span data-theater-native-summary>${theaterNativePresetName ? `${escapeHTML(theaterNativePresetName)} · 已选 ${selectedCount} 条` : '未选择'}</span></button></div>`;
+        if (!theaterNativePresetPickerOpen) return summary;
         const list = theaterNativePresetLoading
             ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取预设…</div>'
             : theaterNativePresetError
@@ -2638,8 +2710,7 @@
                         ? `<div class="ctb-theater-native-entry is-marker${entry.enabled ? '' : ' is-disabled'}"><i class="fa-solid fa-code-branch"></i><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(theaterNativeMarkerLabel(entry.raw?.identifier, entry.name))}</small></span><em>${entry.enabled ? '占位' : '停用'}</em></div>`
                         : `<label class="ctb-theater-native-entry${selected.has(String(entry.id)) ? ' is-selected' : ''}"><input type="checkbox" data-theater-native-entry-id="${escapeHTML(entry.id)}"${selected.has(String(entry.id)) ? ' checked' : ''}><span><strong>${escapeHTML(entry.name)}</strong><small>${escapeHTML(entry.content.trim().replace(/\s+/g, ' ').slice(0, 140) || '（空条目）')}</small></span><em>${entry.enabled ? '启用' : '停用'}</em></label>`).join('')}</div>`
                     : '<div class="ctb-world-empty">选择一个预设后可勾选要带入小剧场的条目。</div>';
-        const selectedCount = theaterNativePresetEntries.filter((entry) => !entry.marker && selected.has(String(entry.id))).length;
-        return `<div class="ctb-theater-native-picker"><div class="ctb-inline ctb-theater-native-toolbar"><select class="ctb-input" id="ctb-theater-native-preset">${options}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-native-presets" title="刷新"><i class="fa-solid fa-rotate"></i></button>${theaterNativePresetName ? `<span class="ctb-selection-count" data-theater-native-selected-count>已选 ${selectedCount} 条</span><button type="button" class="ctb-button" data-action="select-theater-native-preset-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-native-preset">清空</button>` : ''}</div>${list}</div>`;
+        return `${summary}<div class="ctb-theater-native-picker"><div class="ctb-inline ctb-theater-native-toolbar"><select class="ctb-input" id="ctb-theater-native-preset">${options}</select><button type="button" class="ctb-icon-button" data-action="refresh-theater-native-presets" title="刷新"><i class="fa-solid fa-rotate"></i></button>${theaterNativePresetName ? `<span class="ctb-selection-count" data-theater-native-selected-count>已选 ${selectedCount} 条</span><button type="button" class="ctb-button" data-action="select-theater-native-preset-all">全选</button><button type="button" class="ctb-button" data-action="clear-theater-native-preset">清空</button>` : ''}<button type="button" class="ctb-button" data-action="close-theater-native-preset-picker">完成</button></div>${list}</div>`;
     }
 
     function theaterSelectedWorldKeys(selections = settings.theater?.worldEntries || []) {
@@ -2843,6 +2914,11 @@
             const visibleSelected = theaterNativePresetEntries.filter((entry) => !entry.marker && nativeSelected.has(String(entry.id))).length;
             nativeCount.textContent = `已选 ${visibleSelected} 条`;
         }
+        const nativeSummary = root.querySelector('[data-theater-native-summary]');
+        if (nativeSummary) {
+            const visibleSelected = theaterNativePresetEntries.filter((entry) => !entry.marker && nativeSelected.has(String(entry.id))).length;
+            nativeSummary.textContent = theaterNativePresetName ? `${theaterNativePresetName} · 已选 ${visibleSelected} 条` : '未选择';
+        }
 
         const worldSelected = theaterSelectedWorldKeys();
         root.querySelectorAll('[data-theater-world-entry-uid]').forEach((input) => {
@@ -3033,8 +3109,9 @@
         const system = theaterSystemPrompt(config);
         const request = prompt || '请根据以上设定与上下文，自行选择一个合适的片段生成小剧场。';
         return [
-            ...(system ? [{ role: 'system', content: system }] : []),
             ...layoutMessages,
+            // 最终输出约束放在请求前，避免被原生预设中较早的 system 条目冲淡。
+            ...(system ? [{ role: 'system', content: system }] : []),
             { role: 'user', content: request },
         ];
     }
@@ -3093,6 +3170,7 @@
 
     function theaterTaskStatusText(task) {
         if (task.cancelled || task.status === 'cancelling') return '正在取消…';
+        if (task.status === 'continuing') return '正在续写截断内容';
         if (task.status === 'connecting') return '正在连接流式响应';
         if (task.status === 'streaming') return '流式接收中';
         if (task.status === 'fallback') return '流式不可用，等待完整返回';
@@ -3125,24 +3203,20 @@
         updateTheaterTaskClocks();
     }
 
-    function runTheater() {
+    function startTheaterTask(snapshot) {
         if (theaterTasks.size >= THEATER_MAX_CONCURRENT) {
             return notify(`一次最多同时生成 ${THEATER_MAX_CONCURRENT} 个小剧场，请等待或取消一个任务`, 'warning');
         }
-        const channelId = String(settings.theater.channelId || 'main');
-        if (channelId !== 'main' && !selectedChannel('theater')) {
-            return notify('当前小剧场生成渠道不存在，请重新选择', 'warning');
-        }
         const Controller = host.AbortController || globalThis.AbortController;
-        const snapshot = theaterRequestSnapshot();
+        const continuing = Boolean(snapshot.continuationBaseOutput);
         const task = {
             id: `theater-task-${Date.now().toString(36)}-${(++theaterTaskSequence).toString(36)}`,
             number: theaterTaskSequence,
-            prompt: String(snapshot.prompt || ''),
+            prompt: continuing ? '继续生成当前结果' : String(snapshot.prompt || ''),
             startedAt: Date.now(),
             controller: typeof Controller === 'function' ? new Controller() : null,
             cancelled: false,
-            status: snapshot.streaming ? 'connecting' : 'running',
+            status: continuing ? 'continuing' : snapshot.streaming ? 'connecting' : 'running',
             output: '',
         };
         theaterTasks.set(task.id, task);
@@ -3151,14 +3225,64 @@
         void executeTheaterTask(task, snapshot);
     }
 
+    function runTheater() {
+        const channelId = String(settings.theater.channelId || 'main');
+        if (channelId !== 'main' && !selectedChannel('theater')) {
+            return notify('当前小剧场生成渠道不存在，请重新选择', 'warning');
+        }
+        return startTheaterTask(theaterRequestSnapshot());
+    }
+
+    function continueTheater() {
+        if (!theaterResult || !theaterCurrentRequestMessages.length || !theaterCurrentRequestSnapshot) {
+            return notify('当前结果没有可继续使用的原请求，请重新生成一次', 'warning');
+        }
+        const snapshot = deepClone(theaterCurrentRequestSnapshot);
+        snapshot.continuationBaseOutput = theaterResult;
+        snapshot.continuationMessages = deepClone(theaterCurrentRequestMessages);
+        snapshot.continuationTargetId = theaterCurrentId;
+        return startTheaterTask(snapshot);
+    }
+
+    function appendTheaterContinuation(base, addition) {
+        const before = String(base || '');
+        const after = String(addition || '');
+        if (!after.trim()) return before;
+        const limit = Math.min(4000, before.length, after.length);
+        for (let size = limit; size >= 24; size -= 1) {
+            if (before.slice(-size) === after.slice(0, size)) return `${before}${after.slice(size)}`;
+        }
+        return `${before}${after}`;
+    }
+
+    function theaterHtmlLooksIncomplete(value) {
+        const source = String(value || '');
+        const openingDivs = source.match(/<div\b[^>]*>/gi)?.length || 0;
+        if (!openingDivs) return false;
+        const closingDivs = source.match(/<\/div\s*>/gi)?.length || 0;
+        const fences = source.match(/```/g)?.length || 0;
+        return openingDivs > closingDivs || fences % 2 === 1;
+    }
+
     async function executeTheaterTask(task, snapshot) {
         try {
-            const messages = await buildTheaterMessages(snapshot);
+            const continuing = Boolean(snapshot.continuationBaseOutput);
+            const baseOutput = String(snapshot.continuationBaseOutput || '');
+            const baseMessages = Array.isArray(snapshot.continuationMessages)
+                ? snapshot.continuationMessages
+                : await buildTheaterMessages(snapshot);
+            const messages = continuing ? [
+                ...baseMessages,
+                { role: 'assistant', content: baseOutput },
+                { role: 'user', content: '上一条回复在输出途中结束。请从中断处直接继续，只输出尚未生成的部分；不要重复已有内容，不要解释，不要新建外层 <div>。' },
+            ] : baseMessages;
+            let hitOutputLimit = false;
             const output = await callAiText('theater', messages, {
                 channelOverride: snapshot.channelOverride,
                 signal: task.controller?.signal || null,
                 timeoutSec: AI_REQUEST_TIMEOUT_SEC,
                 streaming: snapshot.streaming === true,
+                onLimit: () => { hitOutputLimit = true; },
                 onMode: (mode) => {
                     if (task.cancelled) return;
                     task.status = mode;
@@ -3172,13 +3296,47 @@
                 },
             });
             if (task.cancelled) return;
-            theaterResult = String(output || '').trim();
+            theaterResult = continuing
+                ? appendTheaterContinuation(baseOutput, output)
+                : String(output || '').trim();
             if (!theaterResult) throw new Error('API 返回了空文本');
-            theaterCurrentId = `theater-result-${Date.now().toString(36)}`;
-            const item = { id: theaterCurrentId, prompt: task.prompt, output: theaterResult, time: new Date().toLocaleString() };
-            theaterHistory = [item, ...(theaterHistory || [])].slice(0, 20);
+            theaterResultMayBeTruncated = hitOutputLimit || theaterHtmlLooksIncomplete(theaterResult);
+            if (continuing) {
+                theaterCurrentId = String(snapshot.continuationTargetId || theaterCurrentId || `theater-result-${Date.now().toString(36)}`);
+                const recent = theaterHistory.find((item) => String(item.id) === theaterCurrentId);
+                if (recent) {
+                    recent.output = theaterResult;
+                    recent.time = new Date().toLocaleString();
+                } else {
+                    theaterHistory = [{
+                        id: theaterCurrentId,
+                        prompt: String(snapshot.prompt || ''),
+                        output: theaterResult,
+                        time: new Date().toLocaleString(),
+                    }, ...(theaterHistory || [])].slice(0, 20);
+                }
+                const favorite = theaterFavorites().find((item) => String(item.id) === theaterCurrentId);
+                if (favorite) {
+                    favorite.output = theaterResult;
+                    favorite.time = new Date().toLocaleString();
+                    saveSettings();
+                }
+                theaterCurrentRequestMessages = deepClone(baseMessages);
+                theaterCurrentRequestSnapshot = deepClone(snapshot);
+                delete theaterCurrentRequestSnapshot.continuationBaseOutput;
+                delete theaterCurrentRequestSnapshot.continuationMessages;
+                delete theaterCurrentRequestSnapshot.continuationTargetId;
+            } else {
+                theaterCurrentId = `theater-result-${Date.now().toString(36)}`;
+                const item = { id: theaterCurrentId, prompt: task.prompt, output: theaterResult, time: new Date().toLocaleString() };
+                theaterHistory = [item, ...(theaterHistory || [])].slice(0, 20);
+                theaterCurrentRequestMessages = deepClone(messages);
+                theaterCurrentRequestSnapshot = deepClone(snapshot);
+            }
             // 最近记录只存在当前页面会话；只有点击星标才写入插件设置。
-            notify(`小剧场任务 #${task.number} 生成完成；未收藏的记录会在刷新后清除`, 'success');
+            notify(theaterResultMayBeTruncated
+                ? `小剧场任务 #${task.number} 可能在输出上限处截断，可点击“继续生成”接着写`
+                : `小剧场任务 #${task.number} 生成完成；未收藏的记录会在刷新后清除`, theaterResultMayBeTruncated ? 'warning' : 'success');
         } catch (error) {
             if (task.cancelled || error?.name === 'AbortError') {
                 notify(`小剧场任务 #${task.number} 已取消`, 'info');
@@ -3257,7 +3415,7 @@
             const Parser = host.DOMParser || globalThis.DOMParser;
             if (typeof Parser !== 'function') throw new Error('当前浏览器不支持 HTML 解析');
             const parsed = new Parser().parseFromString(source, 'text/html');
-            parsed.querySelectorAll('script,link,iframe,object,embed,base,meta,form,input,button,select,textarea,dialog,audio,video,svg,math').forEach((node) => node.remove());
+            parsed.querySelectorAll('script,link,iframe,object,embed,base,meta,form,input,button,select,textarea,dialog,audio,video,svg,math,think,thinking,analysis,reasoning').forEach((node) => node.remove());
             parsed.querySelectorAll('*').forEach((node) => {
                 [...node.attributes].forEach((attribute) => {
                     const name = attribute.name.toLowerCase();
@@ -3284,6 +3442,15 @@
                     .replace(/url\(\s*[^)]*\)/gi, 'none')
                     .replace(/([^{}]+)\{/g, (match, selector) => `${selector.replace(/\b(?:html|body)\b|:root/gi, ':host')}{`);
             });
+            // 小剧场要求返回 HTML；丢弃模型偶尔夹在根元素前后的分析或说明文字。
+            [...parsed.body.childNodes].forEach((node) => {
+                if (node.nodeType === 3 && String(node.textContent || '').trim()) node.remove();
+            });
+            if ([...parsed.body.children].some((node) => node.tagName === 'DIV')) {
+                [...parsed.body.children].forEach((node) => {
+                    if (node.tagName !== 'DIV' && node.tagName !== 'STYLE') node.remove();
+                });
+            }
             const styles = [...parsed.head.querySelectorAll('style')].map((node) => node.outerHTML).join('');
             return { rich: true, html: `${styles}${parsed.body.innerHTML}` };
         } catch (_) {
@@ -3328,14 +3495,7 @@
     }
 
     function theaterPlainPreview(value, limit = 420) {
-        // Recent history is a navigation list, not the full reader.  Keeping
-        // it as escaped plain text avoids parsing and attaching a ShadowRoot
-        // for every long historical result on every panel repaint.
-        let text = String(value || '')
-            .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
-            .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
-            .replace(/<[^>]+>/g, ' ')
-            .replace(/&nbsp;/gi, ' ')
+        let text = theaterReadableText(value)
             .replace(/\s+/g, ' ')
             .trim();
         if (text.length > limit) text = `${text.slice(0, limit)}…`;
@@ -3428,6 +3588,16 @@
                 ? `跟随酒馆主接口：${streamChecked ? '已开启' : '已关闭'}`
                 : '当前主接口由酒馆返回完整结果'
             : customChannelSelected ? '接口不支持时自动回退完整返回' : '当前渠道不存在';
+        const contextTagSelector = renderTagMultiSelector({
+            inputId: 'ctb-theater-context-tags',
+            value: config.contextTags || '',
+            placeholder: '上下文标签，例如 content, options（留空=整层）',
+            scanAction: 'scan-theater-context-tags',
+            closeAction: 'close-theater-context-tags',
+            dataAttribute: 'data-theater-context-tag',
+            open: ui.theaterContextTagPickerOpen,
+            options: ui.theaterContextTagOptions,
+        });
         if (!theaterNativePresetLoadedOnce && !theaterNativePresetLoading) host.setTimeout(() => loadTheaterNativePresets(), 0);
         const presetOptions = ['<option value="">选择小剧场预设…</option>'].concat((config.presets || []).map((preset) => `<option value="${escapeHTML(preset.id)}"${config.selectedPresetId === preset.id ? ' selected' : ''}>${escapeHTML(preset.name)}</option>`)).join('');
         const recent = theaterHistory || [];
@@ -3452,9 +3622,9 @@
             <section class="ctb-section"><div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div><textarea class="ctb-input ctb-textarea ctb-system-prompt" id="ctb-theater-system" placeholder="控制小剧场的生成身份、边界与风格">${escapeHTML(theaterSystemPrompt(config))}</textarea></section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场预设</div><div class="ctb-inline ctb-preset-row"><select class="ctb-input" id="ctb-theater-preset">${presetOptions}</select><input class="ctb-input" id="ctb-theater-preset-name" placeholder="预设名称" value="${escapeHTML(config.presetName || '')}"><button type="button" class="ctb-button" data-action="save-theater-preset">保存</button><button type="button" class="ctb-button ctb-danger" data-action="delete-theater-preset"${config.selectedPresetId ? '' : ' disabled'}>删除</button></div></section>
             <section class="ctb-section"><div class="ctb-section-title">酒馆原生预设</div>${renderTheaterNativePresetPicker()}</section>
-            <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div><input class="ctb-input ctb-context-tags" id="ctb-theater-context-tags" placeholder="上下文标签筛选（留空=整层）" value="${escapeHTML(config.contextTags || '')}">${renderTheaterWorldPicker()}</section>
+            <section class="ctb-section"><div class="ctb-section-title">剧情与设定</div><div class="ctb-inline ctb-context-row"><label class="ctb-mini-field">最近楼层 <input class="ctb-input" id="ctb-theater-context-floors" type="number" min="0" max="50" value="${escapeHTML(config.contextFloors ?? 6)}"></label><label class="ctb-check"><input id="ctb-theater-character" type="checkbox"${config.includeCharacter !== false ? ' checked' : ''}> 角色卡</label><label class="ctb-check"><input id="ctb-theater-persona" type="checkbox"${config.includePersona !== false ? ' checked' : ''}> 用户设定</label></div>${contextTagSelector}${renderTheaterWorldPicker()}</section>
             <section class="ctb-section"><div class="ctb-section-title">小剧场请求</div><textarea class="ctb-input ctb-textarea ctb-theater-prompt" id="ctb-theater-prompt" placeholder="可留空；留空时会根据已选设定和上下文自动生成">${escapeHTML(config.prompt || '')}</textarea><div class="ctb-inline ctb-theater-actions"><button type="button" class="ctb-button ctb-primary" data-action="run-theater"${!channelReady || theaterTasks.size >= THEATER_MAX_CONCURRENT ? ' disabled' : ''} title="${channelReady ? '' : '请重新选择生成渠道'}"><i class="fa-solid fa-wand-magic-sparkles"></i> ${!channelReady ? '请选择生成渠道' : theaterTasks.size >= THEATER_MAX_CONCURRENT ? `已达上限（${THEATER_MAX_CONCURRENT}/${THEATER_MAX_CONCURRENT}）` : '生成小剧场'}</button><button type="button" class="ctb-button" data-action="preview-theater-prompt">预览发送内容</button></div>${renderTheaterTaskList()}</section>
-            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title">本次结果 · 正文字数 ${theaterOutputCharacterCount(theaterResult)} <button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
+            ${theaterResult ? `<section class="ctb-section"><div class="ctb-section-title"><span>本次结果 · 正文字数 ${theaterOutputCharacterCount(theaterResult)}</span><span class="ctb-inline">${theaterCurrentRequestMessages.length ? `<button type="button" class="ctb-button${theaterResultMayBeTruncated ? ' ctb-primary-soft' : ''}" data-action="continue-theater"${theaterTasks.size >= THEATER_MAX_CONCURRENT ? ' disabled' : ''}>${theaterResultMayBeTruncated ? '疑似截断 · 继续生成' : '继续生成'}</button>` : ''}<button type="button" class="ctb-review-expand" data-action="open-theater-current-reader" title="放大阅读"><i class="fa-solid fa-expand"></i></button></span></div><article class="ctb-theater-result">${theaterOutputSlot(theaterResult)}</article></section>` : ''}
             <section class="ctb-section"><div class="ctb-section-title">记录 <span>${theaterHistoryView === 'favorites' ? '收藏夹' : '本次会话'}</span></div>
                 <div class="ctb-inline ctb-theater-history-tabs"><button type="button" class="ctb-scope${theaterHistoryView === 'recent' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="recent">最近</button><button type="button" class="ctb-scope${theaterHistoryView === 'favorites' ? ' is-active' : ''}" data-action="set-theater-history-view" data-theater-view="favorites">★ 收藏夹</button></div>
                 <div class="ctb-theater-history-list" data-ctb-scroll-key="theater-history-list">${history || '<div class="ctb-results ctb-results-empty">这里还没有记录。</div>'}</div>
@@ -3479,6 +3649,9 @@
         settings.theater.prompt = item.prompt || '';
         theaterResult = item.output || '';
         theaterCurrentId = item.id;
+        theaterResultMayBeTruncated = false;
+        theaterCurrentRequestMessages = [];
+        theaterCurrentRequestSnapshot = null;
         renderPanel();
     }
 
@@ -3506,6 +3679,9 @@
             if (String(theaterCurrentId) === String(id)) {
                 theaterCurrentId = '';
                 theaterResult = '';
+                theaterResultMayBeTruncated = false;
+                theaterCurrentRequestMessages = [];
+                theaterCurrentRequestSnapshot = null;
             }
         }
         renderPanel();
@@ -5583,6 +5759,10 @@
             setExportTagSelected(target.dataset.exportTag, target.checked);
             return;
         }
+        else if (target.dataset.theaterContextTag !== undefined) {
+            setTheaterContextTagSelected(target.dataset.theaterContextTag, target.checked);
+            return;
+        }
         else if (target.dataset.theaterWorldEntryUid !== undefined) {
             setTheaterWorldEntrySelected(target.dataset.theaterWorldName, target.dataset.theaterWorldEntryUid, target.checked);
             return;
@@ -5793,6 +5973,8 @@
             case 'export-epub': return exportEPUB();
             case 'scan-export-tags': scanExportTags(); return renderPanel();
             case 'close-export-tags': ui.exportTagPickerOpen = false; return renderPanel();
+            case 'scan-theater-context-tags': scanTheaterContextTags(); return renderPanel();
+            case 'close-theater-context-tags': ui.theaterContextTagPickerOpen = false; return renderPanel();
             case 'add-channel': return beginNewChannel(data.feature);
             case 'edit-channel': return beginEditChannel(data.feature, data.channelId);
             case 'save-channel': return saveChannelEditor();
@@ -5837,12 +6019,18 @@
             case 'clear-theater-world-book': return setTheaterWorldBookSelection(false);
             case 'save-theater-world-preset': return saveTheaterWorldPreset();
             case 'delete-theater-world-preset': return deleteTheaterWorldPreset();
+            case 'toggle-theater-native-preset-picker':
+                theaterNativePresetPickerOpen = !theaterNativePresetPickerOpen;
+                if (theaterNativePresetPickerOpen && !theaterNativePresetLoadedOnce) return loadTheaterNativePresets();
+                return renderPanel();
+            case 'close-theater-native-preset-picker': theaterNativePresetPickerOpen = false; return renderPanel();
             case 'refresh-theater-native-presets': return loadTheaterNativePresets({ force: true });
             case 'select-theater-native-preset-all': return setTheaterNativePresetSelection(true);
             case 'clear-theater-native-preset': return setTheaterNativePresetSelection(false);
             case 'save-theater-preset': return saveTheaterPreset();
             case 'delete-theater-preset': return deleteTheaterPreset();
             case 'run-theater': return runTheater();
+            case 'continue-theater': return continueTheater();
             case 'cancel-theater-task': return cancelTheaterTask(data.theaterTaskId);
             case 'preview-theater-prompt': return previewTheaterPrompt();
             case 'close-theater-preview': theaterPromptPreview = null; return renderPanel();
