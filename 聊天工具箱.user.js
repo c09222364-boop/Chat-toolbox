@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.14
+// @version      1.0.15
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,18 +8,17 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.14';
-    const PREFIX = 'ctb-v090';
+    const VERSION = '1.0.15';
+    const PREFIX = 'chat-toolbox';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
     const FLOAT_ID = `${PREFIX}-float`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
     const SETTINGS_ID = `${PREFIX}-extension-settings`;
-    const INSTANCE_KEY = '__ChatToolbox_v090__';
-    const COMMAND_HANDLER_KEY = '__ChatToolboxCommandHandler_v090__';
-    const COMMAND_REGISTERED_KEY = '__ChatToolboxCommandRegistered_v090__';
-    const LEGACY_INSTANCE_KEYS = ['__ChatToolbox_v080__', '__ChatToolbox_v020__'];
-    const STORAGE_KEY = 'chat-toolbox-v020-settings';
+    const INSTANCE_KEY = '__ChatToolbox__';
+    const COMMAND_HANDLER_KEY = '__ChatToolboxCommandHandler__';
+    const COMMAND_REGISTERED_KEY = '__ChatToolboxCommandRegistered__';
+    const STORAGE_KEY = 'chat-toolbox-settings';
     const MAX_RESULTS = 2000;
     const THEATER_MAX_CONCURRENT = 3;
     const AI_REQUEST_TIMEOUT_SEC = 300;
@@ -33,11 +32,6 @@
         }
     } catch (_) {}
 
-    // 让从旧版脚本直接升级的用户不会同时留下旧的节点。
-    try { host.__ChatSearchReplace_v010__?.(); } catch (_) {}
-    for (const legacyKey of LEGACY_INSTANCE_KEYS) {
-        try { host[legacyKey]?.(); } catch (_) {}
-    }
     try { host[INSTANCE_KEY]?.(); } catch (_) {}
 
     let root = null;
@@ -170,7 +164,7 @@
         'post-edit-overview': '用于修订一个 AI 楼层的词句。生成后可以逐段审核，采用的内容才会写回聊天。',
         'post-edit-scope': '用于指定要修订的正文标签。填写 content 时，只处理 <content> 标签内的文字；留空则处理整条正文。',
         'channel-main': '选择“跟随酒馆主接口”会使用酒馆当前连接；选择自定义渠道则使用单独填写的地址、密钥和模型。',
-        'channel-custom': '用于选择小剧场的生成接口。跟随酒馆主接口会使用酒馆当前模型和流式设置；自定义渠道可单独设置模型、流式传输和最大输出，长篇内容可把最大输出设为 16384。',
+        'channel-custom': '用于选择小剧场的生成接口。跟随酒馆主接口会使用酒馆当前模型、流式设置和回复上限；自定义渠道则完全按照这里单独填写的设置发送。',
         'system-cache': '用于填写模型的身份、写作要求和输出格式。留空时使用默认提示词。',
         'theater-scope': '用于根据角色设定、世界书和最近聊天生成独立片段。结果只保存在工具箱中，不会加入聊天楼层。',
         'worldbook-save': '用于编辑世界书条目。修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
@@ -251,7 +245,6 @@
         const rawMaxTokens = Number(channel.maxTokens);
         const rawTimeout = Number(channel.timeoutSec);
         const model = String(channel.model || '');
-        const defaultMaxTokens = /(?:claude|anthropic)/i.test(model) ? 16384 : 8192;
         return {
             id: String(channel.id || `channel-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`),
             name: String(channel.name || '自定义渠道'),
@@ -260,12 +253,9 @@
             model,
             models: Array.isArray(channel.models) ? [...new Set(channel.models.map(String).filter(Boolean))] : [],
             temperature: Math.max(0, Math.min(2, Number(channel.temperature) || 0)),
-            // 65535 是旧版本的危险默认值，会让部分后端超时或拒绝请求。
-            // Claude 渠道曾默认只有 4096，长篇 HTML 很容易刚好在中途结束。
-            maxTokens: !Number.isFinite(rawMaxTokens) || rawMaxTokens <= 0 || rawMaxTokens >= 65535
-                || (rawMaxTokens === 4096 && /(?:claude|anthropic)/i.test(model))
-                ? defaultMaxTokens
-                : Math.max(256, Math.min(32768, Math.round(rawMaxTokens))),
+            maxTokens: !Number.isFinite(rawMaxTokens) || rawMaxTokens <= 0
+                ? 4096
+                : Math.round(rawMaxTokens),
             timeoutSec: !Number.isFinite(rawTimeout) || rawTimeout <= 0
                 ? AI_REQUEST_TIMEOUT_SEC
                 : Math.max(10, Math.min(600, Math.round(rawTimeout))),
@@ -311,34 +301,17 @@
             next.ai.channels = (Array.isArray(stored.ai?.channels) ? stored.ai.channels : [])
                 .map(normalizeSavedChannel)
                 .filter(Boolean);
-            if (!next.ai.channels.length && stored.postEdit?.endpoint) {
-                const legacyId = `legacy-${Date.now().toString(36)}`;
-                next.ai.channels.push(normalizeSavedChannel({
-                    id: legacyId,
-                    name: '原 API 设置',
-                    url: String(stored.postEdit.endpoint || ''),
-                    key: String(stored.postEdit.apiKey || ''),
-                    model: String(stored.postEdit.model || ''),
-                    models: [],
-                    temperature: Number(stored.postEdit.temperature) || 0.2,
-                    maxTokens: 4096,
-                    timeoutSec: AI_REQUEST_TIMEOUT_SEC,
-                }));
-            }
             const validChannel = (id) => id === 'main' || next.ai.channels.some((channel) => channel.id === id);
-            const postChannelId = String(stored.postEdit?.channelId || (stored.postEdit?.endpoint ? next.ai.channels[0]?.id : 'main'));
+            const postChannelId = String(stored.postEdit?.channelId || 'main');
             const theaterChannelId = String(stored.theater?.channelId || 'main');
             next.postEdit.channelId = validChannel(postChannelId) ? postChannelId : 'main';
             next.postEdit.systemPrompt = typeof stored.postEdit?.systemPrompt === 'string' ? stored.postEdit.systemPrompt : base.postEdit.systemPrompt;
             next.postEdit.rules = typeof stored.postEdit?.rules === 'string' ? stored.postEdit.rules : '';
             next.postEdit.presets = Array.isArray(stored.postEdit?.presets) ? stored.postEdit.presets : [];
             next.theater.channelId = validChannel(theaterChannelId) ? theaterChannelId : 'main';
-            const savedTheaterSystemPrompt = typeof stored.theater?.systemPrompt === 'string'
+            next.theater.systemPrompt = typeof stored.theater?.systemPrompt === 'string'
                 ? stored.theater.systemPrompt
                 : base.theater.systemPrompt;
-            next.theater.systemPrompt = isObsoleteTheaterSystemPrompt(savedTheaterSystemPrompt)
-                ? base.theater.systemPrompt
-                : savedTheaterSystemPrompt;
             next.theater.presets = Array.isArray(stored.theater?.presets) ? stored.theater.presets : [];
             next.theater.worldPresets = (Array.isArray(stored.theater?.worldPresets) ? stored.theater.worldPresets : [])
                 .map(normalizeTheaterWorldPreset)
@@ -411,14 +384,6 @@
 
     function defaultTheaterSystemPrompt() {
         return '你是一个创意生成引擎。只输出一个包含完整小剧场内容的有效 <div> HTML 片段，并使用内联 CSS；不要输出 Markdown 代码块、实现说明或 HTML 之外的文字。默认使用中文。';
-    }
-
-    function isObsoleteTheaterSystemPrompt(value) {
-        const prompt = String(value || '').trim();
-        if (prompt === '你是一个独立的小剧场生成器。只在插件内回答用户提出的 IF 线、角色想法或幕后片段，不创建新聊天楼层，不改变主线事实。请明确区分已知剧情与假设内容。') return true;
-        return prompt.startsWith('你是独立小剧场的导演与编剧。')
-            && prompt.includes('创作原则：')
-            && prompt.endsWith('不添加“分析”“说明”“小剧场请求”等元标签。');
     }
 
     function theaterSystemPrompt(config = settings.theater) {
@@ -777,7 +742,7 @@
                 updater(rawIndex, message, { rerenderMessage: true });
                 return true;
             } catch (error) {
-                console.warn('[聊天工具箱] 酒馆原生楼层重渲染失败，使用兼容渲染', error);
+                console.warn('[聊天工具箱] 酒馆原生楼层重渲染失败，使用备用渲染', error);
             }
         }
         const node = doc.querySelector(`.mes[mesid="${escapeCss(rawIndex)}"]`) || doc.querySelectorAll('.mes')[rawIndex];
@@ -1412,7 +1377,7 @@
             model: '',
             models: [],
             temperature: 0.2,
-            maxTokens: 8192,
+            maxTokens: 4096,
             timeoutSec: AI_REQUEST_TIMEOUT_SEC,
         };
     }
@@ -1493,6 +1458,34 @@
             return Boolean(chatSettings.stream_openai);
         }
         return Boolean(doc.querySelector('#stream_toggle')?.checked);
+    }
+
+    function mainInterfaceMaxOutputTokens() {
+        const context = getContext();
+        const chatSettings = context.chatCompletionSettings
+            || context.oaiSettings
+            || context.oai_settings
+            || host.oai_settings;
+        const candidates = [
+            chatSettings?.openai_max_tokens,
+            context.amountGen,
+            context.amount_gen,
+            host.amount_gen,
+            doc.querySelector('#openai_max_tokens')?.value,
+            doc.querySelector('#amount_gen')?.value,
+        ];
+        try {
+            const substitute = context.substituteParams || host.substituteParams;
+            if (typeof substitute === 'function') {
+                const resolved = String(substitute.call(context, '{{maxResponseTokens}}') || '').trim();
+                if (!resolved.includes('{{')) candidates.unshift(resolved);
+            }
+        } catch (_) {}
+        for (const value of candidates) {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed > 0) return Math.round(parsed);
+        }
+        return null;
     }
 
     function normalizeProxyUrl(value) {
@@ -1737,7 +1730,7 @@
             throw error;
         }
         if (typeof openai.sendOpenAIRequest !== 'function') {
-            const error = new Error('当前酒馆版本没有公开 Chat Completion 请求方法');
+            const error = new Error('酒馆没有提供可用的 Chat Completion 请求方法');
             error.streamFallbackAllowed = true;
             throw error;
         }
@@ -1831,7 +1824,7 @@
                     options.onMode?.('fallback');
                 }
             }
-            if (typeof generateRaw !== 'function') throw new Error('当前酒馆版本没有公开“跟随主接口”的生成方法，请添加自定义渠道');
+            if (typeof generateRaw !== 'function') throw new Error('酒馆没有提供可用的“跟随主接口”生成方法，请添加自定义渠道');
             // generateRaw's dedicated systemPrompt is always prepended. Move
             // only the first system message there; keep later system injections
             // inside the conversation so world-info depth/order is preserved.
@@ -1864,7 +1857,7 @@
             model: channel.model,
             messages,
             temperature: Math.max(0, Math.min(2, Number(channel.temperature) || 0)),
-            max_tokens: Math.max(256, Math.min(32768, Number(channel.maxTokens) || 8192)),
+            max_tokens: Math.max(1, Math.round(Number(channel.maxTokens) || 4096)),
             presence_penalty: 0,
             frequency_penalty: 0,
             stream: feature === 'theater' && options.streaming === true,
@@ -2351,7 +2344,7 @@
         renderPanel();
     }
 
-    function discardWorldbookChangesV2() {
+    function discardWorldbookChanges() {
         // All worldbook writes are staged until this close/save checkpoint.
         // Discarding therefore only resets local memory; the server document
         // remains untouched, including pending documents from other books.
@@ -2384,9 +2377,9 @@
                 const saved = await saveCurrentWorldbook();
                 if (!saved) return;
             }
-            if (!(await savePendingWorldbooksV2())) return;
+            if (!(await savePendingWorldbooks())) return;
         }
-        if (discarded) discardWorldbookChangesV2();
+        if (discarded) discardWorldbookChanges();
         infoMessage = null;
         transientNotice = null;
         pendingConfirm = null;
@@ -2502,7 +2495,7 @@
                 </div>
                 <div class="ctb-inline">
                     <label class="ctb-mini-field">温度 <input class="ctb-input" id="ctb-${feature}-channel-temperature" data-channel-id="${escapeHTML(editing.id)}" type="number" min="0" max="2" step="0.1" value="${escapeHTML(editing.temperature ?? 0.2)}"></label>
-                    <label class="ctb-mini-field">最大输出 <input class="ctb-input" id="ctb-${feature}-channel-tokens" data-channel-id="${escapeHTML(editing.id)}" type="number" min="256" max="32768" step="256" value="${escapeHTML(editing.maxTokens || 8192)}"></label>
+                    <label class="ctb-mini-field">最大输出 <input class="ctb-input" id="ctb-${feature}-channel-tokens" data-channel-id="${escapeHTML(editing.id)}" type="number" min="1" step="1" value="${escapeHTML(editing.maxTokens || 4096)}"></label>
                 </div>
                 <div class="ctb-channel-editor-actions"><button type="button" class="ctb-button ctb-primary" data-action="save-channel">保存渠道</button><button type="button" class="ctb-button" data-action="cancel-channel">取消</button>${editor.isNew ? '' : `<button type="button" class="ctb-button ctb-danger" data-action="delete-channel" data-channel-id="${escapeHTML(editing.id)}">删除渠道</button>`}</div>
             </div>` : '';
@@ -2880,13 +2873,13 @@
         // then by depth (for @D), then by insertion Order.  Sorting globally
         // here prevents multi-book checkbox order from changing the prompt.
         return output.sort((a, b) => {
-            const positionCompare = worldbookPositionV2(a.raw) - worldbookPositionV2(b.raw);
+            const positionCompare = worldbookPosition(a.raw) - worldbookPosition(b.raw);
             if (positionCompare) return positionCompare;
-            if (worldbookPositionV2(a.raw) === 4) {
-                const depthCompare = worldbookDepthV2(b.raw) - worldbookDepthV2(a.raw);
+            if (worldbookPosition(a.raw) === 4) {
+                const depthCompare = worldbookDepth(b.raw) - worldbookDepth(a.raw);
                 if (depthCompare) return depthCompare;
             }
-            return worldbookOrderV2(a.raw) - worldbookOrderV2(b.raw)
+            return worldbookOrder(a.raw) - worldbookOrder(b.raw)
                 || a.bookIndex - b.bookIndex
                 || a.entryIndex - b.entryIndex;
         });
@@ -2953,7 +2946,7 @@
     }
 
     function theaterWorldMessage(entry) {
-        const position = worldbookPositionV2(entry?.raw);
+        const position = worldbookPosition(entry?.raw);
         return {
             role: position === 4 ? theaterMessageRole(entry?.raw?.role) : 'system',
             content: theaterSubstituteText(entry.content.trim()),
@@ -3012,7 +3005,7 @@
     function insertTheaterDepthMessages(history, entries) {
         const slots = new Map();
         for (const entry of entries) {
-            const depth = Math.max(0, Math.floor(worldbookDepthV2(entry.raw)));
+            const depth = Math.max(0, Math.floor(worldbookDepth(entry.raw)));
             // ST depth 0 is after the newest history message; depth 1 is
             // immediately before it.  The final theater request stays last.
             const slot = Math.max(0, history.length - depth);
@@ -3081,7 +3074,7 @@
         const nativeLayout = await collectTheaterNativePresetEntries(config);
         const worldEntries = await collectTheaterWorldEntries(normalizeWorldEntrySelections(config.worldEntries));
         const character = theaterCharacterContext(config);
-        const worldAt = (position) => worldEntries.filter((entry) => worldbookPositionV2(entry.raw) === position);
+        const worldAt = (position) => worldEntries.filter((entry) => worldbookPosition(entry.raw) === position);
         const worldMessagesAt = (position) => worldAt(position).map(theaterWorldMessage);
         const historyWithDepth = insertTheaterDepthMessages(history, worldAt(4));
         const markerMessages = new Map([
@@ -3415,7 +3408,7 @@
             const Parser = host.DOMParser || globalThis.DOMParser;
             if (typeof Parser !== 'function') throw new Error('当前浏览器不支持 HTML 解析');
             const parsed = new Parser().parseFromString(source, 'text/html');
-            parsed.querySelectorAll('script,link,iframe,object,embed,base,meta,form,input,button,select,textarea,dialog,audio,video,svg,math,think,thinking,analysis,reasoning').forEach((node) => node.remove());
+            parsed.querySelectorAll('script,link,iframe,object,embed,base,meta,form,input,button,select,textarea,dialog,audio,video,svg,math').forEach((node) => node.remove());
             parsed.querySelectorAll('*').forEach((node) => {
                 [...node.attributes].forEach((attribute) => {
                     const name = attribute.name.toLowerCase();
@@ -3442,15 +3435,6 @@
                     .replace(/url\(\s*[^)]*\)/gi, 'none')
                     .replace(/([^{}]+)\{/g, (match, selector) => `${selector.replace(/\b(?:html|body)\b|:root/gi, ':host')}{`);
             });
-            // 小剧场要求返回 HTML；丢弃模型偶尔夹在根元素前后的分析或说明文字。
-            [...parsed.body.childNodes].forEach((node) => {
-                if (node.nodeType === 3 && String(node.textContent || '').trim()) node.remove();
-            });
-            if ([...parsed.body.children].some((node) => node.tagName === 'DIV')) {
-                [...parsed.body.children].forEach((node) => {
-                    if (node.tagName !== 'DIV' && node.tagName !== 'STYLE') node.remove();
-                });
-            }
             const styles = [...parsed.head.querySelectorAll('style')].map((node) => node.outerHTML).join('');
             return { rich: true, html: `${styles}${parsed.body.innerHTML}` };
         } catch (_) {
@@ -3583,10 +3567,12 @@
         const customChannelSelected = Boolean(selectedChannel('theater'));
         const channelReady = followsMain || customChannelSelected;
         const streamChecked = followsMain ? mainInterfaceStreamingEnabled() : config.streaming === true;
+        const mainMaxOutput = followsMain ? mainInterfaceMaxOutputTokens() : null;
+        const mainLimitHint = mainMaxOutput ? `回复上限 ${mainMaxOutput} tokens` : '回复上限由酒馆当前连接决定';
         const streamHint = followsMain
             ? mainInterfaceApi() === 'openai'
-                ? `跟随酒馆主接口：${streamChecked ? '已开启' : '已关闭'}`
-                : '当前主接口由酒馆返回完整结果'
+                ? `跟随酒馆主接口：${streamChecked ? '已开启' : '已关闭'} · ${mainLimitHint}`
+                : `当前主接口由酒馆返回完整结果 · ${mainLimitHint}`
             : customChannelSelected ? '接口不支持时自动回退完整返回' : '当前渠道不存在';
         const contextTagSelector = renderTagMultiSelector({
             inputId: 'ctb-theater-context-tags',
@@ -3743,7 +3729,7 @@
         const refreshList = normalized.refreshList === true;
         const verifyAfterSave = normalized.verify === true;
         const context = getContext();
-        if (typeof context.saveWorldInfo !== 'function') throw new Error('当前酒馆版本没有公开世界书保存接口');
+        if (typeof context.saveWorldInfo !== 'function') throw new Error('酒馆没有提供可用的世界书保存接口');
         const saved = await context.saveWorldInfo(name, deepClone(data), Boolean(immediate));
         if (refreshList) {
             try { await context.updateWorldInfoList?.(); } catch (_) {}
@@ -3768,7 +3754,7 @@
     }
 
     /* Worldbook manager: numeric UID and native send order. */
-    const WORLDBOOK_POSITIONS_V2 = Object.freeze([
+    const WORLDBOOK_POSITIONS = Object.freeze([
         { value: 0, label: '角色定义前' },
         { value: 1, label: '角色定义后' },
         { value: 2, label: '作者注释前' },
@@ -3779,18 +3765,18 @@
         { value: 7, label: '命名出口' },
     ]);
 
-    function worldbookIntegerV2(value, fallback = 0) {
+    function worldbookInteger(value, fallback = 0) {
         const number = Number(value);
         return Number.isSafeInteger(number) && number >= 0 ? number : fallback;
     }
 
-    function worldbookDisplayIndexV2(raw, fallback) {
+    function worldbookDisplayIndex(raw, fallback) {
         const candidates = [raw?.displayIndex, raw?.extensions?.displayIndex, raw?.extensions?.display_index];
         const value = candidates.find((candidate) => Number.isFinite(Number(candidate)));
         return value === undefined ? fallback : Number(value);
     }
 
-    async function loadFreshWorldInfoDocumentV2(name) {
+    async function loadFreshWorldInfoDocument(name) {
         try {
             return deepClone(await stProxyJson('/api/worldinfo/get', { name }));
         } catch (_) {
@@ -3820,13 +3806,11 @@
                 ? candidate
                 : allocate();
             claimed.add(uid);
-            // ST stores these two flags in `extensions` on some versions and
-            // at the top level on others.  Hydrate both shapes so the editor
-            // and the save serializer remain version-compatible.
+            // 酒馆可能把递归字段放在顶层或 extensions 中，读取后统一到编辑模型。
             if (value.excludeRecursion === undefined) value.excludeRecursion = Boolean(value.extensions?.exclude_recursion);
             if (value.preventRecursion === undefined) value.preventRecursion = Boolean(value.extensions?.prevent_recursion);
             value.uid = uid;
-            const displayIndex = worldbookDisplayIndexV2(value, index);
+            const displayIndex = worldbookDisplayIndex(value, index);
             value.displayIndex = displayIndex;
             return { uid: String(uid), raw: value, displayIndex };
         });
@@ -3836,10 +3820,10 @@
         const entries = {};
         for (const record of records || []) {
             const raw = deepClone(record?.raw || {});
-            const uid = worldbookIntegerV2(raw.uid ?? record?.uid, 0);
+            const uid = worldbookInteger(raw.uid ?? record?.uid, 0);
             const displayIndex = Number.isFinite(Number(record?.displayIndex))
                 ? Number(record.displayIndex)
-                : worldbookDisplayIndexV2(raw, 0);
+                : worldbookDisplayIndex(raw, 0);
             raw.uid = uid;
             raw.displayIndex = displayIndex;
             if (raw.extensions && typeof raw.extensions === 'object') {
@@ -3862,7 +3846,7 @@
         return String(raw.comment || raw.name || keys || `条目 ${record?.uid || ''}`);
     }
 
-    function worldbookWordCountV2(record) {
+    function worldbookWordCount(record) {
         const content = String(record?.raw?.content || '');
         return Array.from(content.replace(/\s/g, '')).length;
     }
@@ -3890,22 +3874,22 @@
     // order within each position is Order ascending. Depth/chat interleaving
     // is intentionally not flattened here; only worldbook-internal order is
     // represented. UID is only a deterministic tie-breaker for equal Order.
-    function worldbookPositionV2(raw) {
+    function worldbookPosition(raw) {
         const value = Number(raw?.position);
         return Number.isInteger(value) && value >= 0 && value <= 7 ? value : 1;
     }
 
-    function worldbookOrderV2(raw) {
+    function worldbookOrder(raw) {
         const value = Number(raw?.order);
         return Number.isFinite(value) ? value : 0;
     }
 
-    function worldbookDepthV2(raw) {
+    function worldbookDepth(raw) {
         const value = Number(raw?.depth);
         return Number.isFinite(value) ? value : 4;
     }
 
-    function worldbookGroupKeyV2(record) {
+    function worldbookGroupKey(record) {
         const position = Number.isInteger(Number(record?.raw?.position)) ? Number(record.raw.position) : 1;
         return position === 4 ? `position-${position}-depth-${Number(record?.raw?.depth ?? 4)}` : `position-${position}`;
     }
@@ -3913,22 +3897,22 @@
     function sortWorldbookRecords(records) {
         const list = Array.isArray(records) ? records.slice() : [];
         return list.sort((a, b) => {
-            const positionCompare = worldbookPositionV2(a.raw) - worldbookPositionV2(b.raw);
+            const positionCompare = worldbookPosition(a.raw) - worldbookPosition(b.raw);
             if (positionCompare) return positionCompare;
             // At-depth entries are placed by chat depth first.  Larger depth
             // means an earlier position in the prompt history; Order only
             // controls entries sharing that same depth.
-            if (worldbookPositionV2(a.raw) === 4) {
-                const depthCompare = worldbookDepthV2(b.raw) - worldbookDepthV2(a.raw);
+            if (worldbookPosition(a.raw) === 4) {
+                const depthCompare = worldbookDepth(b.raw) - worldbookDepth(a.raw);
                 if (depthCompare) return depthCompare;
             }
-            return worldbookOrderV2(a.raw) - worldbookOrderV2(b.raw)
+            return worldbookOrder(a.raw) - worldbookOrder(b.raw)
                 || worldbookUidNumber(a) - worldbookUidNumber(b)
                 || Number(a.displayIndex ?? 0) - Number(b.displayIndex ?? 0);
         });
     }
 
-    function normalizeWorldbookDisplayIndexesV2(records) {
+    function normalizeWorldbookDisplayIndexes(records) {
         const ordered = (Array.isArray(records) ? records.slice() : []).sort((a, b) => Number(a.displayIndex ?? 0) - Number(b.displayIndex ?? 0)
             || worldbookUidNumber(a) - worldbookUidNumber(b));
         ordered.forEach((record, index) => {
@@ -3947,7 +3931,7 @@
         return sortWorldbookRecords(worldbookEntries);
     }
 
-    function markWorldbookDirtyV2() {
+    function markWorldbookDirty() {
         worldbookDirty = true;
         if (worldbookBook) {
             worldbookPendingDocuments.set(worldbookBook, {
@@ -3957,7 +3941,7 @@
         }
     }
 
-    function markWorldbookDraftDirtyV2() {
+    function markWorldbookDraftDirty() {
         worldbookDraftDirty = true;
         if (!root) return;
         const draftStatus = root.querySelector('[data-worldbook-draft-status]');
@@ -3993,7 +3977,7 @@
                 worldbookDocument = pendingDocument
                     ? deepClone(pendingDocument)
                     : (force
-                        ? await loadFreshWorldInfoDocumentV2(worldbookBook)
+                        ? await loadFreshWorldInfoDocument(worldbookBook)
                         : await loadWorldInfoDocument(worldbookBook));
                 worldbookEntries = sortWorldbookRecords(worldbookRecords(worldbookDocument));
             } else {
@@ -4017,13 +4001,13 @@
         }
     }
 
-    function canDiscardWorldbookChangesV2() {
+    function canDiscardWorldbookChanges() {
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         return true;
     }
 
     async function chooseWorldbook(name) {
-        if (!canDiscardWorldbookChangesV2()) return renderPanel();
+        if (!canDiscardWorldbookChanges()) return renderPanel();
         return loadWorldbookManager({ force: false, book: name });
     }
 
@@ -4050,7 +4034,7 @@
         editWorldbookEntry(id);
     }
 
-    function discardWorldbookDraftV2() {
+    function discardWorldbookDraft() {
         if (!worldbookEditingUid) return;
         const record = worldbookEntries.find((item) => item.uid === String(worldbookEditingUid));
         worldbookDraft = record ? deepClone(record.raw) : null;
@@ -4062,19 +4046,17 @@
         if (!worldbookDraft || !worldbookEditingUid) return false;
         const record = worldbookEntries.find((item) => item.uid === String(worldbookEditingUid));
         if (!record) return false;
-        const uid = worldbookIntegerV2(record.raw?.uid ?? record.uid, 0);
+        const uid = worldbookInteger(record.raw?.uid ?? record.uid, 0);
         record.raw = deepClone(worldbookDraft);
         record.raw.uid = uid;
-        // The compact editor no longer exposes the legacy Selective checkbox:
-        // entering secondary keywords is the visible signal that their logic
-        // should participate in matching.
+        // 有次要关键词时启用次要关键词匹配。
         record.raw.selective = Array.isArray(record.raw.keysecondary) && record.raw.keysecondary.length > 0;
         record.raw.selectiveLogic = [0, 1, 2, 3].includes(Number(record.raw.selectiveLogic)) ? Number(record.raw.selectiveLogic) : 0;
         record.uid = String(uid);
-        record.displayIndex = worldbookDisplayIndexV2(record.raw, record.displayIndex ?? 0);
+        record.displayIndex = worldbookDisplayIndex(record.raw, record.displayIndex ?? 0);
         worldbookDraft = deepClone(record.raw);
         worldbookDraftDirty = false;
-        markWorldbookDirtyV2();
+        markWorldbookDirty();
         if (!quiet) {
             renderPanel();
             notify('条目修改已暂存；请点击“保存世界书”写入文件', 'success');
@@ -4087,7 +4069,7 @@
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         const used = new Set(worldbookEntries.map((record) => worldbookUidNumber(record)).filter((value) => Number.isSafeInteger(value)));
         const uid = nextWorldbookUid(used);
-        normalizeWorldbookDisplayIndexesV2(worldbookEntries);
+        normalizeWorldbookDisplayIndexes(worldbookEntries);
         const displayIndex = worldbookEntries.length;
         const raw = {
             uid, comment: '新条目', key: [], keysecondary: [], content: '',
@@ -4097,14 +4079,14 @@
             excludeRecursion: false, preventRecursion: false, displayIndex,
         };
         const maxOrder = worldbookEntries
-            .filter((record) => worldbookGroupKeyV2(record) === worldbookGroupKeyV2({ raw }))
+            .filter((record) => worldbookGroupKey(record) === worldbookGroupKey({ raw }))
             .reduce((max, record) => Math.max(max, Number(record.raw?.order) || 0), 0);
         raw.order = maxOrder + 1;
         worldbookEntries.push({ uid: String(uid), raw, displayIndex });
         worldbookEditingUid = String(uid);
         worldbookDraft = deepClone(raw);
         worldbookDraftDirty = false;
-        markWorldbookDirtyV2();
+        markWorldbookDirty();
         renderPanel();
     }
 
@@ -4139,7 +4121,7 @@
         }
     }
 
-    async function savePendingWorldbooksV2() {
+    async function savePendingWorldbooks() {
         const pending = [...worldbookPendingDocuments.entries()]
             .filter(([name]) => String(name) !== String(worldbookBook));
         for (const [name, document] of pending) {
@@ -4155,7 +4137,7 @@
     }
 
     async function createWorldbookBook() {
-        if ((worldbookDraftDirty || worldbookDirty) && !canDiscardWorldbookChangesV2()) return;
+        if ((worldbookDraftDirty || worldbookDirty) && !canDiscardWorldbookChanges()) return;
         const name = String(host.prompt('新世界书名称：') || '').trim();
         if (!name) return;
         if (worldbookBooks.includes(name)) return notify('已经存在同名世界书', 'warning');
@@ -4215,14 +4197,14 @@
         }
         if (worldbookDraftDirty && !ids.includes(String(worldbookEditingUid))) applyWorldbookDraft({ quiet: true });
         worldbookEntries = worldbookEntries.filter((record) => !worldbookSelected.has(record.uid));
-        normalizeWorldbookDisplayIndexesV2(worldbookEntries);
+        normalizeWorldbookDisplayIndexes(worldbookEntries);
         worldbookSelected = new Set();
         if (ids.includes(String(worldbookEditingUid))) {
             worldbookEditingUid = '';
             worldbookDraft = null;
             worldbookDraftDirty = false;
         }
-        markWorldbookDirtyV2();
+        markWorldbookDirty();
         renderPanel();
         notify(`已暂存删除 ${ids.length} 个条目；关闭世界书管理时再统一保存`, 'success');
     }
@@ -4235,7 +4217,7 @@
         return uid;
     }
 
-    function copySelectedWorldbookEntriesV2() {
+    function copySelectedWorldbookEntries() {
         if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         const selected = currentWorldbookView().filter((record) => worldbookSelected.has(record.uid));
@@ -4254,12 +4236,12 @@
             copiedIds.push(String(uid));
         });
         worldbookSelected = new Set(copiedIds);
-        markWorldbookDirtyV2();
+        markWorldbookDirty();
         renderPanel();
         notify(`已在当前世界书复制 ${copiedIds.length} 个条目；深度、优先级、位置等设置均已保留`, 'success');
     }
 
-    async function copySelectedWorldbookEntriesToBookV2() {
+    async function copySelectedWorldbookEntriesToBook() {
         if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         const target = String(worldbookCopyTarget || '').trim();
@@ -4267,7 +4249,7 @@
         const selected = currentWorldbookView().filter((record) => worldbookSelected.has(record.uid));
         if (!selected.length) return notify('请先勾选要复制的条目', 'warning');
         try {
-            const document = await loadFreshWorldInfoDocumentV2(target);
+            const document = await loadFreshWorldInfoDocument(target);
             const records = worldbookRecords(document);
             const used = new Set(records.map((record) => worldbookUidNumber(record)));
             let displayIndex = records.reduce((max, record) => Math.max(max, Number(record.displayIndex) || 0), -1) + 1;
@@ -4293,23 +4275,23 @@
         }
     }
 
-    function mutateWorldbookEntryV2(uid, mutate) {
+    function mutateWorldbookEntry(uid, mutate) {
         const id = String(uid || '');
         const record = worldbookEntries.find((item) => item.uid === id);
         if (!record || typeof mutate !== 'function') return false;
         if (id === String(worldbookEditingUid) && worldbookDraft) {
             mutate(worldbookDraft);
-            markWorldbookDraftDirtyV2();
+            markWorldbookDraftDirty();
         } else {
             mutate(record.raw);
-            markWorldbookDirtyV2();
+            markWorldbookDirty();
         }
         renderPanel();
         return true;
     }
 
-    function cycleWorldbookLightV2(uid) {
-        return mutateWorldbookEntryV2(uid, (raw) => {
+    function cycleWorldbookLight(uid) {
+        return mutateWorldbookEntry(uid, (raw) => {
             // Keep the two row controls independent: this button changes only
             // the light type, while the adjacent power button owns disable.
             // A closed entry can therefore retain/select its preferred light
@@ -4318,11 +4300,11 @@
         });
     }
 
-    function toggleWorldbookEnabledV2(uid) {
-        return mutateWorldbookEntryV2(uid, (raw) => { raw.disable = !raw.disable; });
+    function toggleWorldbookEnabled(uid) {
+        return mutateWorldbookEntry(uid, (raw) => { raw.disable = !raw.disable; });
     }
 
-    function setWorldbookRecursionFlagsV2(raw, enabled = true) {
+    function setWorldbookRecursionFlags(raw, enabled = true) {
         if (!raw || typeof raw !== 'object') return;
         raw.excludeRecursion = Boolean(enabled);
         raw.preventRecursion = Boolean(enabled);
@@ -4331,23 +4313,23 @@
         raw.extensions.prevent_recursion = Boolean(enabled);
     }
 
-    function enableCurrentWorldbookRecursionGuardsV2() {
+    function enableCurrentWorldbookRecursionGuards() {
         if (!worldbookDraft || !worldbookEditingUid) return;
-        setWorldbookRecursionFlagsV2(worldbookDraft, true);
-        markWorldbookDraftDirtyV2();
+        setWorldbookRecursionFlags(worldbookDraft, true);
+        markWorldbookDraftDirty();
         renderPanel();
     }
 
-    function enableSelectedWorldbookRecursionGuardsV2() {
+    function enableSelectedWorldbookRecursionGuards() {
         if (!worldbookSelected.size) return notify('请先勾选要处理的世界书条目', 'warning');
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         let count = 0;
         worldbookEntries.forEach((record) => {
             if (!worldbookSelected.has(record.uid)) return;
-            setWorldbookRecursionFlagsV2(record.raw, true);
+            setWorldbookRecursionFlags(record.raw, true);
             count += 1;
         });
-        if (count) markWorldbookDirtyV2();
+        if (count) markWorldbookDirty();
         if (worldbookEditingUid) {
             const record = worldbookEntries.find((item) => item.uid === String(worldbookEditingUid));
             if (record) worldbookDraft = deepClone(record.raw);
@@ -4356,13 +4338,13 @@
         notify(`已为 ${count} 个条目开启“不可递归 + 阻止进一步递归”，关闭工具箱时统一保存`, 'success');
     }
 
-    function toggleWorldbookBatchModeV2() {
+    function toggleWorldbookBatchMode() {
         worldbookBatchMode = !worldbookBatchMode;
         if (!worldbookBatchMode) worldbookSelected = new Set();
         renderPanel();
     }
 
-    function setWorldbookSelectionV2(mode) {
+    function setWorldbookSelection(mode) {
         const visible = currentWorldbookView().filter((record) => {
             const query = worldbookSearch.trim().toLowerCase();
             return !query || worldbookRecordSearchText(record).includes(query);
@@ -4372,9 +4354,9 @@
         renderPanel();
     }
 
-    function renderWorldbookInlineEditorV2(record) {
+    function renderWorldbookInlineEditor(record) {
         const draft = worldbookDraft || record.raw || {};
-        const positionItems = WORLDBOOK_POSITIONS_V2.filter((item) => item.value !== 7);
+        const positionItems = WORLDBOOK_POSITIONS.filter((item) => item.value !== 7);
         if (Number(draft.position) === 7) positionItems.push({ value: 7, label: '命名出口（保留现有设置）' });
         const positionOptions = positionItems.map((item) => `<option value="${item.value}"${Number(draft.position ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
         const logicOptions = [
@@ -4409,7 +4391,7 @@
         </div>`;
     }
 
-    function renderWorldbookRowsV2(records) {
+    function renderWorldbookRows(records) {
         return records.map((record) => {
             const expanded = record.uid === String(worldbookEditingUid) && !!worldbookDraft;
             const raw = expanded ? worldbookDraft : (record.raw || {});
@@ -4427,14 +4409,14 @@
                     <div class="ctb-worldbook-status-controls" aria-label="条目状态">
                         <button type="button" class="ctb-worldbook-enabled-button${raw.disable ? ' is-off' : ' is-on'}" data-action="toggle-worldbook-enabled" data-worldbook-uid="${escapeHTML(record.uid)}" title="${escapeHTML(enabledTitle)}" aria-label="${escapeHTML(enabledTitle)}"><span class="ctb-worldbook-power-track" aria-hidden="true"></span></button>
                         <button type="button" class="ctb-worldbook-light-button ${lightClass}${raw.disable ? ' is-off' : ''}" data-action="cycle-worldbook-light" data-worldbook-uid="${escapeHTML(record.uid)}" title="${escapeHTML(lightTitle)}" aria-label="${escapeHTML(lightTitle)}"><span class="ctb-worldbook-light-dot" aria-hidden="true"></span></button>
-                        <span class="ctb-worldbook-word-count" title="正文字符数">${worldbookWordCountV2(record)} 字</span>
+                        <span class="ctb-worldbook-word-count" title="正文字符数">${worldbookWordCount(record)} 字</span>
                     </div>
                     <button type="button" class="ctb-worldbook-entry-toggle" data-action="toggle-worldbook-entry" data-worldbook-uid="${escapeHTML(record.uid)}" aria-expanded="${expanded ? 'true' : 'false'}">
                         <span class="ctb-worldbook-entry-main"><strong>${escapeHTML(worldbookRecordLabel(record))}</strong></span>
                         <span class="ctb-worldbook-chevron" aria-hidden="true"><svg viewBox="0 0 16 16" focusable="false"><path d="M3.5 6 8 10.5 12.5 6"></path></svg></span>
                     </button>
                 </div>
-                ${expanded ? renderWorldbookInlineEditorV2(record) : ''}
+                ${expanded ? renderWorldbookInlineEditor(record) : ''}
             </article>`;
         }).join('');
     }
@@ -4448,7 +4430,7 @@
         const list = worldbookLoading
             ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取世界书…</div>'
             : filtered.length
-                ? `<div class="ctb-manager-list" data-ctb-scroll-key="worldbook-list">${renderWorldbookRowsV2(visible)}${filtered.length > visible.length ? `<button type="button" class="ctb-list-more" data-action="more-worldbook-entries">再显示 ${Math.min(120, filtered.length - visible.length)} 条（共 ${filtered.length} 条）</button>` : ''}</div>`
+                ? `<div class="ctb-manager-list" data-ctb-scroll-key="worldbook-list">${renderWorldbookRows(visible)}${filtered.length > visible.length ? `<button type="button" class="ctb-list-more" data-action="more-worldbook-entries">再显示 ${Math.min(120, filtered.length - visible.length)} 条（共 ${filtered.length} 条）</button>` : ''}</div>`
                 : '<div class="ctb-world-empty">没有符合条件的条目。</div>';
         const batchTools = worldbookBatchMode ? `<div class="ctb-worldbook-batch-panel">
                     <div class="ctb-worldbook-batch-head">
@@ -4492,7 +4474,7 @@
     function getPresetTransferManager() {
         const context = getContext();
         const getter = context.getPresetManager || host.SillyTavern?.getPresetManager || host.getPresetManager;
-        if (typeof getter !== 'function') throw new Error('当前酒馆版本没有公开预设管理接口');
+        if (typeof getter !== 'function') throw new Error('酒馆没有提供可用的预设管理接口');
         const manager = getter.call(context, 'openai');
         if (!manager) throw new Error('没有找到 Chat Completion 预设管理器，请先切换到可用的聊天补全接口');
         return manager;
@@ -4528,8 +4510,7 @@
      *   prompts: 条目实体
      *   prompt_order: 多组发送顺序，其中 character_id=100001 才是主顺序。
      *
-     * 旧版把新条目追加到每一组 prompt_order，导致顺序错乱；这里所有插入、
-     * 移动都只操作主顺序，删除时再清理其它组中已经失效的引用。
+     * 插入和移动只操作主顺序；删除时清理其它组中已经失效的引用。
      */
     function presetTransferEntryMatchesLoadMode(entry) {
         return presetTransferLoadModeValue === 'all' || Boolean(entry?.inserted && entry?.enabled);
@@ -5213,9 +5194,7 @@
 
     function renderPanel({ remember = true } = {}) {
         if (!root || root.hidden) return;
-        // When switching tabs the old DOM still occupies the root. Remembering
-        // it under the *new* tab would overwrite that tab's own scroll state
-        // and make the tab click appear to jump back to the top.
+        // 切换标签时，先保存当前标签的滚动位置，避免覆盖目标标签的滚动位置。
         if (remember) rememberPanelScroll(activeTab);
         theaterRenderCache.clear();
         theaterRenderSequence = 0;
@@ -5269,21 +5248,6 @@
         doc.getElementById(FLOAT_ID)?.remove();
         doc.getElementById(ENTRY_ID)?.remove();
         doc.getElementById(SETTINGS_ID)?.remove();
-        doc.getElementById('ctb-v080-style')?.remove();
-        doc.getElementById('ctb-v080-root')?.remove();
-        doc.getElementById('ctb-v080-float')?.remove();
-        doc.getElementById('ctb-v080-menu-entry')?.remove();
-        doc.querySelectorAll('[id$="-extension-settings"]').forEach((node) => {
-            if (node !== doc.getElementById(SETTINGS_ID) && node.id.startsWith('ctb-v')) node.remove();
-        });
-        doc.getElementById('ctb-v020-style')?.remove();
-        doc.getElementById('ctb-v020-root')?.remove();
-        doc.getElementById('ctb-v020-float')?.remove();
-        doc.getElementById('ctb-v020-menu-entry')?.remove();
-        // 旧版查找替换脚本可能没有成功执行 destroy，顺手清掉遗留节点，避免出现双悬浮按钮。
-        doc.getElementById('chat-search-replace-style-v010')?.remove();
-        doc.getElementById('chat-search-replace-panel-v010')?.remove();
-        doc.getElementById('chat-search-replace-float-v010')?.remove();
         const style = doc.createElement('style');
         style.id = STYLE_ID;
         style.textContent = `
@@ -5710,27 +5674,19 @@
         else if (id === 'ctb-theater-context-floors') settings.theater.contextFloors = target.value;
         else if (id === 'ctb-theater-context-tags') settings.theater.contextTags = target.value;
         else if (id === 'ctb-worldbook-search') { worldbookSearch = target.value; return; }
-        else if (id === 'ctb-worldbook-comment' && worldbookDraft) { worldbookDraft.comment = target.value; markWorldbookDraftDirtyV2(); return; }
-        else if (id === 'ctb-worldbook-keys' && worldbookDraft) { worldbookDraft.key = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); markWorldbookDraftDirtyV2(); return; }
-        else if (id === 'ctb-worldbook-keysecondary' && worldbookDraft) { worldbookDraft.keysecondary = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); markWorldbookDraftDirtyV2(); return; }
-        else if (id === 'ctb-worldbook-content' && worldbookDraft) { worldbookDraft.content = target.value; markWorldbookDraftDirtyV2(); return; }
-        else if (id === 'ctb-worldbook-order' && worldbookDraft) { worldbookDraft.order = Number(target.value) || 0; markWorldbookDraftDirtyV2(); return; }
-        else if (id === 'ctb-worldbook-depth' && worldbookDraft) { worldbookDraft.depth = Math.max(0, Number(target.value) || 0); markWorldbookDraftDirtyV2(); return; }
+        else if (id === 'ctb-worldbook-comment' && worldbookDraft) { worldbookDraft.comment = target.value; markWorldbookDraftDirty(); return; }
+        else if (id === 'ctb-worldbook-keys' && worldbookDraft) { worldbookDraft.key = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); markWorldbookDraftDirty(); return; }
+        else if (id === 'ctb-worldbook-keysecondary' && worldbookDraft) { worldbookDraft.keysecondary = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean); markWorldbookDraftDirty(); return; }
+        else if (id === 'ctb-worldbook-content' && worldbookDraft) { worldbookDraft.content = target.value; markWorldbookDraftDirty(); return; }
+        else if (id === 'ctb-worldbook-order' && worldbookDraft) { worldbookDraft.order = Number(target.value) || 0; markWorldbookDraftDirty(); return; }
+        else if (id === 'ctb-worldbook-depth' && worldbookDraft) { worldbookDraft.depth = Math.max(0, Number(target.value) || 0); markWorldbookDraftDirty(); return; }
         else if (id === 'ctb-preset-draft-name' && presetTransferDraft) {
             presetTransferDraft.raw.name = target.value;
             return;
         }
         else if (id === 'ctb-preset-transfer-search') { presetTransferSearch = target.value; return; }
         else if (id === 'ctb-preset-draft-content' && presetTransferDraft) {
-            // Chat Completion prompts normally use `content`; preserve the
-            // original field shape for older preset variants.
-            if (Object.prototype.hasOwnProperty.call(presetTransferDraft.raw, 'content')) {
-                presetTransferDraft.raw.content = target.value;
-            } else if (Object.prototype.hasOwnProperty.call(presetTransferDraft.raw, 'prompt')) {
-                presetTransferDraft.raw.prompt = target.value;
-            } else {
-                presetTransferDraft.raw.content = target.value;
-            }
+            presetTransferDraft.raw.content = target.value;
             return;
         }
         else if (target.dataset.channelId) {
@@ -5806,27 +5762,27 @@
         }
         else if (id === 'ctb-worldbook-position' && worldbookDraft) {
             worldbookDraft.position = Number(target.value) || 0;
-            markWorldbookDraftDirtyV2();
+            markWorldbookDraftDirty();
             renderPanel();
             return;
         }
         else if (id === 'ctb-worldbook-selective-logic' && worldbookDraft) {
             worldbookDraft.selectiveLogic = [0, 1, 2, 3].includes(Number(target.value)) ? Number(target.value) : 0;
-            markWorldbookDraftDirtyV2();
+            markWorldbookDraftDirty();
             return;
         }
         else if (id === 'ctb-worldbook-exclude-recursion' && worldbookDraft) {
             worldbookDraft.excludeRecursion = target.checked;
             worldbookDraft.extensions = { ...(worldbookDraft.extensions && typeof worldbookDraft.extensions === 'object' ? worldbookDraft.extensions : {}) };
             worldbookDraft.extensions.exclude_recursion = target.checked;
-            markWorldbookDraftDirtyV2();
+            markWorldbookDraftDirty();
             return;
         }
         else if (id === 'ctb-worldbook-prevent-recursion' && worldbookDraft) {
             worldbookDraft.preventRecursion = target.checked;
             worldbookDraft.extensions = { ...(worldbookDraft.extensions && typeof worldbookDraft.extensions === 'object' ? worldbookDraft.extensions : {}) };
             worldbookDraft.extensions.prevent_recursion = target.checked;
-            markWorldbookDraftDirtyV2();
+            markWorldbookDraftDirty();
             return;
         }
         else if (id === 'ctb-preset-transfer-source') {
@@ -6048,27 +6004,27 @@
                 return renderPanel();
             case 'close-theater-reader': theaterReader = null; return renderPanel();
             case 'refresh-worldbook':
-                canDiscardWorldbookChangesV2();
+                canDiscardWorldbookChanges();
                 return loadWorldbookManager({ force: true, book: worldbookBook });
             case 'create-worldbook': return createWorldbookBook();
             case 'rename-worldbook': return renameWorldbookBook();
             case 'delete-worldbook': return deleteWorldbookBook();
             case 'new-worldbook-entry': return createWorldbookEntry();
-            case 'toggle-worldbook-batch': return toggleWorldbookBatchModeV2();
+            case 'toggle-worldbook-batch': return toggleWorldbookBatchMode();
             case 'filter-worldbook': worldbookVisibleLimit = 120; return renderPanel();
             case 'more-worldbook-entries': worldbookVisibleLimit += 120; return renderPanel();
             case 'toggle-worldbook-entry': return toggleWorldbookEntry(data.worldbookUid);
-            case 'cycle-worldbook-light': return cycleWorldbookLightV2(data.worldbookUid);
-            case 'toggle-worldbook-enabled': return toggleWorldbookEnabledV2(data.worldbookUid);
-            case 'select-all-worldbook-entries': return setWorldbookSelectionV2('all');
-            case 'clear-worldbook-selection': return setWorldbookSelectionV2('clear');
-            case 'enable-worldbook-recursion-guards': return enableCurrentWorldbookRecursionGuardsV2();
-            case 'enable-selected-worldbook-recursion-guards': return enableSelectedWorldbookRecursionGuardsV2();
+            case 'cycle-worldbook-light': return cycleWorldbookLight(data.worldbookUid);
+            case 'toggle-worldbook-enabled': return toggleWorldbookEnabled(data.worldbookUid);
+            case 'select-all-worldbook-entries': return setWorldbookSelection('all');
+            case 'clear-worldbook-selection': return setWorldbookSelection('clear');
+            case 'enable-worldbook-recursion-guards': return enableCurrentWorldbookRecursionGuards();
+            case 'enable-selected-worldbook-recursion-guards': return enableSelectedWorldbookRecursionGuards();
             case 'apply-worldbook-entry': return applyWorldbookDraft();
-            case 'discard-worldbook-entry': return discardWorldbookDraftV2();
+            case 'discard-worldbook-entry': return discardWorldbookDraft();
             case 'save-worldbook': return saveCurrentWorldbook();
-            case 'copy-worldbook-entries': return copySelectedWorldbookEntriesV2();
-            case 'copy-worldbook-entries-to-book': return copySelectedWorldbookEntriesToBookV2();
+            case 'copy-worldbook-entries': return copySelectedWorldbookEntries();
+            case 'copy-worldbook-entries-to-book': return copySelectedWorldbookEntriesToBook();
             case 'delete-worldbook-entries': return deleteSelectedWorldbookEntries();
             case 'refresh-preset-transfer': return loadPresetTransfer({ force: true });
             case 'filter-preset-transfer': presetTransferVisibleLimit = 120; return renderPanel();
@@ -6210,9 +6166,7 @@
             commandHandler = () => {
                 if (!destroyed) showPanel('search');
             };
-            // The parser keeps command objects beyond an extension reload.
-            // Reusing one stable callback prevents old closures from retaining
-            // a destroyed panel; a new instance simply replaces this handler.
+            // 注册一次斜杠命令，实例重载时只替换回调。
             host[COMMAND_HANDLER_KEY] = commandHandler;
             if (host[COMMAND_REGISTERED_KEY]) return;
             const parser = host.SillyTavern?.SlashCommandParser;
