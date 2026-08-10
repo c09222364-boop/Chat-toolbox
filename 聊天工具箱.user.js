@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.12
+// @version      1.0.13
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.12';
+    const VERSION = '1.0.13';
     const PREFIX = 'ctb-v090';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -155,20 +155,20 @@
     };
 
     const INFO = Object.freeze({
-        'search-results': '点击某条结果会跳转到对应楼层；上、下按钮只切换当前结果。',
-        'json-readonly': '完整消息 JSON 用于偶尔定位 name、is_user 等结构字段。为避免破坏聊天文件，本范围只能查找。',
-        'export-range': '两个楼层留空时导出全部；只填写一个时以该端为界。',
-        'export-tags': '填入 content、small_theater 等标签名可只导出标签内部文字；留空则导出整条正文。',
-        'export-epub': 'EPUB 会按消息生成章节。首次使用若浏览器没有打包组件，会提示加载一次。',
-        'undo': '撤销只保留本次页面会话的最后一次操作，不会写进聊天文件；刷新或重开页面后失效。',
-        'post-edit-overview': '对所选 AI 楼层做一次低成本的完整词句修订，不带入其他楼层；结果先对照审核，确认后才保存。',
-        'post-edit-scope': '填写 content 时，会自动读取并只替换所选楼层 <content> 与 </content> 之间的文字；标签本身和楼层其他内容都保留。',
-        'channel-main': '“跟随酒馆主接口”不需要重复填写地址和密钥；自定义渠道通过酒馆的 OpenAI 兼容代理请求。',
-        'channel-custom': '小剧场可以跟随酒馆主接口，也可以使用独立的 OpenAI 兼容渠道。跟随主接口时，Chat Completion 会继承酒馆当前模型、采样参数、代理和流式开关。',
-        'system-cache': '这里的提示词只保存在聊天工具箱的插件设置缓存中，不会写入聊天记录；留空时使用内置默认提示词。',
-        'theater-scope': '小剧场只在插件里独立生成和保存最近结果，不会插入聊天楼层，也不会改动原聊天。',
-        'worldbook-save': '世界书编辑采用先在界面修改、再一次保存的方式。移动条目时会先保存目标世界书，确认成功后才从来源删除。',
-        'preset-transfer': '预设转移分为单预设编辑和双预设对比。复制或移动时可放到列表开头，或放到指定条目后；只处理提示词条目及主 prompt_order，不会修改其他预设参数。',
+        'search-results': '用于查看所有查找结果。点击一条结果可跳到对应楼层，上下按钮可切换当前结果。',
+        'json-readonly': '用于查看消息的完整数据，例如发言者、正文和消息类型；这里只能查找，不能替换。',
+        'export-range': '用于选择导出的楼层范围。两项都留空会导出全部楼层，只填一项则从该楼层开始或到该楼层结束。',
+        'export-tags': '用于只导出指定标签里的文字，例如 content；留空会导出整条消息正文。',
+        'export-epub': '用于把聊天导出为 EPUB 电子书，每条消息会成为一个章节。',
+        'undo': '用于撤销本次打开页面后的最后一次查找替换操作；刷新页面后撤销记录会清空。',
+        'post-edit-overview': '用于修订一个 AI 楼层的词句。生成后可以逐段审核，采用的内容才会写回聊天。',
+        'post-edit-scope': '用于指定要修订的正文标签。填写 content 时，只处理 <content> 标签内的文字；留空则处理整条正文。',
+        'channel-main': '选择“跟随酒馆主接口”会使用酒馆当前连接；选择自定义渠道则使用单独填写的地址、密钥和模型。',
+        'channel-custom': '用于选择小剧场的生成接口。跟随酒馆主接口会使用酒馆当前模型和流式设置；也可以选择单独配置的自定义渠道。',
+        'system-cache': '用于填写模型的身份、写作要求和输出格式。留空时使用默认提示词。',
+        'theater-scope': '用于根据角色设定、世界书和最近聊天生成独立片段。结果只保存在工具箱中，不会加入聊天楼层。',
+        'worldbook-save': '用于编辑世界书条目。修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
+        'preset-transfer': '用于查看、编辑、复制或移动预设中的提示词条目。单预设模式处理一本预设，双预设模式在两本预设之间转移条目。',
     });
 
     function defaults() {
@@ -3381,7 +3381,7 @@
         if (!theaterReader) return '';
         return `<div class="ctb-reader-overlay" role="dialog" aria-modal="true">
             <div class="ctb-reader-card">
-                <div class="ctb-reader-header"><span>小剧场结果 · 正文字数 ${theaterOutputCharacterCount(theaterReader.output || '')}</span><button type="button" class="ctb-close" data-action="close-theater-reader" aria-label="关闭">×</button></div>
+                <div class="ctb-reader-header"><span>正文字数 ${theaterOutputCharacterCount(theaterReader.output || '')}</span><button type="button" class="ctb-close" data-action="close-theater-reader" aria-label="关闭">×</button></div>
                 <article class="ctb-reader-content" data-ctb-scroll-key="theater-reader">${theaterOutputSlot(theaterReader.output || '', 'is-reader')}</article>
             </div>
         </div>`;
