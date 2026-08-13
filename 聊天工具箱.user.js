@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.15
+// @version      1.0.16
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.15';
+    const VERSION = '1.0.16';
     const PREFIX = 'chat-toolbox';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -2949,17 +2949,106 @@
         const position = worldbookPosition(entry?.raw);
         return {
             role: position === 4 ? theaterMessageRole(entry?.raw?.role) : 'system',
-            content: theaterSubstituteText(entry.content.trim()),
+            content: entry.content.trim(),
+            ctbTemplate: true,
+            ctbTemplateData: { world_info: entry.raw },
         };
     }
 
     function theaterSubstituteText(value) {
         const text = String(value || '');
+        const context = getContext();
         try {
-            return String(getContext().substituteParams?.(text) ?? text);
-        } catch (_) {
-            return text;
+            if (typeof context.substituteParams === 'function') {
+                const result = String(context.substituteParams(text) ?? text);
+                if (!/{{\s*(?:set|get|add|inc|dec)(?:global)?var\b/i.test(result)) return result;
+                const macros = context.macros;
+                if (macros?.engine?.evaluate && macros?.envBuilder?.buildFromRawEnv) {
+                    const evaluated = String(macros.engine.evaluate(result, macros.envBuilder.buildFromRawEnv({ content: result })) ?? result);
+                    return theaterResolveVariableMacros(evaluated, context);
+                }
+                return theaterResolveVariableMacros(result, context);
+            }
+        } catch (error) {
+            console.warn('[聊天工具箱] 酒馆宏解析失败', error);
         }
+        return theaterResolveVariableMacros(text, context);
+    }
+
+    function theaterResolveVariableMacros(value, context = getContext()) {
+        const resolveScope = (global) => context.variables?.[global ? 'global' : 'local'];
+        let result = String(value || '');
+        result = result.replace(/{{\s*(set|add)(global)?var::([^:}]+)::([^}]*)}}/gi, (match, operation, global, name, macroValue) => {
+            const scope = resolveScope(Boolean(global));
+            const action = String(operation).toLowerCase();
+            if (typeof scope?.[action] !== 'function') return match;
+            scope[action](String(name).trim(), macroValue);
+            return '';
+        });
+        result = result.replace(/{{\s*(get|inc|dec)(global)?var::([^}]+)}}/gi, (match, operation, global, name) => {
+            const scope = resolveScope(Boolean(global));
+            const action = String(operation).toLowerCase();
+            if (typeof scope?.[action] !== 'function') return match;
+            return String(scope[action](String(name).trim()) ?? '');
+        });
+        return result;
+    }
+
+    function theaterEjsApi() {
+        const candidates = [host, window, globalThis];
+        try { candidates.push(host.parent, window.parent); } catch (_) {}
+        for (const candidate of candidates) {
+            const api = candidate?.EjsTemplate;
+            if (typeof api?.evalTemplate === 'function' && typeof api?.prepareContext === 'function') return api;
+        }
+        return null;
+    }
+
+    async function theaterRenderTemplateText(value, message, index, state) {
+        let text = theaterSubstituteText(value);
+        if (!/<%[=_\-#]?/.test(text)) return text;
+        state.api ||= theaterEjsApi();
+        if (!state.api) {
+            throw new Error('提示词中含有 EJS（<% … %>），但未检测到已启用的 Prompt Template 扩展。');
+        }
+        try {
+            state.env ||= await state.api.prepareContext({
+                runType: 'custom',
+                generateType: 'chat-toolbox-theater',
+            }, getChat().length - 1);
+            Object.assign(state.env, {
+                message_id: index,
+                is_last: false,
+                is_user: message.role === 'user',
+                is_system: message.role === 'system',
+                name: undefined,
+                world_info: undefined,
+                ...(message.ctbTemplateData || {}),
+            });
+            text = String(await state.api.evalTemplate(text, state.env, {
+                filename: `chat-toolbox/theater/${index}`,
+                cache: false,
+            }) ?? '');
+            state.used = true;
+            return theaterSubstituteText(text);
+        } catch (error) {
+            throw new Error(`第 ${index + 1} 条提示词的 EJS 解析失败：${error?.message || error}`);
+        }
+    }
+
+    async function renderTheaterPromptMessages(messages) {
+        const result = [];
+        const templateState = { api: null, env: null, used: false };
+        for (let index = 0; index < messages.length; index += 1) {
+            const message = messages[index];
+            const content = message.ctbTemplate
+                ? await theaterRenderTemplateText(message.content, message, index, templateState)
+                : String(message.content || '');
+            if (!content.trim()) continue;
+            result.push({ role: message.role, content });
+        }
+        if (templateState.used) await templateState.api.saveVariables?.();
+        return result;
     }
 
     function theaterCardField(card, key) {
@@ -2980,24 +3069,22 @@
             const card = context.characters?.[characterId] || host.characters?.[characterId];
             if (card) {
                 const name = theaterCardField(card, 'name');
-                const description = theaterSubstituteText(theaterCardField(card, 'description'));
-                const personality = theaterSubstituteText(theaterCardField(card, 'personality'));
-                const scenario = theaterSubstituteText(theaterCardField(card, 'scenario'));
-                const examples = theaterSubstituteText(theaterCardField(card, 'mes_example'));
+                const description = theaterCardField(card, 'description');
+                const personality = theaterCardField(card, 'personality');
+                const scenario = theaterCardField(card, 'scenario');
+                const examples = theaterCardField(card, 'mes_example');
                 if (name || description) result.charDescription.push({
                     role: 'system',
                     content: [name, description].filter(Boolean).join('\n'),
+                    ctbTemplate: true,
                 });
-                if (personality) result.charPersonality.push({ role: 'system', content: personality });
-                if (scenario) result.scenario.push({ role: 'system', content: scenario });
-                if (examples) result.dialogueExamples.push({ role: 'system', content: examples });
+                if (personality) result.charPersonality.push({ role: 'system', content: personality, ctbTemplate: true });
+                if (scenario) result.scenario.push({ role: 'system', content: scenario, ctbTemplate: true });
+                if (examples) result.dialogueExamples.push({ role: 'system', content: examples, ctbTemplate: true });
             }
         }
         if (config.includePersona !== false) {
-            try {
-                const personaText = String(context.substituteParams?.('{{persona}}') || '').trim();
-                if (personaText) result.personaDescription.push({ role: 'system', content: personaText });
-            } catch (_) {}
+            result.personaDescription.push({ role: 'system', content: '{{persona}}', ctbTemplate: true });
         }
         return result;
     }
@@ -3092,7 +3179,7 @@
             if (item.kind === 'marker') {
                 expandedPreset.push(...(markerMessages.get(item.identifier) || []));
             } else {
-                expandedPreset.push({ role: item.role, content: theaterSubstituteText(item.content) });
+                expandedPreset.push({ role: item.role, content: item.content, ctbTemplate: true });
             }
         }
         const fallbackOrder = ['worldInfoBefore', 'personaDescription', 'charDescription', 'charPersonality', 'scenario', 'worldInfoAfter', 'dialogueExamples', 'chatHistory'];
@@ -3101,12 +3188,12 @@
             : fallbackOrder.flatMap((identifier) => markerMessages.get(identifier) || []);
         const system = theaterSystemPrompt(config);
         const request = prompt || '请根据以上设定与上下文，自行选择一个合适的片段生成小剧场。';
-        return [
+        return renderTheaterPromptMessages([
             ...layoutMessages,
             // 最终输出约束放在请求前，避免被原生预设中较早的 system 条目冲淡。
-            ...(system ? [{ role: 'system', content: system }] : []),
-            { role: 'user', content: request },
-        ];
+            ...(system ? [{ role: 'system', content: system, ctbTemplate: true }] : []),
+            { role: 'user', content: request, ctbTemplate: true },
+        ]);
     }
 
     function saveTheaterPreset() {
@@ -4369,9 +4456,9 @@
             <div class="ctb-worldbook-inline-editor-head"><strong>编辑条目</strong><span data-worldbook-draft-status>${worldbookDraftDirty ? '当前条目有未暂存修改' : '已载入'}</span></div>
             <div class="ctb-worldbook-editor-grid">
                 <label class="ctb-field"><span>名称</span><input class="ctb-input" id="ctb-worldbook-comment" placeholder="条目名称" value="${escapeHTML(draft.comment || '')}"></label>
+                <label class="ctb-field"><span>关键词逻辑</span><select class="ctb-input" id="ctb-worldbook-selective-logic">${logicOptions}</select></label>
                 <label class="ctb-field"><span>关键词</span><input class="ctb-input" id="ctb-worldbook-keys" placeholder="多个关键词用逗号分隔" value="${escapeHTML((Array.isArray(draft.key) ? draft.key : []).join(', '))}"></label>
                 <label class="ctb-field"><span>次要关键词</span><input class="ctb-input" id="ctb-worldbook-keysecondary" placeholder="可选；多个关键词用逗号分隔" value="${escapeHTML((Array.isArray(draft.keysecondary) ? draft.keysecondary : []).join(', '))}"></label>
-                <label class="ctb-field"><span>次要关键词逻辑</span><select class="ctb-input" id="ctb-worldbook-selective-logic">${logicOptions}</select></label>
             </div>
             <label class="ctb-field"><span>条目内容</span><textarea class="ctb-input ctb-textarea ctb-manager-content" id="ctb-worldbook-content" placeholder="世界书内容">${escapeHTML(draft.content || '')}</textarea></label>
             <div class="ctb-inline ctb-manager-fields">
@@ -5328,7 +5415,7 @@
             #${ROOT_ID} .ctb-model-row select{flex:1;}
             #${ROOT_ID} .ctb-mini-field{display:flex;align-items:center;gap:5px;min-width:0;color:#6f7277;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-mini-field .ctb-input{width:90px;}
             #${ROOT_ID} .ctb-preset-row{margin-bottom:6px;} #${ROOT_ID} .ctb-preset-row select{max-width:150px;} #${ROOT_ID} .ctb-preset-row input{flex:1;} #${ROOT_ID} .ctb-world-preset-title{margin-top:9px;}
-            #${ROOT_ID} .ctb-context-row{flex-wrap:wrap;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;}
+            #${ROOT_ID} .ctb-context-row{flex-wrap:wrap;margin-bottom:7px;} #${ROOT_ID} .ctb-context-tags{margin-top:6px;}
             #${ROOT_ID} .ctb-primary-soft{border-color:#91aa98;background:#e0e9e3;color:#4d6755;} #${ROOT_ID} .ctb-world-picker-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:7px;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button:first-child{flex:1;justify-content:space-between;} #${ROOT_ID} .ctb-world-picker-summary .ctb-button span{color:#7a817c;font-size:10px;font-weight:400;}
             #${ROOT_ID} .ctb-world-selected-summary{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px;} #${ROOT_ID} .ctb-world-selected-summary span{max-width:100%;overflow:hidden;padding:3px 6px;border:1px solid #c9d2cc;border-radius:3px;background:#e5ebe7;color:#5c6860;font-size:10px;text-overflow:ellipsis;white-space:nowrap;}
             #${ROOT_ID} .ctb-world-picker{margin-top:6px;overflow:hidden;border:1px solid #cbd0cc;border-radius:3px;background:#e9ebeb;} #${ROOT_ID} .ctb-world-book-row{padding:6px;border-bottom:1px solid #cfd3d0;} #${ROOT_ID} .ctb-world-book-row select{flex:1;} #${ROOT_ID} .ctb-world-bulk{justify-content:flex-end;padding:5px 6px;border-bottom:1px solid #d3d6d4;color:#6d716f;font-size:10px;} #${ROOT_ID} .ctb-world-bulk>span{margin-right:auto;}
@@ -5432,7 +5519,7 @@
             #${ROOT_ID} .ctb-worldbook-inline-editor .ctb-field{display:grid;gap:4px;min-width:0;color:#334155;font-size:11px;font-weight:600;}
             #${ROOT_ID} .ctb-worldbook-inline-editor .ctb-manager-content{min-height:180px;height:180px;line-height:1.5;}
             #${ROOT_ID} .ctb-worldbook-inline-editor .ctb-manager-fields{align-items:end;gap:8px;}
-            #${ROOT_ID} .ctb-worldbook-inline-editor .ctb-mini-field{display:grid;gap:4px;}
+            #${ROOT_ID} .ctb-worldbook-inline-editor .ctb-mini-field{display:grid;grid-template-rows:16px 29px;align-items:stretch;gap:4px;}
             #${ROOT_ID} .ctb-worldbook-inline-editor .ctb-mini-field .ctb-input{width:100px;}
             #${ROOT_ID} .ctb-preset-transfer-grid{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;}
             #${ROOT_ID} .ctb-preset-transfer-grid>div{min-width:0;padding:10px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;}
@@ -5487,6 +5574,7 @@
                 #${ROOT_ID} .ctb-card.ctb-card-wide{width:calc(100vw - 12px);}
                 #${ROOT_ID} .ctb-worldbook-inline-editor{padding:10px;}
                 #${ROOT_ID} .ctb-preset-transfer-grid>div{padding:7px;}
+                #${ROOT_ID} .ctb-context-row{margin-bottom:9px;}
             }
 
             /* v0.9.2: one accent family, with a user-selectable blue/green
