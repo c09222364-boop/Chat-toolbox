@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.17
+// @version      1.0.18
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.17';
+    const VERSION = '1.0.18';
     const PREFIX = 'chat-toolbox';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -90,6 +90,8 @@
     let theaterNativePresetPickerOpen = false;
     let worldbookLoading = false;
     let worldbookLoadedOnce = false;
+    let worldbookLoadedContextKey = '';
+    let worldbookLoadScheduledContextKey = '';
     let worldbookSaving = false;
     let worldbookBooks = [];
     let worldbookBook = '';
@@ -169,7 +171,7 @@
         'channel-custom': '用于选择小剧场的生成接口。跟随酒馆主接口会使用酒馆当前模型、流式设置和回复上限；自定义渠道则完全按照这里单独填写的设置发送。',
         'system-cache': '用于填写模型的身份、写作要求和输出格式。留空时使用默认提示词。',
         'theater-scope': '用于根据角色设定、世界书和最近聊天生成独立片段。结果只保存在工具箱中，不会加入聊天楼层。',
-        'worldbook-save': '用于编辑世界书条目。修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
+        'worldbook-save': '进入世界书管理时会优先打开当前角色卡绑定的世界书；“模拟最近 2 层”可查看常驻条目和关键词条目的触发结果。条目修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
         'preset-transfer': '用于查看、编辑、复制或移动预设中的提示词条目。单预设模式处理一本预设，双预设模式在两本预设之间转移条目。',
     });
 
@@ -3829,6 +3831,15 @@
         return String(card?.data?.extensions?.world || card?.extensions?.world || '').trim();
     }
 
+    function currentWorldbookContextKey() {
+        const context = getContext();
+        const characterId = context.characterId ?? context.this_chid ?? host.this_chid ?? '';
+        const conversation = context.groupId
+            ? `group:${context.groupId}`
+            : `character:${characterId}`;
+        return `${conversation}\u0000${chatKey()}\u0000${currentCharacterWorldBookName()}`;
+    }
+
     async function getWorldBookNames(force = false) {
         const context = getContext();
         const readNames = () => {
@@ -4104,13 +4115,20 @@
         if (copyToBook) copyToBook.disabled = worldbookSelected.size === 0 || !worldbookCopyTarget;
     }
 
-    async function loadWorldbookManager({ force = false, book = '' } = {}) {
+    async function loadWorldbookManager({ force = false, book = '', contextKey = currentWorldbookContextKey() } = {}) {
         if (worldbookLoading) return;
+        if (worldbookLoadScheduledContextKey === contextKey) worldbookLoadScheduledContextKey = '';
         worldbookLoading = true;
         renderPanel();
         try {
             if (force || !worldbookBooks.length) worldbookBooks = await getWorldBookNames(force);
-            const preferred = String(book || worldbookBook || currentCharacterWorldBookName() || '');
+            const boundBook = currentCharacterWorldBookName();
+            if (boundBook && !worldbookBooks.includes(boundBook)) {
+                const refreshed = await getWorldBookNames(true);
+                if (refreshed.length) worldbookBooks = refreshed;
+            }
+            const contextChanged = contextKey !== worldbookLoadedContextKey;
+            const preferred = String(book || (!contextChanged ? worldbookBook : '') || boundBook || '');
             worldbookBook = worldbookBooks.includes(preferred) ? preferred : (worldbookBooks[0] || '');
             const pendingDocument = worldbookPendingDocuments.get(worldbookBook);
             if (worldbookBook) {
@@ -4138,6 +4156,7 @@
         } finally {
             worldbookLoading = false;
             worldbookLoadedOnce = true;
+            if (contextKey === currentWorldbookContextKey()) worldbookLoadedContextKey = contextKey;
             renderPanel();
         }
     }
@@ -4632,7 +4651,19 @@
     }
 
     function renderWorldbookTab() {
-        if (!worldbookLoadedOnce && !worldbookLoading) host.setTimeout(() => loadWorldbookManager(), 0);
+        const contextKey = currentWorldbookContextKey();
+        if ((!worldbookLoadedOnce || worldbookLoadedContextKey !== contextKey)
+            && !worldbookLoading
+            && worldbookLoadScheduledContextKey !== contextKey) {
+            const boundBook = currentCharacterWorldBookName();
+            worldbookLoadScheduledContextKey = contextKey;
+            host.setTimeout(() => {
+                if (worldbookLoadScheduledContextKey !== contextKey) return;
+                worldbookLoadScheduledContextKey = '';
+                if (currentWorldbookContextKey() !== contextKey || worldbookLoading) return;
+                loadWorldbookManager({ book: boundBook, contextKey });
+            }, 0);
+        }
         const query = worldbookSearch.trim().toLowerCase();
         const filtered = currentWorldbookView().filter((record) => !query || worldbookRecordSearchText(record).includes(query));
         const visible = filtered.slice(0, worldbookVisibleLimit);
@@ -4664,6 +4695,7 @@
                 <div class="ctb-inline ctb-manager-toolbar">
                     <select class="ctb-input" id="ctb-worldbook-book">${books || '<option value="">没有世界书</option>'}</select>
                     <button type="button" class="ctb-button" data-action="refresh-worldbook">刷新</button>
+                    <button type="button" class="ctb-button ctb-primary-soft ctb-worldbook-simulate-button" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}><i class="fa-solid fa-bolt"></i> 模拟最近 2 层</button>
                     <button type="button" class="ctb-button" data-action="create-worldbook">新建书</button>
                     <button type="button" class="ctb-button" data-action="rename-worldbook"${worldbookBook ? '' : ' disabled'}>重命名</button>
                     <button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook"${worldbookBook ? '' : ' disabled'}>删除书</button>
@@ -4673,7 +4705,6 @@
                 <div class="ctb-inline ctb-manager-toolbar">
                     <input class="ctb-input" id="ctb-worldbook-search" placeholder="搜索条目名称、关键词或内容" value="${escapeHTML(worldbookSearch)}">
                     <button type="button" class="ctb-button" data-action="filter-worldbook">筛选</button>
-                    <button type="button" class="ctb-button ctb-primary-soft" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}>模拟触发（2 层）</button>
                     <button type="button" class="ctb-button${worldbookBatchMode ? ' ctb-primary' : ''}" data-action="toggle-worldbook-batch">${worldbookBatchMode ? '完成' : '编辑'}</button>
                 </div>
                 ${renderWorldbookSimulation()}
@@ -5568,6 +5599,7 @@
             #${ROOT_ID} .ctb-theater-stream-option{display:flex;margin-top:7px;gap:5px;} #${ROOT_ID} .ctb-theater-stream-option small{color:#777d84;font-size:9px;} #${ROOT_ID} .ctb-theater-task-list{display:grid;gap:5px;margin-top:8px;} #${ROOT_ID} .ctb-theater-task{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 8px;border:1px solid #cbd2d8;border-radius:4px;background:#edf0f3;} #${ROOT_ID} .ctb-theater-task-state{display:grid;min-width:0;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:2px 6px;color:#50565d;} #${ROOT_ID} .ctb-theater-task-state .ctb-save-spinner{grid-row:1/3;} #${ROOT_ID} .ctb-theater-task-state strong{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-state small{overflow:hidden;color:#747a82;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side{display:flex;align-items:center;gap:6px;flex:0 0 auto;} #${ROOT_ID} .ctb-theater-task-side em{color:#68717a;font-size:9px;font-style:normal;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side .ctb-button{padding:3px 7px;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live{grid-column:1/-1;min-width:0;padding-top:5px;border-top:1px solid #d5dbe0;} #${ROOT_ID} .ctb-theater-task-live small{display:block;margin-bottom:3px;color:#68717a;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live pre{max-height:170px;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#4f555c;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);}
             #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-selection-count{margin-left:auto;color:#64748b;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry.is-selected{background:#f1f6fb;} #${ROOT_ID} .ctb-theater-native-entry.is-marker{background:#f8fafc;cursor:default;} #${ROOT_ID} .ctb-theater-native-entry.is-marker>i{margin-top:2px;color:#6b879d;text-align:center;} #${ROOT_ID} .ctb-theater-native-entry.is-disabled{opacity:.48;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
             #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
+            #${ROOT_ID} .ctb-worldbook-simulate-button{flex:0 0 auto;white-space:nowrap;}
             #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
             #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.62;}
             #${ROOT_ID} .ctb-preset-entry-head{display:flex;align-items:center;gap:6px;min-width:0;}
