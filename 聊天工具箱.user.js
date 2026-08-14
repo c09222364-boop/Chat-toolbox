@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.18
+// @version      1.0.19
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.18';
+    const VERSION = '1.0.19';
     const PREFIX = 'chat-toolbox';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -4692,10 +4692,13 @@
                 </div>` : '';
         return `<section class="ctb-section">
                 <div class="ctb-section-title">世界书管理 ${infoButton('worldbook-save')}</div>
+                <button type="button" class="ctb-button ctb-primary-soft ctb-worldbook-simulate-button" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}>
+                    <span><i class="fa-solid fa-bolt"></i> 模拟最近 2 层触发</span>
+                    <small>${worldbookLoading ? '正在加载世界书…' : worldbookBook ? escapeHTML(worldbookBook) : '没有可用世界书'}</small>
+                </button>
                 <div class="ctb-inline ctb-manager-toolbar">
                     <select class="ctb-input" id="ctb-worldbook-book">${books || '<option value="">没有世界书</option>'}</select>
                     <button type="button" class="ctb-button" data-action="refresh-worldbook">刷新</button>
-                    <button type="button" class="ctb-button ctb-primary-soft ctb-worldbook-simulate-button" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}><i class="fa-solid fa-bolt"></i> 模拟最近 2 层</button>
                     <button type="button" class="ctb-button" data-action="create-worldbook">新建书</button>
                     <button type="button" class="ctb-button" data-action="rename-worldbook"${worldbookBook ? '' : ' disabled'}>重命名</button>
                     <button type="button" class="ctb-button ctb-danger" data-action="delete-worldbook"${worldbookBook ? '' : ' disabled'}>删除书</button>
@@ -5457,8 +5460,8 @@
         const wideManager = activeTab === 'preset-transfer';
         const theme = settings.uiTheme === 'green' ? 'green' : 'blue';
         const nextThemeLabel = theme === 'green' ? '蓝色界面' : '绿色界面';
-        root.innerHTML = `<div class="ctb-card ctb-theme-${theme}${wideManager ? ' ctb-card-wide' : ''}" role="dialog" aria-modal="true" aria-label="聊天工具箱">
-            <header class="ctb-header"><div class="ctb-title"><i class="fa-solid fa-toolbox"></i> 聊天工具箱</div><div class="ctb-header-side"><span>${total} 条消息</span><button type="button" class="ctb-theme-toggle" data-action="toggle-ui-theme" title="切换为${nextThemeLabel}" aria-label="切换为${nextThemeLabel}"><i class="fa-solid fa-palette" aria-hidden="true"></i></button><button type="button" class="ctb-close" data-action="close" aria-label="关闭">×</button></div></header>
+        root.innerHTML = `<div class="ctb-card ctb-theme-${theme}${wideManager ? ' ctb-card-wide' : ''}" role="dialog" aria-modal="true" aria-label="聊天工具箱" data-ctb-version="${VERSION}">
+            <header class="ctb-header"><div class="ctb-title"><i class="fa-solid fa-toolbox"></i> 聊天工具箱 <small class="ctb-runtime-version">v${VERSION}</small></div><div class="ctb-header-side"><span>${total} 条消息</span><button type="button" class="ctb-theme-toggle" data-action="toggle-ui-theme" title="切换为${nextThemeLabel}" aria-label="切换为${nextThemeLabel}"><i class="fa-solid fa-palette" aria-hidden="true"></i></button><button type="button" class="ctb-close" data-action="close" aria-label="关闭">×</button></div></header>
             ${tabs ? `<nav class="ctb-tabs" style="--ctb-tab-count:${Math.min(modules.length, 5)}">${tabs}</nav>` : ''}
             <main class="ctb-body">${body}${renderInfoPopup()}</main>
             ${renderTransientNotice()}
@@ -5499,6 +5502,7 @@
             #${ROOT_ID} .ctb-card{width:min(650px,calc(100vw - 24px));max-height:min(720px,calc(100dvh - 24px));min-height:0;margin:auto;display:flex;flex-direction:column;overflow:hidden;background:#f6f6f8;border:1px solid rgba(92,99,110,.38);border-radius:5px;box-shadow:0 14px 40px rgba(0,0,0,.32);font-size:12px;line-height:1.35;}
             #${ROOT_ID} .ctb-header{display:flex;align-items:center;justify-content:space-between;padding:11px 16px 9px;border-bottom:1px solid #d5d7dc;background:#fafafd;flex:0 0 auto;}
             #${ROOT_ID} .ctb-title{font-size:18px;font-weight:700;color:#373a40;letter-spacing:.01em;} #${ROOT_ID} .ctb-title i{font-size:16px;margin-right:6px;}
+            #${ROOT_ID} .ctb-runtime-version{margin-left:4px;color:#8a8f97;font-size:10px;font-weight:500;letter-spacing:0;vertical-align:middle;}
             #${ROOT_ID} .ctb-header-side{display:flex;gap:11px;align-items:center;color:#83868c;font-size:12px;}
             #${ROOT_ID} .ctb-close{border:0;background:transparent;color:#85888d;font-size:25px;line-height:18px;padding:0 2px;cursor:pointer;} #${ROOT_ID} .ctb-close:hover{color:#34373b;}
             #${ROOT_ID} .ctb-tabs{display:grid;grid-template-columns:repeat(3,1fr);padding:0 14px;background:#fafafd;border-bottom:1px solid #d8dade;flex:0 0 auto;}
@@ -5599,7 +5603,9 @@
             #${ROOT_ID} .ctb-theater-stream-option{display:flex;margin-top:7px;gap:5px;} #${ROOT_ID} .ctb-theater-stream-option small{color:#777d84;font-size:9px;} #${ROOT_ID} .ctb-theater-task-list{display:grid;gap:5px;margin-top:8px;} #${ROOT_ID} .ctb-theater-task{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 8px;border:1px solid #cbd2d8;border-radius:4px;background:#edf0f3;} #${ROOT_ID} .ctb-theater-task-state{display:grid;min-width:0;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:2px 6px;color:#50565d;} #${ROOT_ID} .ctb-theater-task-state .ctb-save-spinner{grid-row:1/3;} #${ROOT_ID} .ctb-theater-task-state strong{overflow:hidden;font-size:10px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-state small{overflow:hidden;color:#747a82;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side{display:flex;align-items:center;gap:6px;flex:0 0 auto;} #${ROOT_ID} .ctb-theater-task-side em{color:#68717a;font-size:9px;font-style:normal;white-space:nowrap;} #${ROOT_ID} .ctb-theater-task-side .ctb-button{padding:3px 7px;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live{grid-column:1/-1;min-width:0;padding-top:5px;border-top:1px solid #d5dbe0;} #${ROOT_ID} .ctb-theater-task-live small{display:block;margin-bottom:3px;color:#68717a;font-size:9px;} #${ROOT_ID} .ctb-theater-task-live pre{max-height:170px;margin:0;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#4f555c;font:10px/1.5 var(--mainFontFamily,Arial,sans-serif);}
             #${ROOT_ID} .ctb-theater-native-picker{margin-top:6px;border:1px solid #cbd5e1;border-radius:5px;background:#fff;overflow:hidden;} #${ROOT_ID} .ctb-theater-native-toolbar{padding:6px;border-bottom:1px solid #e2e8f0;} #${ROOT_ID} .ctb-theater-native-toolbar select{flex:1;min-width:0;} #${ROOT_ID} .ctb-selection-count{margin-left:auto;color:#64748b;font-size:10px;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry-list{max-height:260px;overflow:auto;} #${ROOT_ID} .ctb-theater-native-entry{display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:start;gap:6px;padding:7px 8px;border-bottom:1px solid #e2e8f0;color:#334155;cursor:pointer;} #${ROOT_ID} .ctb-theater-native-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-theater-native-entry.is-selected{background:#f1f6fb;} #${ROOT_ID} .ctb-theater-native-entry.is-marker{background:#f8fafc;cursor:default;} #${ROOT_ID} .ctb-theater-native-entry.is-marker>i{margin-top:2px;color:#6b879d;text-align:center;} #${ROOT_ID} .ctb-theater-native-entry.is-disabled{opacity:.48;} #${ROOT_ID} .ctb-theater-native-entry>span{display:flex;min-width:0;flex-direction:column;gap:2px;} #${ROOT_ID} .ctb-theater-native-entry strong{overflow:hidden;color:#0f172a;font-size:11px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry small{overflow:hidden;color:#64748b;font-size:9px;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-theater-native-entry em{font-style:normal;color:#64748b;font-size:9px;white-space:nowrap;}
             #${ROOT_ID} .ctb-manager-toolbar{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-toolbar>.ctb-input{flex:1;min-width:140px;} #${ROOT_ID} .ctb-manager-list{max-height:390px;overflow:auto;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-manager-content{min-height:190px;height:190px;} #${ROOT_ID} .ctb-manager-fields{flex-wrap:wrap;} #${ROOT_ID} .ctb-manager-fields select{width:auto;min-width:110px;} #${ROOT_ID} .ctb-manager-actions{justify-content:flex-end;} #${ROOT_ID} .ctb-manager-savebar{position:static;justify-content:space-between;gap:12px;margin:10px 0 0;padding:10px 0 0;border-top:1px solid #cdd0d4;background:transparent;color:#697069;font-size:11px;}
-            #${ROOT_ID} .ctb-worldbook-simulate-button{flex:0 0 auto;white-space:nowrap;}
+            #${ROOT_ID} .ctb-worldbook-simulate-button{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:38px;height:auto;margin:0 0 7px;padding:7px 10px;gap:10px;text-align:left;white-space:normal;}
+            #${ROOT_ID} .ctb-worldbook-simulate-button>span{font-size:12px;font-weight:700;white-space:nowrap;}
+            #${ROOT_ID} .ctb-worldbook-simulate-button>small{min-width:0;overflow:hidden;color:inherit;font-size:10px;font-weight:400;text-overflow:ellipsis;white-space:nowrap;opacity:.78;}
             #${ROOT_ID} .ctb-preset-transfer-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;} #${ROOT_ID} .ctb-preset-transfer-grid.is-single{grid-template-columns:1fr;} #${ROOT_ID} .ctb-preset-entry-list{max-height:365px;overflow:auto;margin-top:6px;border:1px solid #cfd2d6;border-radius:3px;background:#ececef;} #${ROOT_ID} .ctb-preset-entry{display:block;min-width:0;padding:6px 7px;border-bottom:1px solid #d5d7da;color:#51555b;} #${ROOT_ID} .ctb-preset-entry:last-child{border-bottom:0;} #${ROOT_ID} .ctb-preset-entry.is-selected{background:#dfe8e2;} #${ROOT_ID} .ctb-preset-entry strong,#${ROOT_ID} .ctb-preset-entry small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} #${ROOT_ID} .ctb-preset-entry strong{font-size:11px;} #${ROOT_ID} .ctb-preset-entry small{color:#85898e;font-size:9px;}
             #${ROOT_ID} .ctb-preset-entry.is-locked{opacity:.62;}
             #${ROOT_ID} .ctb-preset-entry-head{display:flex;align-items:center;gap:6px;min-width:0;}
@@ -5836,6 +5842,8 @@
             @media (max-width:560px){
                 #${ROOT_ID} .ctb-header-side{gap:6px;}
                 #${ROOT_ID} .ctb-theme-toggle{width:22px;height:25px;padding:0;font-size:15px;}
+                #${ROOT_ID} .ctb-worldbook-simulate-button{align-items:flex-start;flex-direction:column;gap:2px;}
+                #${ROOT_ID} .ctb-worldbook-simulate-button>small{width:100%;}
                 #${ROOT_ID} .ctb-worldbook-entry-head{gap:5px;padding:6px;}
                 #${ROOT_ID} .ctb-worldbook-status-controls{gap:3px;}
                 #${ROOT_ID} .ctb-worldbook-enabled-button{width:28px;height:16px;}
