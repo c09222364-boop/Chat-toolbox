@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.16
+// @version      1.0.17
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.16';
+    const VERSION = '1.0.17';
     const PREFIX = 'chat-toolbox';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -46,8 +46,9 @@
     let panelTabsScrollLeft = 0;
     let theaterHistoryView = 'recent';
     let theaterReader = null;
-    let theaterRenderSequence = 0;
+    let theaterRenderValues = [];
     const theaterRenderCache = new Map();
+    let settingsSaveTimer = null;
     let results = [];
     let currentResultIndex = -1;
     let infoMessage = null;
@@ -103,6 +104,7 @@
     let worldbookDirty = false;
     let worldbookBatchMode = false;
     let worldbookCopyTarget = '';
+    let worldbookSimulation = null;
     // Keep staged edits when the user changes the selected book.  They are
     // still written only from the close/save checkpoint, never on row changes.
     const worldbookPendingDocuments = new Map();
@@ -345,6 +347,8 @@
     }
 
     function saveSettings() {
+        if (settingsSaveTimer) host.clearTimeout(settingsSaveTimer);
+        settingsSaveTimer = null;
         const persistent = persistentSettingsSnapshot();
         let savedToExtension = false;
         try {
@@ -358,6 +362,21 @@
         if (!savedToExtension) {
             try { host.localStorage?.setItem(STORAGE_KEY, JSON.stringify(persistent)); } catch (_) {}
         }
+    }
+
+    function scheduleSettingsSave() {
+        if (settingsSaveTimer) host.clearTimeout(settingsSaveTimer);
+        settingsSaveTimer = host.setTimeout(() => {
+            settingsSaveTimer = null;
+            saveSettings();
+        }, 450);
+    }
+
+    function flushSettingsSave() {
+        if (!settingsSaveTimer) return;
+        host.clearTimeout(settingsSaveTimer);
+        settingsSaveTimer = null;
+        saveSettings();
     }
 
     function notify(message, level = 'info') {
@@ -514,21 +533,31 @@
         return String(context.chatId || context.chatMetadata?.chat_id || context.chatMetadata?.title || currentChatName());
     }
 
-    function getRows() {
-        return getChat().map((raw, rawIndex) => ({
+    function chatRow(raw, rawIndex) {
+        return {
             raw,
             rawIndex,
             id: messageId(raw, rawIndex),
             name: messageName(raw),
             text: messageText(raw),
             isUser: isUserMessage(raw),
-        }));
+        };
+    }
+
+    function* iterateRows() {
+        const chat = getChat();
+        for (let rawIndex = 0; rawIndex < chat.length; rawIndex += 1) {
+            yield chatRow(chat[rawIndex], rawIndex);
+        }
     }
 
     function maxFloor() {
-        const rows = getRows();
-        if (!rows.length) return 0;
-        return rows.reduce((max, row) => Math.max(max, Number(row.id) || row.rawIndex), 0);
+        const chat = getChat();
+        let max = 0;
+        for (let rawIndex = 0; rawIndex < chat.length; rawIndex += 1) {
+            max = Math.max(max, Number(messageId(chat[rawIndex], rawIndex)) || rawIndex);
+        }
+        return max;
     }
 
     function fieldValue(row, scope) {
@@ -584,7 +613,7 @@
         try {
             const found = [];
             const regex = ui.regex ? compileRegex(query) : null;
-            for (const row of getRows()) {
+            for (const row of iterateRows()) {
                 const value = fieldValue(row, ui.scope);
                 if (!value) continue;
                 let occurrence = 0;
@@ -913,17 +942,17 @@
         try {
             const re = ui.regex ? compileRegex(ui.query) : new RegExp(escapeRegex(ui.query), 'gi');
             const changed = [];
-            getRows().forEach((row) => {
+            for (const row of iterateRows()) {
                 const current = fieldValue(row, ui.scope);
                 re.lastIndex = 0;
-                if (!re.test(current)) return;
+                if (!re.test(current)) continue;
                 re.lastIndex = 0;
                 const replaced = current.replace(re, ui.replacement);
                 const next = ui.scope === 'mes' ? normalizeBlankLines(replaced) : replaced;
-                if (next === current) return;
+                if (next === current) continue;
                 changed.push({ rawIndex: row.rawIndex, field: ui.scope, before: current });
                 stageValue(row.rawIndex, ui.scope, next);
-            });
+            }
             if (!changed.length) return notify('替换后内容没有变化', 'info');
             rememberUndo(changed, `整体替换 ${changed.length} 条消息`);
             lastUndo.staged = true;
@@ -936,13 +965,13 @@
 
     function stageBlankLineCleanup() {
         const changed = [];
-        getRows().forEach((row) => {
+        for (const row of iterateRows()) {
             const current = fieldValue(row, 'mes');
             const next = collapseExtraBlankLines(current);
-            if (next === current) return;
+            if (next === current) continue;
             changed.push({ rawIndex: row.rawIndex, field: 'mes', before: current });
             stageValue(row.rawIndex, 'mes', next);
-        });
+        }
         if (!changed.length) return notify('当前聊天没有三个及以上的连续换行', 'info');
         rememberUndo(changed, `去除多余空行 ${changed.length} 条消息`);
         lastUndo.staged = true;
@@ -1071,7 +1100,7 @@
     function collectPairedTagOptions() {
         const ignored = new Set(['a', 'b', 'blockquote', 'body', 'code', 'details', 'div', 'em', 'head', 'html', 'i', 'li', 'ol', 'p', 'pre', 'script', 'small', 'span', 'strong', 'style', 'summary', 'table', 'tbody', 'td', 'th', 'thead', 'tr', 'ul']);
         const map = new Map();
-        for (const row of getRows()) {
+        for (const row of iterateRows()) {
             const text = String(row.text || '');
             const openings = new Map();
             const closings = new Map();
@@ -1149,13 +1178,15 @@
         const start = ui.exportStart === '' ? 0 : Number(ui.exportStart);
         const end = ui.exportEnd === '' ? Infinity : Number(ui.exportEnd);
         const tags = parseTags(ui.exportTags);
-        return getRows().filter((row) => {
+        const rows = [];
+        for (const row of iterateRows()) {
             const id = Number(row.id);
-            return Number.isFinite(id) && id >= start && id <= end && (ui.exportIncludeUser || !row.isUser);
-        }).map((row) => {
+            if (!Number.isFinite(id) || id < start || id > end || (!ui.exportIncludeUser && row.isUser)) continue;
             const extracted = extractTags(row.text, tags);
-            return { ...row, text: ui.exportClean ? cleanText(extracted) : extracted.trim() };
-        }).filter((row) => row.text);
+            const text = ui.exportClean ? cleanText(extracted) : extracted.trim();
+            if (text) rows.push({ ...row, text });
+        }
+        return rows;
     }
 
     function download(content, filename, mime = 'text/plain;charset=utf-8') {
@@ -1257,9 +1288,15 @@
     function assistantAtFloor(value) {
         const wanted = String(value ?? '').trim();
         if (!wanted) return latestAssistant();
-        const rows = getRows();
-        const row = rows.find((item) => isAssistantMessage(item.raw) && (String(item.id) === wanted || String(item.rawIndex) === wanted));
-        return row ? { raw: row.raw, rawIndex: row.rawIndex, id: row.id, text: row.text } : null;
+        const chat = getChat();
+        for (let rawIndex = 0; rawIndex < chat.length; rawIndex += 1) {
+            const raw = chat[rawIndex];
+            const id = messageId(raw, rawIndex);
+            if (isAssistantMessage(raw) && (String(id) === wanted || String(rawIndex) === wanted)) {
+                return { raw, rawIndex, id, text: messageText(raw) };
+            }
+        }
+        return null;
     }
 
     function postEditTagMatch(text, rawTag) {
@@ -3149,7 +3186,11 @@
         const prompt = String(config.prompt || '').trim();
         const limit = Math.max(0, Math.min(50, Number(config.contextFloors) || 0));
         const tags = parseTags(config.contextTags);
-        const historyRows = limit > 0 ? getRows().slice(-limit) : [];
+        const chat = getChat();
+        const historyStart = Math.max(0, chat.length - limit);
+        const historyRows = limit > 0
+            ? chat.slice(historyStart).map((raw, index) => chatRow(raw, historyStart + index))
+            : [];
         const history = historyRows.map((row) => {
             const text = extractTags(row.text, tags).trim();
             if (!text) return null;
@@ -3533,7 +3574,7 @@
         const source = String(value || '').trim();
         if (!source) return '';
         try {
-            const rendered = cleanTheaterRichHtml(source);
+            const rendered = cachedTheaterRichHtml(source);
             const template = doc.createElement('template');
             template.innerHTML = rendered.html;
             template.content.querySelectorAll('script,style,link,meta').forEach((node) => node.remove());
@@ -3559,10 +3600,20 @@
         return Array.from(text).length;
     }
 
+    function cachedTheaterRichHtml(value) {
+        const source = String(value || '');
+        if (theaterRenderCache.has(source)) return theaterRenderCache.get(source);
+        const rendered = cleanTheaterRichHtml(source);
+        if (theaterRenderCache.size >= 24) {
+            theaterRenderCache.delete(theaterRenderCache.keys().next().value);
+        }
+        theaterRenderCache.set(source, rendered);
+        return rendered;
+    }
+
     function theaterOutputSlot(value, extraClass = '') {
-        const key = `theater-render-${++theaterRenderSequence}`;
-        theaterRenderCache.set(key, String(value || ''));
-        return `<div class="ctb-theater-render${extraClass ? ` ${extraClass}` : ''}" data-ctb-theater-render="${key}"></div>`;
+        const index = theaterRenderValues.push(String(value || '')) - 1;
+        return `<div class="ctb-theater-render${extraClass ? ` ${extraClass}` : ''}" data-ctb-theater-render="${index}"></div>`;
     }
 
     function theaterPlainPreview(value, limit = 420) {
@@ -3576,9 +3627,9 @@
     function hydrateTheaterOutputs() {
         if (!root) return;
         root.querySelectorAll('[data-ctb-theater-render]').forEach((container) => {
-            const value = theaterRenderCache.get(container.dataset.ctbTheaterRender) || '';
+            const value = theaterRenderValues[Number(container.dataset.ctbTheaterRender)] || '';
             try {
-                const rendered = cleanTheaterRichHtml(value);
+                const rendered = cachedTheaterRichHtml(value);
                 if (!rendered.rich) {
                     container.innerHTML = rendered.html;
                     return;
@@ -3601,6 +3652,7 @@
                 container.textContent = value;
             }
         });
+        theaterRenderValues = [];
     }
 
     function theaterRecordById(id, source = 'recent') {
@@ -4020,6 +4072,7 @@
 
     function markWorldbookDirty() {
         worldbookDirty = true;
+        worldbookSimulation = null;
         if (worldbookBook) {
             worldbookPendingDocuments.set(worldbookBook, {
                 ...(worldbookDocument || {}),
@@ -4079,6 +4132,7 @@
             worldbookBatchMode = false;
             worldbookCopyTarget = worldbookBooks.find((name) => name !== worldbookBook) || '';
             worldbookDirty = Boolean(pendingDocument);
+            worldbookSimulation = null;
         } catch (error) {
             notify(`读取世界书失败：${error.message}`, 'error');
         } finally {
@@ -4441,6 +4495,75 @@
         renderPanel();
     }
 
+    function worldbookKeywordHits(text, keywords, caseSensitive = false) {
+        const source = caseSensitive ? String(text || '') : String(text || '').toLocaleLowerCase();
+        return (Array.isArray(keywords) ? keywords : [])
+            .map((keyword) => String(keyword || '').trim())
+            .filter(Boolean)
+            .filter((keyword) => source.includes(caseSensitive ? keyword : keyword.toLocaleLowerCase()));
+    }
+
+    function simulateWorldbookTriggers() {
+        if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
+        if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
+        const chat = getChat();
+        const start = Math.max(0, chat.length - 2);
+        const floors = chat.slice(start).map((message, index) => ({
+            id: messageId(message, start + index),
+            text: `${messageName(message)}: ${messageText(message)}`,
+        }));
+        const scanText = floors.map((floor) => floor.text).join('\n');
+        const triggered = [];
+        let scanned = 0;
+        for (const record of currentWorldbookView()) {
+            const raw = record.raw || {};
+            if (raw.disable) continue;
+            scanned += 1;
+            if (raw.constant) {
+                triggered.push({ uid: record.uid, label: worldbookRecordLabel(record), reason: '常驻条目' });
+                continue;
+            }
+            const caseSensitive = Boolean(raw.caseSensitive ?? raw.case_sensitive);
+            const primary = worldbookKeywordHits(scanText, raw.key, caseSensitive);
+            if (!primary.length) continue;
+            const secondaryKeys = Array.isArray(raw.keysecondary) ? raw.keysecondary.filter((item) => String(item || '').trim()) : [];
+            const usesSecondary = secondaryKeys.length > 0 && raw.selective !== false;
+            const secondary = usesSecondary ? worldbookKeywordHits(scanText, secondaryKeys, caseSensitive) : [];
+            const logic = [0, 1, 2, 3].includes(Number(raw.selectiveLogic)) ? Number(raw.selectiveLogic) : 0;
+            const secondaryPass = !usesSecondary
+                || (logic === 0 && secondary.length > 0)
+                || (logic === 1 && secondary.length < secondaryKeys.length)
+                || (logic === 2 && secondary.length === 0)
+                || (logic === 3 && secondary.length === secondaryKeys.length);
+            if (!secondaryPass) continue;
+            const logicLabel = ['AND ANY', 'NOT ALL', 'NOT ANY', 'AND ALL'][logic];
+            const details = [`主关键词：${primary.join('、')}`];
+            if (usesSecondary) {
+                details.push(`次要逻辑：${logicLabel}`);
+                details.push(secondary.length ? `命中次要：${secondary.join('、')}` : '命中次要：无');
+            }
+            triggered.push({ uid: record.uid, label: worldbookRecordLabel(record), reason: details.join('；') });
+        }
+        worldbookSimulation = {
+            book: worldbookBook,
+            floors: floors.map((floor) => floor.id),
+            scanned,
+            triggered,
+        };
+        renderPanel();
+    }
+
+    function renderWorldbookSimulation() {
+        if (!worldbookSimulation || worldbookSimulation.book !== worldbookBook) return '';
+        const floorText = worldbookSimulation.floors.length
+            ? worldbookSimulation.floors.map((floor) => `#${floor}`).join('、')
+            : '无聊天内容';
+        const items = worldbookSimulation.triggered.length
+            ? worldbookSimulation.triggered.map((item) => `<div class="ctb-worldbook-simulation-item"><strong>${escapeHTML(item.label)}</strong><span>${escapeHTML(item.reason)}</span></div>`).join('')
+            : '<div class="ctb-hint">最近 2 层没有触发当前世界书的关键词条目。</div>';
+        return `<div class="ctb-worldbook-simulation"><div class="ctb-worldbook-simulation-head"><strong>触发结果：${worldbookSimulation.triggered.length} 条</strong><span>扫描 ${escapeHTML(floorText)} · 已开启 ${worldbookSimulation.scanned} 条</span></div><div class="ctb-worldbook-simulation-list">${items}</div></div>`;
+    }
+
     function renderWorldbookInlineEditor(record) {
         const draft = worldbookDraft || record.raw || {};
         const positionItems = WORLDBOOK_POSITIONS.filter((item) => item.value !== 7);
@@ -4550,8 +4673,10 @@
                 <div class="ctb-inline ctb-manager-toolbar">
                     <input class="ctb-input" id="ctb-worldbook-search" placeholder="搜索条目名称、关键词或内容" value="${escapeHTML(worldbookSearch)}">
                     <button type="button" class="ctb-button" data-action="filter-worldbook">筛选</button>
+                    <button type="button" class="ctb-button ctb-primary-soft" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}>模拟触发（2 层）</button>
                     <button type="button" class="ctb-button${worldbookBatchMode ? ' ctb-primary' : ''}" data-action="toggle-worldbook-batch">${worldbookBatchMode ? '完成' : '编辑'}</button>
                 </div>
+                ${renderWorldbookSimulation()}
                 ${batchTools}
                 <div class="ctb-worldbook-entry-list">${list}</div>
             </section>
@@ -5283,9 +5408,8 @@
         if (!root || root.hidden) return;
         // 切换标签时，先保存当前标签的滚动位置，避免覆盖目标标签的滚动位置。
         if (remember) rememberPanelScroll(activeTab);
-        theaterRenderCache.clear();
-        theaterRenderSequence = 0;
-        const total = getRows().length;
+        theaterRenderValues = [];
+        const total = getChat().length;
         const modules = ensureActiveTab();
         const renderers = {
             search: renderSearchTab,
@@ -5620,6 +5744,13 @@
             #${ROOT_ID} .ctb-worldbook-entry.is-expanded{border-color:var(--ctb-accent)!important;box-shadow:0 3px 12px rgba(15,23,42,.09);}
             #${ROOT_ID} .ctb-worldbook-entry.is-selected{outline-color:color-mix(in srgb,var(--ctb-accent) 45%,#fff)!important;}
             #${ROOT_ID} .ctb-worldbook-entry-list{margin-top:8px;}
+            #${ROOT_ID} .ctb-worldbook-simulation{display:grid;gap:6px;margin-top:8px;padding:8px;border:1px solid #cbd5e1;border-radius:5px;background:#f8fafc;}
+            #${ROOT_ID} .ctb-worldbook-simulation-head{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#334155;font-size:11px;}
+            #${ROOT_ID} .ctb-worldbook-simulation-head span{color:#64748b;font-size:10px;}
+            #${ROOT_ID} .ctb-worldbook-simulation-list{display:grid;gap:4px;max-height:150px;overflow:auto;}
+            #${ROOT_ID} .ctb-worldbook-simulation-item{display:grid;grid-template-columns:minmax(90px,.42fr) minmax(0,1fr);gap:8px;padding:5px 6px;border:1px solid #dbe2ea;border-radius:4px;background:#fff;color:#475569;font-size:10px;}
+            #${ROOT_ID} .ctb-worldbook-simulation-item strong{overflow-wrap:anywhere;color:#1f2937;}
+            #${ROOT_ID} .ctb-worldbook-simulation-item span{overflow-wrap:anywhere;}
             #${ROOT_ID} .ctb-worldbook-batch-panel{display:grid;gap:7px;margin:8px 0 0;padding:7px 8px;border:1px solid #cbd5e1;border-radius:5px;background:#f8fafc;}
             #${ROOT_ID} .ctb-worldbook-batch-head{display:flex;align-items:center;gap:10px;min-width:0;}
             #${ROOT_ID} .ctb-worldbook-selected-count{flex:0 0 auto;margin-right:auto;font-weight:600;white-space:nowrap;}
@@ -5681,6 +5812,8 @@
                 #${ROOT_ID} .ctb-worldbook-batch-head{align-items:flex-start;flex-direction:column;}
                 #${ROOT_ID} .ctb-worldbook-selected-count{margin-right:0;}
                 #${ROOT_ID} .ctb-worldbook-batch-actions,#${ROOT_ID} .ctb-worldbook-copy-row{width:100%;}
+                #${ROOT_ID} .ctb-worldbook-simulation-head{align-items:flex-start;flex-direction:column;gap:2px;}
+                #${ROOT_ID} .ctb-worldbook-simulation-item{grid-template-columns:1fr;gap:2px;}
                 #${ROOT_ID} .ctb-placement-choices{grid-template-columns:repeat(2,minmax(0,1fr));}
                 #${ROOT_ID} .ctb-placement-reference{align-items:stretch;flex-direction:column;gap:3px;}
             }
@@ -5787,13 +5920,14 @@
             else if (id.endsWith('-channel-tokens')) channel.maxTokens = target.value;
             return;
         }
-        if (id === 'ctb-post-edit-system' || id === 'ctb-post-edit-rules' || id === 'ctb-theater-system') saveSettings();
+        if (id === 'ctb-post-edit-system' || id === 'ctb-post-edit-rules' || id === 'ctb-theater-system') scheduleSettingsSave();
     }
 
     async function handleChange(event) {
         const target = event.target;
         if (!target) return;
         const id = target.id;
+        if (id === 'ctb-post-edit-system' || id === 'ctb-post-edit-rules' || id === 'ctb-theater-system') flushSettingsSave();
         if (id === 'ctb-regex') ui.regex = target.checked;
         else if (id === 'ctb-export-clean') ui.exportClean = target.checked;
         else if (id === 'ctb-export-user') ui.exportIncludeUser = target.checked;
@@ -6099,6 +6233,7 @@
             case 'delete-worldbook': return deleteWorldbookBook();
             case 'new-worldbook-entry': return createWorldbookEntry();
             case 'toggle-worldbook-batch': return toggleWorldbookBatchMode();
+            case 'simulate-worldbook-triggers': return simulateWorldbookTriggers();
             case 'filter-worldbook': worldbookVisibleLimit = 120; return renderPanel();
             case 'more-worldbook-entries': worldbookVisibleLimit += 120; return renderPanel();
             case 'toggle-worldbook-entry': return toggleWorldbookEntry(data.worldbookUid);
@@ -6240,6 +6375,26 @@
         return true;
     }
 
+    function hostMutationNeedsInjection(mutations) {
+        const needsMenu = !doc.getElementById(ENTRY_ID)?.isConnected;
+        const needsSettings = !doc.getElementById(SETTINGS_ID)?.isConnected;
+        if (!needsMenu && !needsSettings) return false;
+        const menuSelector = '#options,#options_menu,#options-menu,#options-content,#options-content-wrapper,.options-content,#option_list';
+        const settingsSelector = '#extensions_settings,#extensions_settings2,.extensions_settings';
+        const matchesRelevantNode = (node, selector) => node?.nodeType === 1
+            && (node.matches?.(selector) || node.querySelector?.(selector));
+        for (const mutation of mutations) {
+            const target = mutation.target?.nodeType === 1 ? mutation.target : mutation.target?.parentElement;
+            if (needsMenu && target?.closest?.(menuSelector)) return true;
+            if (needsSettings && target?.closest?.(settingsSelector)) return true;
+            for (const node of [...mutation.addedNodes, ...mutation.removedNodes]) {
+                if ((needsMenu && matchesRelevantNode(node, menuSelector))
+                    || (needsSettings && matchesRelevantNode(node, settingsSelector))) return true;
+            }
+        }
+        return false;
+    }
+
     function scheduleHostInjection() {
         if (destroyed || injectionTimer) return;
         injectionTimer = host.setTimeout(() => {
@@ -6272,6 +6427,7 @@
 
     function destroy() {
         if (destroyed) return;
+        flushSettingsSave();
         destroyed = true;
         stopSearchSaveClock();
         if (injectionTimer) host.clearTimeout(injectionTimer);
@@ -6291,6 +6447,7 @@
         theaterTasks.clear();
         if (theaterTaskTicker) host.clearInterval(theaterTaskTicker);
         theaterTaskTicker = null;
+        theaterRenderValues = [];
         theaterRenderCache.clear();
         theaterHistory = [];
         doc.getElementById(STYLE_ID)?.remove();
@@ -6307,16 +6464,15 @@
         if ((!context || !context.extensionSettings) && initAttempts++ < 30) return host.setTimeout(init, 100);
         settings = loadSettings();
         theaterHistory = [];
-        saveSettings();
         createUI();
         injectMenuEntry();
         injectExtensionSettings();
         host.setTimeout(scheduleHostInjection, 800);
-        host.setTimeout(scheduleHostInjection, 900);
         host.setTimeout(scheduleHostInjection, 2200);
-        host.setTimeout(scheduleHostInjection, 2300);
-        menuObserver = new MutationObserver(() => scheduleHostInjection());
-        menuObserver.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
+        menuObserver = new MutationObserver((mutations) => {
+            if (hostMutationNeedsInjection(mutations)) scheduleHostInjection();
+        });
+        menuObserver.observe(doc.body, { childList: true, subtree: true });
         registerSlashCommand();
         onPageHide = destroy;
         onUnload = destroy;
