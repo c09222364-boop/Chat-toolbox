@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.0.19
+// @version      1.0.20
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、小剧场、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -8,7 +8,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '1.0.19';
+    const VERSION = '1.0.20';
     const PREFIX = 'chat-toolbox';
     const STYLE_ID = `${PREFIX}-style`;
     const ROOT_ID = `${PREFIX}-root`;
@@ -171,7 +171,7 @@
         'channel-custom': '用于选择小剧场的生成接口。跟随酒馆主接口会使用酒馆当前模型、流式设置和回复上限；自定义渠道则完全按照这里单独填写的设置发送。',
         'system-cache': '用于填写模型的身份、写作要求和输出格式。留空时使用默认提示词。',
         'theater-scope': '用于根据角色设定、世界书和最近聊天生成独立片段。结果只保存在工具箱中，不会加入聊天楼层。',
-        'worldbook-save': '进入世界书管理时会优先打开当前角色卡绑定的世界书；“模拟最近 2 层”可查看常驻条目和关键词条目的触发结果。条目修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
+        'worldbook-save': '进入世界书管理时会优先打开当前角色卡绑定的世界书；“模拟”会读取最近 2 层，显示常驻条目和关键词条目的触发结果与字数。条目修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
         'preset-transfer': '用于查看、编辑、复制或移动预设中的提示词条目。单预设模式处理一本预设，双预设模式在两本预设之间转移条目。',
     });
 
@@ -3996,9 +3996,12 @@
         return String(raw.comment || raw.name || keys || `条目 ${record?.uid || ''}`);
     }
 
+    function worldbookTextCharacterCount(value) {
+        return Array.from(String(value || '').replace(/\s/g, '')).length;
+    }
+
     function worldbookWordCount(record) {
-        const content = String(record?.raw?.content || '');
-        return Array.from(content.replace(/\s/g, '')).length;
+        return worldbookTextCharacterCount(record?.raw?.content);
     }
 
     function worldbookRecordSearchText(record) {
@@ -4522,8 +4525,13 @@
             .filter((keyword) => source.includes(caseSensitive ? keyword : keyword.toLocaleLowerCase()));
     }
 
-    function simulateWorldbookTriggers() {
+    async function simulateWorldbookTriggers() {
         if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
+        if (worldbookSimulation?.book === worldbookBook) {
+            worldbookSimulation = null;
+            renderPanel();
+            return;
+        }
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         const chat = getChat();
         const start = Math.max(0, chat.length - 2);
@@ -4539,7 +4547,7 @@
             if (raw.disable) continue;
             scanned += 1;
             if (raw.constant) {
-                triggered.push({ uid: record.uid, label: worldbookRecordLabel(record), reason: '常驻条目' });
+                triggered.push({ uid: record.uid, label: worldbookRecordLabel(record), reason: '常驻条目', raw });
                 continue;
             }
             const caseSensitive = Boolean(raw.caseSensitive ?? raw.case_sensitive);
@@ -4561,15 +4569,34 @@
                 details.push(`次要逻辑：${logicLabel}`);
                 details.push(secondary.length ? `命中次要：${secondary.join('、')}` : '命中次要：无');
             }
-            triggered.push({ uid: record.uid, label: worldbookRecordLabel(record), reason: details.join('；') });
+            triggered.push({ uid: record.uid, label: worldbookRecordLabel(record), reason: details.join('；'), raw });
         }
+        const templateState = { api: null, env: null, used: false };
+        let templateFailures = 0;
+        for (let index = 0; index < triggered.length; index += 1) {
+            const item = triggered[index];
+            const message = theaterWorldMessage({ raw: item.raw, content: String(item.raw?.content || '') });
+            try {
+                const rendered = await theaterRenderTemplateText(message.content, message, index, templateState);
+                item.characters = worldbookTextCharacterCount(rendered);
+            } catch (error) {
+                item.characters = worldbookTextCharacterCount(message.content);
+                item.reason = `${item.reason}；EJS 解析失败，按原文统计`;
+                templateFailures += 1;
+                console.warn('[聊天工具箱] 世界书模拟 EJS 解析失败', error);
+            }
+            delete item.raw;
+        }
+        const totalCharacters = triggered.reduce((sum, item) => sum + item.characters, 0);
         worldbookSimulation = {
             book: worldbookBook,
             floors: floors.map((floor) => floor.id),
             scanned,
             triggered,
+            totalCharacters,
         };
         renderPanel();
+        if (templateFailures) notify(`${templateFailures} 个条目的 EJS 解析失败，字数已按原文统计`, 'warning');
     }
 
     function renderWorldbookSimulation() {
@@ -4578,9 +4605,9 @@
             ? worldbookSimulation.floors.map((floor) => `#${floor}`).join('、')
             : '无聊天内容';
         const items = worldbookSimulation.triggered.length
-            ? worldbookSimulation.triggered.map((item) => `<div class="ctb-worldbook-simulation-item"><strong>${escapeHTML(item.label)}</strong><span>${escapeHTML(item.reason)}</span></div>`).join('')
+            ? worldbookSimulation.triggered.map((item) => `<div class="ctb-worldbook-simulation-item"><strong>${escapeHTML(item.label)} <em>${Number(item.characters) || 0} 字</em></strong><span>${escapeHTML(item.reason)}</span></div>`).join('')
             : '<div class="ctb-hint">最近 2 层没有触发当前世界书的关键词条目。</div>';
-        return `<div class="ctb-worldbook-simulation"><div class="ctb-worldbook-simulation-head"><strong>触发结果：${worldbookSimulation.triggered.length} 条</strong><span>扫描 ${escapeHTML(floorText)} · 已开启 ${worldbookSimulation.scanned} 条</span></div><div class="ctb-worldbook-simulation-list">${items}</div></div>`;
+        return `<div class="ctb-worldbook-simulation"><div class="ctb-worldbook-simulation-head"><strong>触发结果：${worldbookSimulation.triggered.length} 条 · 总字数 ${Number(worldbookSimulation.totalCharacters) || 0}</strong><span>扫描 ${escapeHTML(floorText)} · 已开启 ${worldbookSimulation.scanned} 条</span></div><div class="ctb-worldbook-simulation-list">${items}</div></div>`;
     }
 
     function renderWorldbookInlineEditor(record) {
@@ -4693,7 +4720,7 @@
         return `<section class="ctb-section">
                 <div class="ctb-section-title">世界书管理 ${infoButton('worldbook-save')}</div>
                 <button type="button" class="ctb-button ctb-primary-soft ctb-worldbook-simulate-button" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}>
-                    <span><i class="fa-solid fa-bolt"></i> 模拟最近 2 层触发</span>
+                    <span><i class="fa-solid fa-bolt"></i> 模拟</span>
                     <small>${worldbookLoading ? '正在加载世界书…' : worldbookBook ? escapeHTML(worldbookBook) : '没有可用世界书'}</small>
                 </button>
                 <div class="ctb-inline ctb-manager-toolbar">
@@ -5788,6 +5815,7 @@
             #${ROOT_ID} .ctb-worldbook-simulation-list{display:grid;gap:4px;max-height:150px;overflow:auto;}
             #${ROOT_ID} .ctb-worldbook-simulation-item{display:grid;grid-template-columns:minmax(90px,.42fr) minmax(0,1fr);gap:8px;padding:5px 6px;border:1px solid #dbe2ea;border-radius:4px;background:#fff;color:#475569;font-size:10px;}
             #${ROOT_ID} .ctb-worldbook-simulation-item strong{overflow-wrap:anywhere;color:#1f2937;}
+            #${ROOT_ID} .ctb-worldbook-simulation-item strong em{display:inline-block;margin-left:4px;padding:1px 4px;border:1px solid #cbd5e1;border-radius:3px;background:#f8fafc;color:#64748b;font-size:9px;font-style:normal;font-weight:600;white-space:nowrap;}
             #${ROOT_ID} .ctb-worldbook-simulation-item span{overflow-wrap:anywhere;}
             #${ROOT_ID} .ctb-worldbook-batch-panel{display:grid;gap:7px;margin:8px 0 0;padding:7px 8px;border:1px solid #cbd5e1;border-radius:5px;background:#f8fafc;}
             #${ROOT_ID} .ctb-worldbook-batch-head{display:flex;align-items:center;gap:10px;min-width:0;}
