@@ -23,6 +23,7 @@ export function createIfBranchModule(deps) {
         download,
         escapeHTML,
         infoButton,
+        requestDialog,
         renderPanel,
         isPanelTabActive,
         isDestroyed,
@@ -180,9 +181,16 @@ export function createIfBranchModule(deps) {
         notify('IF 开场词已保存', 'success');
     }
     
-    function deleteIfPrompt(id) {
+    async function deleteIfPrompt(id) {
         const prompt = ifPromptById(id);
-        if (!prompt || !host.confirm(`确定删除开场词“${prompt.name}”吗？`)) return;
+        if (!prompt) return;
+        const confirmed = await requestDialog({
+            title: '删除 IF 开场词',
+            message: `确定删除开场词“${prompt.name}”吗？`,
+            confirmLabel: '删除',
+            danger: true,
+        });
+        if (!confirmed) return;
         getSettings().ifBranch.prompts = ifPrompts().filter((item) => item.id !== prompt.id);
         if (ifPromptEditor?.draft?.id === prompt.id) ifPromptEditor = null;
         saveSettings();
@@ -230,7 +238,14 @@ export function createIfBranchModule(deps) {
         const input = doc.querySelector('#send_textarea');
         const send = doc.querySelector('#send_but');
         if (!input || !send) return notify('当前页面没有找到酒馆聊天输入框或发送按钮', 'error');
-        if (String(input.value || '').trim() && !host.confirm('酒馆聊天框里已有文字。开始支线会用所选开场词替换它，确定继续吗？')) return;
+        if (String(input.value || '').trim()) {
+            const confirmed = await requestDialog({
+                title: '替换聊天框内容',
+                message: '酒馆聊天框里已有文字。开始支线会用所选开场词替换它，确定继续吗？',
+                confirmLabel: '替换并开始',
+            });
+            if (!confirmed) return;
+        }
     
         ifBranchStarting = true;
         const context = getContext();
@@ -376,7 +391,13 @@ export function createIfBranchModule(deps) {
         const confirmation = mode === 'keep'
             ? `确定把当前 ${snapshot.layers} 层 IF 支线保留为正式主线吗？`
             : `确定${actionText}当前 IF 支线吗？这会从聊天末尾移除 ${snapshot.layers} 层。`;
-        if (!host.confirm(confirmation)) return;
+        const confirmed = await requestDialog({
+            title: actionText,
+            message: confirmation,
+            confirmLabel: actionText,
+            danger: mode === 'discard',
+        });
+        if (!confirmed) return;
     
         const favorite = mode === 'collect' ? createIfBranchFavorite(snapshot) : null;
         try {
@@ -412,7 +433,14 @@ export function createIfBranchModule(deps) {
     
     async function clearBrokenIfBranchState() {
         const branch = ifBranchMetadata();
-        if (!branch || !host.confirm('只清除工具箱的异常支线标记吗？聊天楼层和当前变量都不会改动。')) return;
+        if (!branch) return;
+        const confirmed = await requestDialog({
+            title: '清除异常标记',
+            message: '只清除工具箱的异常支线标记吗？聊天楼层和当前变量都不会改动。',
+            confirmLabel: '清除标记',
+            danger: true,
+        });
+        if (!confirmed) return;
         delete getContext().chatMetadata[IF_BRANCH_META_KEY];
         await saveIfBranchMetadata();
         renderPanel();
@@ -450,10 +478,17 @@ export function createIfBranchModule(deps) {
         download(header + ifFavoriteTranscript(favorite), `${safe}.txt`);
     }
     
-    function renameIfFavorite(id) {
+    async function renameIfFavorite(id) {
         const favorite = ifFavoriteById(id);
         if (!favorite) return notify('找不到这条收藏', 'error');
-        const title = host.prompt('收藏名称', favorite.title);
+        const title = await requestDialog({
+            kind: 'prompt',
+            title: '重命名 IF 收藏',
+            label: '收藏名称',
+            value: favorite.title,
+            placeholder: '输入收藏名称',
+            confirmLabel: '保存',
+        });
         if (title === null) return;
         const trimmed = String(title).trim();
         if (!trimmed) return notify('收藏名称不能为空', 'warning');
@@ -462,9 +497,16 @@ export function createIfBranchModule(deps) {
         renderPanel();
     }
     
-    function deleteIfFavorite(id) {
+    async function deleteIfFavorite(id) {
         const favorite = ifFavoriteById(id);
-        if (!favorite || !host.confirm(`确定删除收藏“${favorite.title}”吗？`)) return;
+        if (!favorite) return;
+        const confirmed = await requestDialog({
+            title: '删除 IF 收藏',
+            message: `确定删除收藏“${favorite.title}”吗？`,
+            confirmLabel: '删除',
+            danger: true,
+        });
+        if (!confirmed) return;
         getSettings().ifBranch.favorites = ifFavorites().filter((item) => item.id !== favorite.id);
         if (ifBranchReader?.favoriteId === favorite.id) ifBranchReader = null;
         saveSettings();
@@ -476,7 +518,14 @@ export function createIfBranchModule(deps) {
         if (!favorite) return '';
         const messages = favorite.messages.map((message, index) => {
             const role = message.role === 'user' ? '用户' : message.role === 'system' ? '系统' : '角色';
-            return `<article class="ctb-if-reader-message is-${message.role}"><div><strong>${index + 1}. ${role}${message.name ? ` · ${escapeHTML(message.name)}` : ''}</strong><span>${ifBranchCharacterCount(message.text)} 字</span></div><pre>${escapeHTML(message.text)}</pre></article>`;
+            let content = '';
+            if (typeof host.messageFormatting === 'function') {
+                try {
+                    content = host.messageFormatting(String(message.text || ''), String(message.name || ''), message.role === 'system', message.role === 'user', -1, {}, false);
+                } catch (_) {}
+            }
+            if (!content) content = escapeHTML(message.text).replace(/\n/g, '<br>');
+            return `<article class="ctb-if-reader-message is-${message.role}"><div class="ctb-if-reader-meta"><strong>${index + 1}. ${role}${message.name ? ` · ${escapeHTML(message.name)}` : ''}</strong><span>${ifBranchCharacterCount(message.text)} 字</span></div><div class="ctb-if-reader-rendered mes_text">${content}</div></article>`;
         }).join('');
         return `<div class="ctb-reader-overlay" role="dialog" aria-modal="true">
             <div class="ctb-reader-card">
@@ -532,7 +581,7 @@ export function createIfBranchModule(deps) {
     }
     
     function renderIfBranchTab() {
-        return `<section class="ctb-section"><div class="ctb-section-title">临时 IF 支线 ${infoButton('if-branch-scope')}</div><p class="ctb-if-intro">选一条开场词后，工具箱会把它作为 user 消息交给酒馆原生聊天。你可以连续对话任意多轮，再决定收藏并删除、仅删除，或保留为主线。</p></section>
+        return `<section class="ctb-section"><div class="ctb-section-title">临时 IF 支线 ${infoButton('if-branch-scope')}</div></section>
             ${renderActiveIfBranch()}
             <div class="ctb-inline ctb-if-tabs"><button type="button" class="ctb-scope${ifBranchLibraryView === 'prompts' ? ' is-active' : ''}" data-action="set-if-library-view" data-if-view="prompts">开场词库</button><button type="button" class="ctb-scope${ifBranchLibraryView === 'favorites' ? ' is-active' : ''}" data-action="set-if-library-view" data-if-view="favorites">收藏夹</button></div>
             ${ifBranchLibraryView === 'favorites' ? renderIfFavorites() : renderIfPrompts()}`;
@@ -554,7 +603,7 @@ export function createIfBranchModule(deps) {
             case 'edit-if-prompt': beginEditIfPrompt(data.ifPromptId); return true;
             case 'save-if-prompt': saveIfPromptEditor(); return true;
             case 'cancel-if-prompt': cancelIfPromptEditor(); return true;
-            case 'delete-if-prompt': deleteIfPrompt(data.ifPromptId); return true;
+            case 'delete-if-prompt': await deleteIfPrompt(data.ifPromptId); return true;
             case 'fill-if-prompt': fillIfPrompt(data.ifPromptId); return true;
             case 'start-if-branch': await startIfBranch(data.ifPromptId); return true;
             case 'finish-if-collect': await finishIfBranch('collect'); return true;
@@ -564,8 +613,8 @@ export function createIfBranchModule(deps) {
             case 'open-if-favorite': ifBranchReader = { favoriteId: data.ifFavoriteId }; renderPanel(); return true;
             case 'copy-if-favorite': await copyIfFavorite(data.ifFavoriteId); return true;
             case 'export-if-favorite': exportIfFavorite(data.ifFavoriteId); return true;
-            case 'rename-if-favorite': renameIfFavorite(data.ifFavoriteId); return true;
-            case 'delete-if-favorite': deleteIfFavorite(data.ifFavoriteId); return true;
+            case 'rename-if-favorite': await renameIfFavorite(data.ifFavoriteId); return true;
+            case 'delete-if-favorite': await deleteIfFavorite(data.ifFavoriteId); return true;
             case 'close-if-reader': closeReader(); return true;
             default: return false;
         }
