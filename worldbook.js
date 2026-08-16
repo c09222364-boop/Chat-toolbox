@@ -1,7 +1,7 @@
 export function createWorldbookModule(deps) {
     const {
         host, getContext, getChat, chatKey, currentCharacterCard, deepClone,
-        stProxyJson, notify, renderPanel, getRoot, requestConfirm,
+        stProxyJson, notify, renderPanel, getRoot, requestDialog,
         escapeHTML, messageId, messageName, messageText, infoButton,
     } = deps;
 
@@ -500,7 +500,13 @@ export function createWorldbookModule(deps) {
     
     async function createWorldbookBook() {
         if ((worldbookDraftDirty || worldbookDirty) && !canDiscardWorldbookChanges()) return;
-        const name = String(host.prompt('新世界书名称：') || '').trim();
+        const name = String(await requestDialog({
+            kind: 'prompt',
+            title: '新建世界书',
+            label: '世界书名称',
+            placeholder: '输入世界书名称',
+            confirmLabel: '创建',
+        }) || '').trim();
         if (!name) return;
         if (worldbookBooks.includes(name)) return notify('已经存在同名世界书', 'warning');
         try {
@@ -515,7 +521,14 @@ export function createWorldbookModule(deps) {
     
     async function deleteWorldbookBook(name) {
         const book = String(name || worldbookBook || '');
-        if (!book || !host.confirm(`确定删除世界书“${book}”吗？此操作会删除文件。`)) return;
+        if (!book) return;
+        const confirmed = await requestDialog({
+            title: '删除世界书',
+            message: `确定删除世界书“${book}”吗？此操作会删除文件。`,
+            confirmLabel: '删除',
+            danger: true,
+        });
+        if (!confirmed) return;
         try {
             await stProxyJson('/api/worldinfo/delete', { name: book });
             worldbookBooks = [];
@@ -529,7 +542,14 @@ export function createWorldbookModule(deps) {
     async function renameWorldbookBook() {
         if (!worldbookBook) return;
         const oldName = worldbookBook;
-        const name = String(host.prompt('新的世界书名称：', oldName) || '').trim();
+        const name = String(await requestDialog({
+            kind: 'prompt',
+            title: '重命名世界书',
+            label: '世界书名称',
+            value: oldName,
+            placeholder: '输入新的世界书名称',
+            confirmLabel: '保存',
+        }) || '').trim();
         if (!name || name === oldName) return;
         if (worldbookBooks.includes(name)) return notify('已经存在同名世界书', 'warning');
         try {
@@ -545,18 +565,16 @@ export function createWorldbookModule(deps) {
         }
     }
     
-    async function deleteSelectedWorldbookEntries({ confirmed = false } = {}) {
+    async function deleteSelectedWorldbookEntries() {
         const ids = [...worldbookSelected];
         if (!ids.length) return;
-        if (!confirmed) {
-            requestConfirm({
-                title: '删除世界书条目',
-                message: `确定删除选中的 ${ids.length} 个条目吗？删除会在当前世界书中暂存，并在保存时写入。`,
-                action: 'delete-worldbook-entries',
-            });
-            renderPanel();
-            return;
-        }
+        const confirmed = await requestDialog({
+            title: '删除世界书条目',
+            message: `确定删除选中的 ${ids.length} 个条目吗？删除会在当前世界书中暂存，并在保存时写入。`,
+            confirmLabel: '删除',
+            danger: true,
+        });
+        if (!confirmed) return;
         if (worldbookDraftDirty && !ids.includes(String(worldbookEditingUid))) applyWorldbookDraft({ quiet: true });
         worldbookEntries = worldbookEntries.filter((record) => !worldbookSelected.has(record.uid));
         normalizeWorldbookDisplayIndexes(worldbookEntries);
@@ -1051,22 +1069,26 @@ export function createWorldbookModule(deps) {
         worldbookSelected = new Set();
     }
 
-    async function beforePanelClose({ confirmed = false, discarded = false } = {}) {
-        if (worldbookDraftDirty && !discarded) applyWorldbookDraft({ quiet: true });
-        if ((worldbookDirty || worldbookPendingDocuments.size) && !confirmed && !discarded) {
-            requestConfirm({
+    async function beforePanelClose() {
+        if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
+        if (worldbookDirty || worldbookPendingDocuments.size) {
+            const decision = await requestDialog({
                 title: '保存世界书并关闭',
                 message: '世界书有未保存修改。你可以保存后关闭、直接放弃修改退出，或返回继续编辑。',
-                action: 'close-worldbook',
+                buttons: [
+                    { label: '保存并关闭', value: 'save', tone: 'primary' },
+                    { label: '不保存退出', value: 'discard', tone: 'danger' },
+                    { label: '取消继续编辑', value: 'cancel' },
+                ],
             });
-            renderPanel();
-            return false;
-        }
-        if (!discarded && (worldbookDirty || worldbookPendingDocuments.size)) {
+            if (decision === 'cancel' || decision === null) return false;
+            if (decision === 'discard') {
+                discardChanges();
+                return true;
+            }
             if (worldbookDirty && !(await saveCurrentWorldbook())) return false;
             if (!(await savePendingWorldbooks())) return false;
         }
-        if (discarded) discardChanges();
         return true;
     }
 
@@ -1150,7 +1172,5 @@ export function createWorldbookModule(deps) {
         handleChange,
         handleAction,
         beforePanelClose,
-        confirmDeleteSelected: () => deleteSelectedWorldbookEntries({ confirmed: true }),
-        discardChanges,
     };
 }

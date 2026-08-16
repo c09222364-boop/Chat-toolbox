@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.2.1
+// @version      1.2.2
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、IF 支线收藏、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -14,7 +14,7 @@ import { createPostEditModule } from './post-edit.js';
 (function () {
     'use strict';
 
-    const VERSION = '1.2.1';
+    const VERSION = '1.2.2';
     const PREFIX = 'chat-toolbox';
     const ROOT_ID = `${PREFIX}-root`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
@@ -53,7 +53,7 @@ import { createPostEditModule } from './post-edit.js';
     // Keep plugin notifications inside the toolbox so API/save errors do not
     // leak into SillyTavern's page-level toastr layer while the panel is open.
     let transientNotice = null;
-    let pendingConfirm = null;
+    let pendingDialog = null;
     let settings = defaults();
 
     const INFO = Object.freeze({
@@ -293,34 +293,64 @@ import { createPostEditModule } from './post-edit.js';
         return `<div class="ctb-notice-overlay" role="alertdialog" aria-modal="true"><div class="ctb-notice-card is-${tone}"><div class="ctb-notice-title">${tone === 'error' ? '插件错误' : tone === 'warning' ? '提示' : tone === 'success' ? '已完成' : '聊天工具箱'}</div><div class="ctb-notice-message">${escapeHTML(transientNotice.message)}</div><button type="button" class="ctb-button ctb-primary" data-action="close-notice">知道了</button></div></div>`;
     }
 
-    function renderConfirmDialog() {
-        if (!pendingConfirm) return '';
-        const isWorldbookClose = pendingConfirm.action === 'close-worldbook';
-        const isPrompt = pendingConfirm.kind === 'prompt';
-        const confirmClass = pendingConfirm.danger ? 'ctb-button ctb-danger' : 'ctb-button ctb-primary';
+    function renderDialog() {
+        if (!pendingDialog) return '';
+        const isPrompt = pendingDialog.kind === 'prompt';
         const promptField = isPrompt
-            ? `<label class="ctb-dialog-field">${pendingConfirm.label ? `<span>${escapeHTML(pendingConfirm.label)}</span>` : ''}<input class="ctb-input" id="ctb-dialog-input" value="${escapeHTML(pendingConfirm.value || '')}" placeholder="${escapeHTML(pendingConfirm.placeholder || '')}"></label>`
+            ? `<label class="ctb-dialog-field">${pendingDialog.label ? `<span>${escapeHTML(pendingDialog.label)}</span>` : ''}<input class="ctb-input" id="ctb-dialog-input" value="${escapeHTML(pendingDialog.value || '')}" placeholder="${escapeHTML(pendingDialog.placeholder || '')}"></label>`
             : '';
-        const actions = isWorldbookClose
-            ? '<button type="button" class="ctb-button ctb-primary" data-action="confirm-dialog">保存并关闭</button><button type="button" class="ctb-button ctb-danger" data-action="discard-worldbook-close">不保存退出</button><button type="button" class="ctb-button" data-action="cancel-dialog">取消继续编辑</button>'
-            : `<button type="button" class="${confirmClass}" data-action="confirm-dialog">${escapeHTML(pendingConfirm.confirmLabel || '确认')}</button><button type="button" class="ctb-button" data-action="cancel-dialog">${escapeHTML(pendingConfirm.cancelLabel || '取消')}</button>`;
-        return `<div class="ctb-notice-overlay" role="dialog" aria-modal="true"><div class="ctb-notice-card is-warning"><div class="ctb-notice-title">${escapeHTML(pendingConfirm.title || '请确认')}</div>${pendingConfirm.message ? `<div class="ctb-notice-message">${escapeHTML(pendingConfirm.message)}</div>` : ''}${promptField}<div class="ctb-inline ctb-confirm-actions">${actions}</div></div></div>`;
+        const actions = dialogChoices(pendingDialog).map((choice, index) => {
+            const tone = choice.tone === 'danger' ? ' ctb-danger' : choice.tone === 'primary' ? ' ctb-primary' : '';
+            return `<button type="button" class="ctb-button${tone}" data-action="resolve-dialog" data-dialog-choice="${index}">${escapeHTML(choice.label)}</button>`;
+        }).join('');
+        return `<div class="ctb-notice-overlay" role="dialog" aria-modal="true"><div class="ctb-notice-card is-warning"><div class="ctb-notice-title">${escapeHTML(pendingDialog.title || '请确认')}</div>${pendingDialog.message ? `<div class="ctb-notice-message">${escapeHTML(pendingDialog.message)}</div>` : ''}${promptField}<div class="ctb-inline ctb-dialog-actions">${actions}</div></div></div>`;
+    }
+
+    function dialogChoices(dialog) {
+        if (Array.isArray(dialog?.buttons) && dialog.buttons.length) {
+            return dialog.buttons.map((choice) => ({
+                label: String(choice?.label || '确认'),
+                value: choice?.value,
+                tone: choice?.tone,
+                submit: choice?.submit === true,
+            }));
+        }
+        return [
+            {
+                label: String(dialog?.confirmLabel || '确认'),
+                value: true,
+                tone: dialog?.danger ? 'danger' : 'primary',
+                submit: dialog?.kind === 'prompt',
+            },
+            { label: String(dialog?.cancelLabel || '取消'), value: null },
+        ];
     }
 
     function requestDialog(options = {}) {
-        if (typeof pendingConfirm?.resolve === 'function') {
-            pendingConfirm.resolve(pendingConfirm.kind === 'prompt' ? null : false);
-        }
+        if (pendingDialog) cancelPendingDialog();
         return new Promise((resolve) => {
-            pendingConfirm = { ...options, kind: options.kind === 'prompt' ? 'prompt' : 'confirm', resolve };
+            pendingDialog = { ...options, kind: options.kind === 'prompt' ? 'prompt' : 'confirm', resolve };
             renderPanel();
         });
     }
 
     function cancelPendingDialog() {
-        const dialog = pendingConfirm;
-        pendingConfirm = null;
-        if (typeof dialog?.resolve === 'function') dialog.resolve(dialog.kind === 'prompt' ? null : false);
+        const dialog = pendingDialog;
+        pendingDialog = null;
+        if (typeof dialog?.resolve === 'function') dialog.resolve(null);
+    }
+
+    function resolvePendingDialog(choiceIndex) {
+        const dialog = pendingDialog;
+        if (!dialog) return;
+        const choice = dialogChoices(dialog)[Number(choiceIndex)];
+        if (!choice) return;
+        const value = dialog.kind === 'prompt' && choice.submit
+            ? String(root?.querySelector('#ctb-dialog-input')?.value ?? '')
+            : choice.value;
+        pendingDialog = null;
+        renderPanel();
+        dialog.resolve?.(value);
     }
 
     function escapeHTML(value) {
@@ -555,8 +585,8 @@ import { createPostEditModule } from './post-edit.js';
         renderPanel();
     }
 
-    async function closePanel({ confirmed = false, discarded = false } = {}) {
-        if (!(await worldbook.beforePanelClose({ confirmed, discarded }))) return;
+    async function closePanel() {
+        if (!(await worldbook.beforePanelClose())) return;
         infoMessage = null;
         transientNotice = null;
         cancelPendingDialog();
@@ -596,10 +626,7 @@ import { createPostEditModule } from './post-edit.js';
         closePanel,
         getRoot: () => root,
         infoButton,
-        confirmState: {
-            get value() { return pendingConfirm; },
-            set value(value) { pendingConfirm = value; },
-        },
+        requestDialog,
     });
 
 
@@ -629,6 +656,7 @@ import { createPostEditModule } from './post-edit.js';
         renderPanel,
         escapeHTML,
         infoButton,
+        requestDialog,
         defaultPostEditSystemPrompt,
     });
 
@@ -684,7 +712,7 @@ import { createPostEditModule } from './post-edit.js';
         notify,
         renderPanel,
         getRoot: () => root,
-        requestConfirm: (confirmation) => { pendingConfirm = confirmation; },
+        requestDialog,
         escapeHTML,
         messageId,
         messageName,
@@ -702,6 +730,7 @@ import { createPostEditModule } from './post-edit.js';
         getRoot: () => root,
         escapeHTML,
         infoButton,
+        requestDialog,
     });
 
 
@@ -779,14 +808,14 @@ import { createPostEditModule } from './post-edit.js';
             ${tabs ? `<nav class="ctb-tabs" style="--ctb-tab-count:${Math.min(modules.length, 5)}">${tabs}</nav>` : ''}
             <main class="ctb-body">${body}${renderInfoPopup()}</main>
             ${renderTransientNotice()}
-            ${renderConfirmDialog()}
+            ${renderDialog()}
         </div>${ifBranch.renderReader()}`;
         restorePanelScroll(activeTab);
         if (ifBranch.hasReader()) {
             (host.requestAnimationFrame || ((callback) => host.setTimeout(callback, 0)))(() => {
                 root?.querySelector('[data-action="close-if-reader"]')?.focus?.({ preventScroll: true });
             });
-        } else if (pendingConfirm?.kind === 'prompt') {
+        } else if (pendingDialog?.kind === 'prompt') {
             (host.requestAnimationFrame || ((callback) => host.setTimeout(callback, 0)))(() => {
                 const input = root?.querySelector('#ctb-dialog-input');
                 input?.focus?.({ preventScroll: true });
@@ -808,6 +837,18 @@ import { createPostEditModule } from './post-edit.js';
         root.addEventListener('input', handleInput);
         root.addEventListener('change', handleChange);
         root.addEventListener('keydown', (event) => {
+            if (pendingDialog && event.key === 'Escape') {
+                event.preventDefault();
+                event.stopPropagation();
+                cancelPendingDialog();
+                renderPanel();
+                return;
+            }
+            if (pendingDialog?.kind === 'prompt' && event.key === 'Enter' && event.target?.id === 'ctb-dialog-input') {
+                event.preventDefault();
+                resolvePendingDialog(0);
+                return;
+            }
             if (event.key === 'Escape' && ifBranch.hasReader()) {
                 ifBranch.handleGlobalKeydown(event);
                 return;
@@ -850,22 +891,7 @@ import { createPostEditModule } from './post-edit.js';
                 settings.uiTheme = settings.uiTheme === 'green' ? 'blue' : 'green';
                 return renderPanel();
             case 'close-notice': transientNotice = null; return renderPanel();
-            case 'confirm-dialog': {
-                const confirm = pendingConfirm;
-                const value = confirm?.kind === 'prompt' ? String(root?.querySelector('#ctb-dialog-input')?.value ?? '') : true;
-                pendingConfirm = null;
-                renderPanel();
-                if (typeof confirm?.resolve === 'function') return confirm.resolve(value);
-                if (confirm?.action === 'replace-all') return searchExport.confirmReplaceAll();
-                if (confirm?.action === 'close-worldbook') return closePanel({ confirmed: true });
-                if (confirm?.action === 'delete-worldbook-entries') return worldbook.confirmDeleteSelected();
-                return undefined;
-            }
-            case 'discard-worldbook-close':
-                if (pendingConfirm?.action !== 'close-worldbook') return undefined;
-                pendingConfirm = null;
-                return closePanel({ discarded: true });
-            case 'cancel-dialog': cancelPendingDialog(); return renderPanel();
+            case 'resolve-dialog': return resolvePendingDialog(data.dialogChoice);
             case 'show-info': infoMessage = infoMessage === data.infoKey ? null : data.infoKey; return renderPanel();
             case 'close-info': infoMessage = null; return renderPanel();
             case 'tab':

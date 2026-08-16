@@ -1,5 +1,5 @@
 export function createPresetTransferModule(deps) {
-    const { host, getContext, deepClone, notify, renderPanel, getRoot, escapeHTML, infoButton } = deps;
+    const { host, getContext, deepClone, notify, renderPanel, getRoot, escapeHTML, infoButton, requestDialog } = deps;
 
     let presetTransferLoading = false;
     let presetTransferLoadedOnce = false;
@@ -472,7 +472,14 @@ export function createPresetTransferModule(deps) {
     
     async function deletePresetEntries() {
         const selected = presetSelectedRecords();
-        if (!selected.length || !host.confirm(`确定从预设“${presetTransferSource}”删除选中的 ${selected.length} 个条目吗？`)) return;
+        if (!selected.length) return;
+        const confirmed = await requestDialog({
+            title: '删除预设条目',
+            message: `确定从预设“${presetTransferSource}”删除选中的 ${selected.length} 个条目吗？`,
+            confirmLabel: '删除',
+            danger: true,
+        });
+        if (!confirmed) return;
         presetTransferLoading = true;
         renderPanel();
         try {

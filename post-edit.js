@@ -5,7 +5,7 @@ export function createPostEditModule(deps) {
         escapeRegex, normalizeBlankLines, saveChat, verifySavedEntries,
         refreshVisibleMessage, emitMessageEdited, emitMessageUpdated,
         rememberUndo, saveSettings, scheduleSettingsSave, flushSettingsSave,
-        notify, renderPanel, escapeHTML, infoButton, defaultPostEditSystemPrompt,
+        notify, renderPanel, escapeHTML, infoButton, requestDialog, defaultPostEditSystemPrompt,
     } = deps;
     const AI_REQUEST_TIMEOUT_SEC = aiRequestTimeoutSec;
 
@@ -394,12 +394,18 @@ export function createPostEditModule(deps) {
         notify(`规则预设“${name}”已保存`, 'success');
     }
     
-    function deletePostEditPreset() {
+    async function deletePostEditPreset() {
         const config = getSettings().postEdit;
         const index = config.presets.findIndex((item) => item.id === config.selectedPresetId);
         if (index < 0) return;
         const name = config.presets[index].name;
-        if (!host.confirm(`确定删除规则预设“${name}”吗？`)) return;
+        const confirmed = await requestDialog({
+            title: '删除规则预设',
+            message: `确定删除规则预设“${name}”吗？`,
+            confirmLabel: '删除',
+            danger: true,
+        });
+        if (!confirmed) return;
         config.presets.splice(index, 1);
         config.selectedPresetId = '';
         config.presetName = '';
@@ -958,7 +964,14 @@ export function createPostEditModule(deps) {
             case 'cancel-channel': cancelChannelEditor(); return true;
             case 'delete-channel': {
                 const index = getSettings().ai.channels.findIndex((channel) => channel.id === data.channelId);
-                if (index < 0 || !host.confirm('确定删除这个生成渠道吗？使用它的词句修改会改为跟随酒馆主接口。')) return true;
+                if (index < 0) return true;
+                const confirmed = await requestDialog({
+                    title: '删除生成渠道',
+                    message: '确定删除这个生成渠道吗？使用它的词句修改会改为跟随酒馆主接口。',
+                    confirmLabel: '删除',
+                    danger: true,
+                });
+                if (!confirmed) return true;
                 getSettings().ai.channels.splice(index, 1);
                 if (getSettings().postEdit.channelId === data.channelId) getSettings().postEdit.channelId = 'main';
                 channelEditor = null;
@@ -968,7 +981,7 @@ export function createPostEditModule(deps) {
             }
             case 'fetch-models': await fetchChannelModels(data.channelId); return true;
             case 'save-post-preset': savePostEditPreset(); return true;
-            case 'delete-post-preset': deletePostEditPreset(); return true;
+            case 'delete-post-preset': await deletePostEditPreset(); return true;
             case 'prepare-post-edit': preparePostEditFloor(); return true;
             case 'preview-post-edit-prompt': await previewPostEditPrompt(); return true;
             case 'close-post-edit-preview': postEditPromptPreview = null; renderPanel(); return true;

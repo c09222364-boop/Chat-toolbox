@@ -6,7 +6,7 @@ export function createSearchExportModule(deps) {
         escapeHTML, escapeXml, escapeRegex, escapeCss, saveChat,
         verifySavedEntries, refreshVisibleMessage, emitMessageEdited,
         emitMessageUpdated, download, notify, renderPanel, closePanel,
-        getRoot, infoButton, confirmState,
+        getRoot, infoButton, requestDialog,
     } = deps;
     const PREFIX = prefix;
     const MAX_RESULTS = maxResults;
@@ -300,18 +300,15 @@ export function createSearchExportModule(deps) {
         }
     }
     
-    function replaceAll() {
+    async function replaceAll() {
         if (ui.scope === 'json') return notify('完整消息 JSON 仅用于查找，不能直接替换', 'warning');
         if (!ui.query.trim()) return notify('请输入查找内容', 'warning');
         if (!results.length) return notify('没有可替换的匹配结果', 'info');
-        if (!confirmState.value) {
-            confirmState.value = {
-                title: '确认整体替换',
-                message: `确定要替换当前范围内的 ${results.length} 个匹配吗？替换只会先暂存，仍需点击“保存修改”才写入聊天文件。`,
-                action: 'replace-all',
-            };
-            return renderPanel();
-        }
+        const confirmed = await requestDialog({
+            title: '确认整体替换',
+            message: `确定要替换当前范围内的 ${results.length} 个匹配吗？替换只会先暂存，仍需点击“保存修改”才写入聊天文件。`,
+        });
+        if (!confirmed) return;
         return replaceAllNow();
     }
     
@@ -759,7 +756,7 @@ export function createSearchExportModule(deps) {
             case 'next-result': selectResult(currentResultIndex + 1, false); return true;
             case 'jump-result': selectResult(Number(data.resultIndex), true); return true;
             case 'replace-current': replaceCurrent(); return true;
-            case 'replace-all': replaceAll(); return true;
+            case 'replace-all': await replaceAll(); return true;
             case 'save-search-changes': await saveSearchChanges(); return true;
             case 'undo': await undoLast(); return true;
             case 'export-txt': exportTXT(); return true;
@@ -784,7 +781,6 @@ export function createSearchExportModule(deps) {
         handleChange,
         handleAction,
         handleKeydown,
-        confirmReplaceAll: replaceAllNow,
         rememberUndo,
         destroy: stopSearchSaveClock,
     };
