@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.2.2
+// @version      1.2.3
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、IF 支线收藏、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -14,7 +14,7 @@ import { createPostEditModule } from './post-edit.js';
 (function () {
     'use strict';
 
-    const VERSION = '1.2.2';
+    const VERSION = '1.2.3';
     const PREFIX = 'chat-toolbox';
     const ROOT_ID = `${PREFIX}-root`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
@@ -162,11 +162,19 @@ import { createPostEditModule } from './post-edit.js';
 
     function normalizeIfFavorite(item) {
         if (!item || typeof item !== 'object') return null;
-        const messages = (Array.isArray(item.messages) ? item.messages : []).map((message) => ({
-            role: message?.role === 'user' ? 'user' : message?.role === 'system' ? 'system' : 'assistant',
-            name: String(message?.name || ''),
-            text: String(message?.text || ''),
-        })).filter((message) => message.text);
+        const messages = (Array.isArray(item.messages) ? item.messages : []).map((message) => {
+            let text = String(message?.text || '');
+            if (!text && message?.renderedHtml) {
+                const container = doc.createElement('div');
+                container.innerHTML = String(message.renderedHtml);
+                text = String(container.textContent || '');
+            }
+            return {
+                role: message?.role === 'user' ? 'user' : message?.role === 'system' ? 'system' : 'assistant',
+                name: String(message?.name || ''),
+                text,
+            };
+        }).filter((message) => message.text);
         if (!messages.length) return null;
         return {
             id: String(item.id || `if-favorite-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`),

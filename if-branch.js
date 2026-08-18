@@ -38,7 +38,7 @@ export function createIfBranchModule(deps) {
     function ifPrompts() {
         return Array.isArray(getSettings().ifBranch?.prompts) ? getSettings().ifBranch.prompts : [];
     }
-    
+
     function ifFavorites() {
         return Array.isArray(getSettings().ifBranch?.favorites) ? getSettings().ifBranch.favorites : [];
     }
@@ -65,7 +65,7 @@ export function createIfBranchModule(deps) {
         if (message?.is_system || message?.role === 'system') return 'system';
         return 'assistant';
     }
-    
+
     function ifBranchStoredMessage(message) {
         return {
             role: ifBranchMessageRole(message),
@@ -230,7 +230,7 @@ export function createIfBranchModule(deps) {
     }
     
     async function startIfBranch(promptId) {
-        if (ifBranchStarting) return;
+        if (ifBranchStarting) return notify('IF 支线正在开始，请稍候', 'info');
         if (ifBranchMetadata()) return notify('当前聊天已有一条进行中的 IF 支线，请先处理它', 'warning');
         if (isHostGenerationBusy()) return notify('酒馆正在生成回复，请等待本轮完成后再开始 IF 支线', 'warning');
         const prompt = ifPromptById(promptId);
@@ -266,6 +266,7 @@ export function createIfBranchModule(deps) {
     
         try {
             context.chatMetadata[IF_BRANCH_META_KEY] = branch;
+            renderPanel();
             await saveIfBranchMetadata();
             setHostChatInput(prompt.content, { focus: false });
             send.click();
@@ -518,14 +519,8 @@ export function createIfBranchModule(deps) {
         if (!favorite) return '';
         const messages = favorite.messages.map((message, index) => {
             const role = message.role === 'user' ? '用户' : message.role === 'system' ? '系统' : '角色';
-            let content = '';
-            if (typeof host.messageFormatting === 'function') {
-                try {
-                    content = host.messageFormatting(String(message.text || ''), String(message.name || ''), message.role === 'system', message.role === 'user', -1, {}, false);
-                } catch (_) {}
-            }
-            if (!content) content = escapeHTML(message.text).replace(/\n/g, '<br>');
-            return `<article class="ctb-if-reader-message is-${message.role}"><div class="ctb-if-reader-meta"><strong>${index + 1}. ${role}${message.name ? ` · ${escapeHTML(message.name)}` : ''}</strong><span>${ifBranchCharacterCount(message.text)} 字</span></div><div class="ctb-if-reader-rendered mes_text">${content}</div></article>`;
+            const content = escapeHTML(message.text).replace(/\n/g, '<br>');
+            return `<article class="ctb-if-reader-message is-${message.role}"><div class="ctb-if-reader-meta"><strong>${index + 1}. ${role}${message.name ? ` · ${escapeHTML(message.name)}` : ''}</strong><span>${ifBranchCharacterCount(message.text)} 字</span></div><div class="ctb-if-reader-plain">${content}</div></article>`;
         }).join('');
         return `<div class="ctb-reader-overlay" role="dialog" aria-modal="true">
             <div class="ctb-reader-card">
@@ -555,10 +550,13 @@ export function createIfBranchModule(deps) {
             return `<section class="ctb-section ctb-if-active is-error"><div class="ctb-section-title">IF 支线标记异常</div><p>当前聊天保留了支线状态，但找不到支线起点。请先检查聊天，再只清除工具箱标记。</p><button type="button" class="ctb-button ctb-danger" data-action="clear-broken-if-branch">清除异常标记</button></section>`;
         }
         const started = snapshot.branch.startedAt ? new Date(snapshot.branch.startedAt).toLocaleString() : '';
+        const status = ifBranchStarting
+            ? '<p class="ctb-if-active-status is-loading"><i class="fa-solid fa-spinner fa-spin"></i> 正在发送开场词并等待酒馆建立用户楼层，请勿重复点击。</p>'
+            : '<p class="ctb-if-active-status is-ready"><i class="fa-solid fa-circle-check"></i> 支线已开始，可以关闭工具箱并直接在主聊天中继续对话。</p>';
         return `<section class="ctb-section ctb-if-active">
-            <div class="ctb-section-title"><span>进行中的 IF 支线</span><span>${snapshot.layers} 层 · ${snapshot.characters} 字</span></div>
-            <div class="ctb-if-active-summary"><strong>${escapeHTML(snapshot.branch.title || '未命名 IF 支线')}</strong><small>${escapeHTML([snapshot.branch.character, started].filter(Boolean).join(' · '))}</small><p>继续直接使用酒馆主聊天框对话；之后新增的楼层都会属于这条支线。删除支线会恢复开始前的聊天变量和全局变量。</p></div>
-            <div class="ctb-if-finish-actions"><button type="button" class="ctb-button ctb-primary" data-action="finish-if-collect"${snapshot.layers ? '' : ' disabled'}>收藏并删除支线</button><button type="button" class="ctb-button ctb-danger" data-action="finish-if-discard"${snapshot.layers ? '' : ' disabled'}>仅删除支线</button><button type="button" class="ctb-button" data-action="finish-if-keep">保留为主线</button></div>
+            <div class="ctb-section-title"><span>${ifBranchStarting ? '正在开始 IF 支线' : '进行中的 IF 支线'}</span><span>${snapshot.layers} 层 · ${snapshot.characters} 字</span></div>
+            <div class="ctb-if-active-summary"><strong>${escapeHTML(snapshot.branch.title || '未命名 IF 支线')}</strong><small>${escapeHTML([snapshot.branch.character, started].filter(Boolean).join(' · '))}</small>${status}<p>之后新增的楼层都会属于这条支线。删除支线会恢复开始前的聊天变量和全局变量。</p></div>
+            <div class="ctb-if-finish-actions"><button type="button" class="ctb-button ctb-primary" data-action="finish-if-collect"${snapshot.layers && !ifBranchStarting ? '' : ' disabled'}>收藏并删除支线</button><button type="button" class="ctb-button ctb-danger" data-action="finish-if-discard"${snapshot.layers && !ifBranchStarting ? '' : ' disabled'}>仅删除支线</button><button type="button" class="ctb-button" data-action="finish-if-keep"${ifBranchStarting ? ' disabled' : ''}>保留为主线</button></div>
         </section>`;
     }
     
@@ -567,7 +565,7 @@ export function createIfBranchModule(deps) {
         const rows = ifPrompts().map((prompt) => `<article class="ctb-if-prompt-card">
             <div class="ctb-if-card-head"><div><strong>${escapeHTML(prompt.name)}</strong>${prompt.tags ? `<small>${escapeHTML(prompt.tags)}</small>` : ''}</div><span>${ifBranchCharacterCount(prompt.content)} 字</span></div>
             <p>${escapeHTML(prompt.content)}</p>
-            <div class="ctb-inline ctb-if-card-actions"><button type="button" class="ctb-button ctb-primary" data-action="start-if-branch" data-if-prompt-id="${escapeHTML(prompt.id)}"${active || ifBranchStarting ? ' disabled' : ''}>开始支线</button><button type="button" class="ctb-button" data-action="fill-if-prompt" data-if-prompt-id="${escapeHTML(prompt.id)}">填入聊天框</button><button type="button" class="ctb-button" data-action="edit-if-prompt" data-if-prompt-id="${escapeHTML(prompt.id)}">编辑</button><button type="button" class="ctb-button ctb-danger" data-action="delete-if-prompt" data-if-prompt-id="${escapeHTML(prompt.id)}">删除</button></div>
+            <div class="ctb-inline ctb-if-card-actions"><button type="button" class="ctb-button ctb-primary" data-action="start-if-branch" data-if-prompt-id="${escapeHTML(prompt.id)}"${active || ifBranchStarting ? ' disabled' : ''}>${ifBranchStarting ? '<i class="fa-solid fa-spinner fa-spin"></i> 正在开始…' : '开始支线'}</button><button type="button" class="ctb-button" data-action="fill-if-prompt" data-if-prompt-id="${escapeHTML(prompt.id)}">填入聊天框</button><button type="button" class="ctb-button" data-action="edit-if-prompt" data-if-prompt-id="${escapeHTML(prompt.id)}">编辑</button><button type="button" class="ctb-button ctb-danger" data-action="delete-if-prompt" data-if-prompt-id="${escapeHTML(prompt.id)}">删除</button></div>
         </article>`).join('');
         return `${renderIfPromptEditor()}<section class="ctb-section"><div class="ctb-section-title"><span>IF 开场词库</span><button type="button" class="ctb-button ctb-primary" data-action="new-if-prompt"><i class="fa-solid fa-plus"></i> 新建</button></div><div class="ctb-if-list">${rows || '<div class="ctb-results ctb-results-empty">还没有开场词。先新建一条完整的 user 指令。</div>'}</div></section>`;
     }
@@ -575,7 +573,7 @@ export function createIfBranchModule(deps) {
     function renderIfFavorites() {
         const rows = ifFavorites().map((favorite) => {
             const date = favorite.createdAt ? new Date(favorite.createdAt).toLocaleString() : '';
-            return `<article class="ctb-if-favorite-card"><div class="ctb-if-card-head"><div><strong>${escapeHTML(favorite.title)}</strong><small>${escapeHTML([favorite.character, favorite.chat, date].filter(Boolean).join(' · '))}</small></div><span>${favorite.messages.length} 层 · ${ifFavoriteCharacters(favorite)} 字</span></div>${favorite.tags ? `<div class="ctb-if-tags">${escapeHTML(favorite.tags)}</div>` : ''}<div class="ctb-inline ctb-if-card-actions"><button type="button" class="ctb-button ctb-primary" data-action="open-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">阅读</button><button type="button" class="ctb-button" data-action="copy-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">复制</button><button type="button" class="ctb-button" data-action="export-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">导出</button><button type="button" class="ctb-button" data-action="rename-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">改名</button><button type="button" class="ctb-button ctb-danger" data-action="delete-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">删除</button></div></article>`;
+            return `<article class="ctb-if-favorite-card"><div class="ctb-if-card-head"><div><strong>${escapeHTML(favorite.title)}</strong><small>${escapeHTML([favorite.character, favorite.chat, date].filter(Boolean).join(' · '))}</small></div><span>${favorite.messages.length} 层 · ${ifFavoriteCharacters(favorite)} 字</span></div>${favorite.tags ? `<div class="ctb-if-tags">${escapeHTML(favorite.tags)}</div>` : ''}<div class="ctb-inline ctb-if-card-actions"><button type="button" class="ctb-button ctb-primary" data-action="open-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">阅读</button><button type="button" class="ctb-button" data-action="copy-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">复制</button><button type="button" class="ctb-button" data-action="export-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">导出 TXT</button><button type="button" class="ctb-button" data-action="rename-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">改名</button><button type="button" class="ctb-button ctb-danger" data-action="delete-if-favorite" data-if-favorite-id="${escapeHTML(favorite.id)}">删除</button></div></article>`;
         }).join('');
         return `<section class="ctb-section"><div class="ctb-section-title"><span>支线收藏夹</span><span>${ifFavorites().length} 条</span></div><div class="ctb-if-list">${rows || '<div class="ctb-results ctb-results-empty">还没有收藏的 IF 支线。</div>'}</div></section>`;
     }
