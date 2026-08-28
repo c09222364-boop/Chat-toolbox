@@ -119,6 +119,7 @@ export function createWorldbookModule(deps) {
     let worldbookBatchMode = false;
     let worldbookCopyTarget = '';
     let worldbookSimulation = null;
+    let worldbookSimulationExpanded = new Set();
     const worldbookPendingDocuments = new Map();
 
     function currentCharacterWorldBookName() {
@@ -939,6 +940,7 @@ export function createWorldbookModule(deps) {
         if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
         if (worldbookSimulation?.book === worldbookBook) {
             worldbookSimulation = null;
+            worldbookSimulationExpanded = new Set();
             renderPanel();
             return;
         }
@@ -989,9 +991,12 @@ export function createWorldbookModule(deps) {
             try {
                 const rendered = await renderPromptTemplateText(message.content, message, index, templateState);
                 item.characters = worldbookTextCharacterCount(rendered);
+                item.content = rendered;
             } catch (error) {
                 item.characters = worldbookTextCharacterCount(message.content);
                 item.reason = `${item.reason}；EJS 解析失败，按原文统计`;
+                item.content = '';
+                item.contentError = '无法解析这条内容，因此不能确认实际发送正文。';
                 templateFailures += 1;
                 console.warn('[聊天工具箱] 世界书模拟 EJS 解析失败', error);
             }
@@ -1005,8 +1010,17 @@ export function createWorldbookModule(deps) {
             triggered,
             totalCharacters,
         };
+        worldbookSimulationExpanded = new Set();
         renderPanel();
         if (templateFailures) notify(`${templateFailures} 个条目的 EJS 解析失败，字数已按原文统计`, 'warning');
+    }
+
+    function toggleWorldbookSimulationEntry(uid) {
+        const id = String(uid || '');
+        if (!worldbookSimulation?.triggered?.some((item) => String(item.uid) === id)) return;
+        if (worldbookSimulationExpanded.has(id)) worldbookSimulationExpanded.delete(id);
+        else worldbookSimulationExpanded.add(id);
+        renderPanel();
     }
     
     function renderWorldbookSimulation() {
@@ -1015,7 +1029,21 @@ export function createWorldbookModule(deps) {
             ? worldbookSimulation.floors.map((floor) => `#${floor}`).join('、')
             : '无聊天内容';
         const items = worldbookSimulation.triggered.length
-            ? worldbookSimulation.triggered.map((item) => `<div class="ctb-worldbook-simulation-item"><strong>${escapeHTML(item.label)} <em>${Number(item.characters) || 0} 字</em></strong><span>${escapeHTML(item.reason)}</span></div>`).join('')
+            ? worldbookSimulation.triggered.map((item) => {
+                const uid = String(item.uid || '');
+                const expanded = worldbookSimulationExpanded.has(uid);
+                const content = item.contentError
+                    ? `<div class="ctb-worldbook-simulation-content is-error">${escapeHTML(item.contentError)}</div>`
+                    : `<div class="ctb-worldbook-simulation-content">${escapeHTML(item.content || '')}</div>`;
+                return `<div class="ctb-worldbook-simulation-item${expanded ? ' is-expanded' : ''}">
+                    <button type="button" class="ctb-worldbook-simulation-toggle" data-action="toggle-worldbook-simulation-entry" data-worldbook-uid="${escapeHTML(uid)}" aria-expanded="${expanded ? 'true' : 'false'}">
+                        <strong>${escapeHTML(item.label)} <em>${Number(item.characters) || 0} 字</em></strong>
+                        <span>${escapeHTML(item.reason)}</span>
+                        <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+                    </button>
+                    ${expanded ? content : ''}
+                </div>`;
+            }).join('')
             : '<div class="ctb-hint">最近 2 层没有触发当前世界书的关键词条目。</div>';
         return `<div class="ctb-worldbook-simulation"><div class="ctb-worldbook-simulation-head"><strong>触发结果：${worldbookSimulation.triggered.length} 条 · 总字数 ${Number(worldbookSimulation.totalCharacters) || 0}</strong><span>扫描 ${escapeHTML(floorText)} · 已开启 ${worldbookSimulation.scanned} 条</span></div><div class="ctb-worldbook-simulation-list">${items}</div></div>`;
     }
@@ -1243,6 +1271,7 @@ export function createWorldbookModule(deps) {
             case 'new-worldbook-entry': createWorldbookEntry(); return true;
             case 'toggle-worldbook-batch': toggleWorldbookBatchMode(); return true;
             case 'simulate-worldbook-triggers': await simulateWorldbookTriggers(); return true;
+            case 'toggle-worldbook-simulation-entry': toggleWorldbookSimulationEntry(data.worldbookUid); return true;
             case 'filter-worldbook': worldbookVisibleLimit = 120; renderPanel(); return true;
             case 'more-worldbook-entries': worldbookVisibleLimit += 120; renderPanel(); return true;
             case 'toggle-worldbook-entry': toggleWorldbookEntry(data.worldbookUid); return true;

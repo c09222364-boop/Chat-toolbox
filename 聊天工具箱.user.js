@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.2.4
+// @version      1.2.5
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、IF 支线收藏、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -14,7 +14,7 @@ import { createPostEditModule } from './post-edit.js';
 (function () {
     'use strict';
 
-    const VERSION = '1.2.4';
+    const VERSION = '1.2.5';
     const PREFIX = 'chat-toolbox';
     const ROOT_ID = `${PREFIX}-root`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
