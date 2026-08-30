@@ -120,6 +120,12 @@ export function createWorldbookModule(deps) {
     let worldbookCopyTarget = '';
     let worldbookSimulation = null;
     let worldbookSimulationExpanded = new Set();
+    let worldbookCompareOpen = false;
+    let worldbookCompareLoading = false;
+    let worldbookCompareTarget = '';
+    let worldbookCompareDocument = null;
+    let worldbookCompareEntries = [];
+    let worldbookCompareDraft = null;
     const worldbookPendingDocuments = new Map();
 
     function currentCharacterWorldBookName() {
@@ -449,6 +455,12 @@ export function createWorldbookModule(deps) {
             worldbookDraftDirty = false;
             worldbookBatchMode = false;
             worldbookCopyTarget = worldbookBooks.find((name) => name !== worldbookBook) || '';
+            worldbookCompareOpen = false;
+            worldbookCompareLoading = false;
+            worldbookCompareTarget = worldbookBooks.find((name) => name !== worldbookBook) || '';
+            worldbookCompareDocument = null;
+            worldbookCompareEntries = [];
+            worldbookCompareDraft = null;
             worldbookDirty = Boolean(pendingDocument);
             worldbookSimulation = null;
         } catch (error) {
@@ -748,6 +760,220 @@ export function createWorldbookModule(deps) {
             notify(`已复制 ${selected.length} 个条目到“${target}”，条目设置均已保留`, 'success');
         } catch (error) {
             notify(`复制到目标世界书失败：${error.message}`, 'error');
+        }
+    }
+
+    function worldbookCompareName(record) {
+        return String(worldbookRecordLabel(record) || '').trim();
+    }
+
+    function worldbookComparableRaw(raw, path = '') {
+        if (Array.isArray(raw)) return raw.map((value) => worldbookComparableRaw(value, path));
+        if (!raw || typeof raw !== 'object') return raw;
+        const ignored = path === '' ? new Set(['uid', 'displayIndex']) : path === 'extensions' ? new Set(['displayIndex', 'display_index']) : new Set();
+        return Object.keys(raw).filter((key) => !ignored.has(key)).sort().reduce((result, key) => {
+            result[key] = worldbookComparableRaw(raw[key], path ? `${path}.${key}` : key);
+            return result;
+        }, {});
+    }
+
+    function worldbookCompareKey(record) {
+        return JSON.stringify(worldbookComparableRaw(record?.raw || {}));
+    }
+
+    function worldbookCompareDifferenceLabels(left, right) {
+        const a = left?.raw || {};
+        const b = right?.raw || {};
+        const same = (first, second) => JSON.stringify(first) === JSON.stringify(second);
+        const differences = [];
+        if (String(a.content || '') !== String(b.content || '')) differences.push('正文');
+        if (!same(a.key || [], b.key || []) || !same(a.keysecondary || [], b.keysecondary || []) || Number(a.selectiveLogic || 0) !== Number(b.selectiveLogic || 0)) differences.push('关键词');
+        if (Boolean(a.disable) !== Boolean(b.disable) || Boolean(a.constant) !== Boolean(b.constant)) differences.push('状态');
+        if (worldbookPosition(a) !== worldbookPosition(b)) differences.push('位置');
+        if (worldbookDepth(a) !== worldbookDepth(b)) differences.push('深度');
+        if (worldbookOrder(a) !== worldbookOrder(b)) differences.push('优先级');
+        if (Boolean(a.excludeRecursion) !== Boolean(b.excludeRecursion) || Boolean(a.preventRecursion) !== Boolean(b.preventRecursion)) differences.push('递归');
+        if (!differences.length && worldbookCompareKey(left) !== worldbookCompareKey(right)) differences.push('其他设置');
+        return differences;
+    }
+
+    function worldbookCompareRows() {
+        if (!worldbookCompareOpen || !worldbookCompareTarget) return [];
+        const source = currentWorldbookView().map((record) => String(record.uid) === String(worldbookEditingUid) && worldbookDraft
+            ? { ...record, raw: deepClone(worldbookDraft) }
+            : record);
+        const left = new Map(source.filter((record) => worldbookCompareName(record)).map((record) => [worldbookCompareName(record), record]));
+        const right = new Map(sortWorldbookRecords(worldbookCompareEntries).filter((record) => worldbookCompareName(record)).map((record) => [worldbookCompareName(record), record]));
+        const rows = [];
+        left.forEach((record, name) => {
+            const target = right.get(name);
+            if (target && worldbookCompareKey(record) !== worldbookCompareKey(target)) {
+                rows.push({ name, left: record, right: target, differences: worldbookCompareDifferenceLabels(record, target) });
+            }
+        });
+        return rows;
+    }
+
+    async function loadWorldbookCompareTarget(name = worldbookCompareTarget) {
+        const target = String(name || '').trim();
+        if (!target || target === worldbookBook) {
+            worldbookCompareTarget = worldbookBooks.find((book) => book !== worldbookBook) || '';
+        } else {
+            worldbookCompareTarget = target;
+        }
+        if (!worldbookCompareTarget) {
+            worldbookCompareDocument = null;
+            worldbookCompareEntries = [];
+            worldbookCompareDraft = null;
+            renderPanel();
+            return false;
+        }
+        worldbookCompareLoading = true;
+        worldbookCompareDraft = null;
+        renderPanel();
+        try {
+            const pending = worldbookPendingDocuments.get(worldbookCompareTarget);
+            worldbookCompareDocument = pending ? deepClone(pending) : await loadFreshWorldInfoDocument(worldbookCompareTarget);
+            worldbookCompareEntries = sortWorldbookRecords(worldbookRecords(worldbookCompareDocument));
+            return true;
+        } catch (error) {
+            worldbookCompareDocument = null;
+            worldbookCompareEntries = [];
+            notify(`读取对比世界书失败：${error.message}`, 'error');
+            return false;
+        } finally {
+            worldbookCompareLoading = false;
+            renderPanel();
+        }
+    }
+
+    async function toggleWorldbookCompare() {
+        if (worldbookCompareOpen) {
+            worldbookCompareOpen = false;
+            worldbookCompareDraft = null;
+            renderPanel();
+            return;
+        }
+        if (!worldbookBook) return notify('请先选择一本世界书', 'warning');
+        if (worldbookBooks.filter((name) => name !== worldbookBook).length === 0) return notify('至少需要两本世界书才能比较', 'warning');
+        if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
+        if (worldbookDirty && !(await saveCurrentWorldbook())) return;
+        worldbookCompareOpen = true;
+        await loadWorldbookCompareTarget(worldbookCompareTarget);
+    }
+
+    function worldbookCompareRecord(side, uid) {
+        const records = side === 'right' ? worldbookCompareEntries : worldbookEntries;
+        return records.find((record) => String(record.uid) === String(uid)) || null;
+    }
+
+    function startWorldbookCompareEdit(side, uid) {
+        const normalizedSide = side === 'right' ? 'right' : 'left';
+        if (normalizedSide === 'left' && worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
+        const record = worldbookCompareRecord(normalizedSide, uid);
+        if (!record) return notify('找不到要编辑的世界书条目', 'error');
+        worldbookCompareDraft = { side: normalizedSide, uid: String(record.uid), raw: deepClone(record.raw) };
+        renderPanel();
+    }
+
+    function normalizeWorldbookCompareDraft(record, draft) {
+        const raw = deepClone(draft || {});
+        raw.uid = worldbookInteger(record?.raw?.uid ?? record?.uid, 0);
+        raw.displayIndex = Number.isFinite(Number(record?.displayIndex)) ? Number(record.displayIndex) : worldbookDisplayIndex(record?.raw, 0);
+        raw.selective = Array.isArray(raw.keysecondary) && raw.keysecondary.length > 0;
+        raw.selectiveLogic = [0, 1, 2, 3].includes(Number(raw.selectiveLogic)) ? Number(raw.selectiveLogic) : 0;
+        raw.excludeRecursion = Boolean(raw.excludeRecursion);
+        raw.preventRecursion = Boolean(raw.preventRecursion);
+        raw.extensions = { ...(raw.extensions && typeof raw.extensions === 'object' ? raw.extensions : {}) };
+        raw.extensions.exclude_recursion = raw.excludeRecursion;
+        raw.extensions.prevent_recursion = raw.preventRecursion;
+        return raw;
+    }
+
+    async function saveWorldbookCompareRecords(side, records) {
+        const isRight = side === 'right';
+        const book = isRight ? worldbookCompareTarget : worldbookBook;
+        const document = isRight ? worldbookCompareDocument : worldbookDocument;
+        if (!book || !document) throw new Error('世界书尚未加载');
+        const next = { ...document, entries: serializeWorldbookRecords(records) };
+        const verified = await saveWorldInfoDocument(book, next, { immediate: true, refreshList: false, verify: true });
+        const loaded = sortWorldbookRecords(worldbookRecords(verified));
+        worldbookPendingDocuments.delete(book);
+        if (isRight) {
+            worldbookCompareDocument = verified;
+            worldbookCompareEntries = loaded;
+        } else {
+            worldbookDocument = verified;
+            worldbookEntries = loaded;
+            worldbookDirty = false;
+            worldbookDraftDirty = false;
+            if (worldbookEditingUid) {
+                const editing = worldbookEntries.find((record) => record.uid === String(worldbookEditingUid));
+                worldbookDraft = editing ? deepClone(editing.raw) : null;
+                if (!editing) worldbookEditingUid = '';
+            }
+        }
+    }
+
+    async function commitWorldbookCompareDraft() {
+        if (!worldbookCompareDraft || worldbookCompareLoading) return;
+        const side = worldbookCompareDraft.side;
+        const record = worldbookCompareRecord(side, worldbookCompareDraft.uid);
+        if (!record) return notify('原世界书条目已经不存在', 'error');
+        worldbookCompareLoading = true;
+        renderPanel();
+        try {
+            const records = (side === 'right' ? worldbookCompareEntries : worldbookEntries).map((item) => ({ ...item, raw: deepClone(item.raw) }));
+            const changed = records.find((item) => String(item.uid) === String(record.uid));
+            changed.raw = normalizeWorldbookCompareDraft(changed, worldbookCompareDraft.raw);
+            changed.displayIndex = changed.raw.displayIndex;
+            await saveWorldbookCompareRecords(side, records);
+            const book = side === 'right' ? worldbookCompareTarget : worldbookBook;
+            worldbookCompareDraft = null;
+            notify(`世界书“${book}”的条目已保存`, 'success');
+        } catch (error) {
+            notify(`保存对比条目失败：${error.message}`, 'error');
+        } finally {
+            worldbookCompareLoading = false;
+            renderPanel();
+        }
+    }
+
+    async function overwriteWorldbookCompareEntry(direction, leftUid, rightUid) {
+        if (worldbookCompareLoading) return;
+        if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
+        if (worldbookDirty && !(await saveCurrentWorldbook())) return;
+        const left = worldbookCompareRecord('left', leftUid);
+        const right = worldbookCompareRecord('right', rightUid);
+        if (!left || !right) return notify('对比条目已经变化，请刷新后重试', 'warning');
+        const leftToRight = direction !== 'right-to-left';
+        const source = leftToRight ? left : right;
+        const destination = leftToRight ? right : left;
+        const destinationSide = leftToRight ? 'right' : 'left';
+        const sourceBook = leftToRight ? worldbookBook : worldbookCompareTarget;
+        const destinationBook = leftToRight ? worldbookCompareTarget : worldbookBook;
+        const confirmed = await requestDialog({
+            title: '覆盖世界书条目',
+            message: `确定用“${sourceBook}”中的“${worldbookRecordLabel(source)}”完整覆盖“${destinationBook}”的同名条目吗？正文、关键词、位置、深度、优先级和状态都会一起替换。`,
+            confirmLabel: '覆盖',
+            danger: true,
+        });
+        if (!confirmed) return;
+        worldbookCompareLoading = true;
+        renderPanel();
+        try {
+            const records = (destinationSide === 'right' ? worldbookCompareEntries : worldbookEntries).map((item) => ({ ...item, raw: deepClone(item.raw) }));
+            const changed = records.find((item) => String(item.uid) === String(destination.uid));
+            changed.raw = normalizeWorldbookCompareDraft(changed, source.raw);
+            changed.displayIndex = changed.raw.displayIndex;
+            await saveWorldbookCompareRecords(destinationSide, records);
+            worldbookCompareDraft = null;
+            notify(`已用“${sourceBook}”覆盖“${destinationBook}”的同名条目`, 'success');
+        } catch (error) {
+            notify(`覆盖世界书条目失败：${error.message}`, 'error');
+        } finally {
+            worldbookCompareLoading = false;
+            renderPanel();
         }
     }
     
@@ -1084,6 +1310,80 @@ export function createWorldbookModule(deps) {
             </div>
         </div>`;
     }
+
+    function renderWorldbookCompareDraftFields() {
+        const draft = worldbookCompareDraft?.raw;
+        if (!draft) return '';
+        const positionOptions = WORLDBOOK_POSITIONS.map((item) => `<option value="${item.value}"${Number(draft.position ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
+        const logicOptions = [
+            { value: 0, label: 'AND ANY · 任一' },
+            { value: 1, label: 'NOT ALL · 不全有' },
+            { value: 2, label: 'NOT ANY · 一个都没有' },
+            { value: 3, label: 'AND ALL · 全部' },
+        ].map((item) => `<option value="${item.value}"${Number(draft.selectiveLogic ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
+        return `<div class="ctb-worldbook-compare-editor">
+            <div class="ctb-worldbook-compare-editor-grid">
+                <label class="ctb-field"><span>名称</span><input class="ctb-input" id="ctb-worldbook-compare-comment" value="${escapeHTML(draft.comment || '')}"></label>
+                <label class="ctb-field"><span>关键词逻辑</span><select class="ctb-input" id="ctb-worldbook-compare-selective-logic">${logicOptions}</select></label>
+                <label class="ctb-field"><span>关键词</span><input class="ctb-input" id="ctb-worldbook-compare-keys" value="${escapeHTML((Array.isArray(draft.key) ? draft.key : []).join(', '))}"></label>
+                <label class="ctb-field"><span>次要关键词</span><input class="ctb-input" id="ctb-worldbook-compare-keysecondary" value="${escapeHTML((Array.isArray(draft.keysecondary) ? draft.keysecondary : []).join(', '))}"></label>
+            </div>
+            <label class="ctb-field"><span>条目内容</span><textarea class="ctb-input" id="ctb-worldbook-compare-content">${escapeHTML(draft.content || '')}</textarea></label>
+            <div class="ctb-inline ctb-worldbook-compare-numbers">
+                <label class="ctb-mini-field">优先级 <input class="ctb-input" id="ctb-worldbook-compare-order" type="number" value="${escapeHTML(draft.order ?? 100)}"></label>
+                <label class="ctb-mini-field">深度 <input class="ctb-input" id="ctb-worldbook-compare-depth" type="number" min="0" value="${escapeHTML(draft.depth ?? 4)}"></label>
+                <label class="ctb-mini-field">位置 <select class="ctb-input" id="ctb-worldbook-compare-position">${positionOptions}</select></label>
+            </div>
+            <div class="ctb-inline ctb-worldbook-compare-checks">
+                <label class="ctb-check"><input id="ctb-worldbook-compare-enabled" type="checkbox"${draft.disable ? '' : ' checked'}> 启用</label>
+                <label class="ctb-check"><input id="ctb-worldbook-compare-constant" type="checkbox"${draft.constant ? ' checked' : ''}> 常驻蓝灯</label>
+                <label class="ctb-check"><input id="ctb-worldbook-compare-exclude-recursion" type="checkbox"${draft.excludeRecursion ? ' checked' : ''}> 不可递归</label>
+                <label class="ctb-check"><input id="ctb-worldbook-compare-prevent-recursion" type="checkbox"${draft.preventRecursion ? ' checked' : ''}> 阻止进一步递归</label>
+            </div>
+            <div class="ctb-inline"><button type="button" class="ctb-button ctb-primary" data-action="save-worldbook-compare-edit">保存此侧</button><button type="button" class="ctb-button" data-action="cancel-worldbook-compare-edit">收起</button></div>
+        </div>`;
+    }
+
+    function renderWorldbookCompareSide(record, side) {
+        const raw = record?.raw || {};
+        const editing = worldbookCompareDraft?.side === side && String(worldbookCompareDraft?.uid) === String(record?.uid);
+        const sideName = side === 'right' ? worldbookCompareTarget : worldbookBook;
+        if (editing) return `<div class="ctb-preset-compare-side ctb-worldbook-compare-side is-editing"><small>${escapeHTML(sideName)} · 直接编辑</small>${renderWorldbookCompareDraftFields()}</div>`;
+        const position = WORLDBOOK_POSITIONS.find((item) => item.value === worldbookPosition(raw))?.label || '角色定义后';
+        const primary = Array.isArray(raw.key) && raw.key.length ? raw.key.join('、') : '无';
+        const secondary = Array.isArray(raw.keysecondary) && raw.keysecondary.length ? raw.keysecondary.join('、') : '无';
+        const status = raw.disable ? '关闭' : raw.constant ? '启用 · 常驻蓝灯' : '启用 · 关键词绿灯';
+        return `<div class="ctb-preset-compare-side ctb-worldbook-compare-side">
+            <div class="ctb-preset-compare-side-head"><small>${escapeHTML(sideName)}</small><button type="button" class="ctb-button ctb-preset-compare-edit" data-action="edit-worldbook-compare-entry" data-worldbook-compare-side="${side}" data-worldbook-uid="${escapeHTML(record.uid)}">编辑并保存</button></div>
+            <div class="ctb-worldbook-compare-meta"><span>${escapeHTML(status)}</span><span>${escapeHTML(position)}</span><span>深度 ${worldbookDepth(raw)}</span><span>优先级 ${worldbookOrder(raw)}</span><span>主关键词：${escapeHTML(primary)}</span><span>次要关键词：${escapeHTML(secondary)}</span></div>
+            <p>${escapeHTML(String(raw.content || '') || '（空内容）')}</p>
+        </div>`;
+    }
+
+    function renderWorldbookCompare() {
+        if (!worldbookCompareOpen) return '';
+        const targetOptions = worldbookBooks.filter((name) => name !== worldbookBook).map((name) => `<option value="${escapeHTML(name)}"${name === worldbookCompareTarget ? ' selected' : ''}>${escapeHTML(name)}</option>`).join('');
+        const rows = worldbookCompareRows();
+        const content = worldbookCompareLoading
+            ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取并比较世界书…</div>'
+            : rows.length
+                ? rows.slice(0, 120).map((row) => `<div class="ctb-preset-compare-row ctb-worldbook-compare-row">
+                    <div class="ctb-preset-compare-title ctb-worldbook-compare-title">
+                        <span>${escapeHTML(row.differences.join('、') || '内容不同')}</span>
+                        <strong>${escapeHTML(row.name)}</strong>
+                        <div class="ctb-worldbook-compare-overwrite">
+                            <button type="button" class="ctb-button" data-action="overwrite-worldbook-compare-entry" data-worldbook-compare-direction="left-to-right" data-worldbook-left-uid="${escapeHTML(row.left.uid)}" data-worldbook-right-uid="${escapeHTML(row.right.uid)}">左侧覆盖右侧</button>
+                            <button type="button" class="ctb-button" data-action="overwrite-worldbook-compare-entry" data-worldbook-compare-direction="right-to-left" data-worldbook-left-uid="${escapeHTML(row.left.uid)}" data-worldbook-right-uid="${escapeHTML(row.right.uid)}">右侧覆盖左侧</button>
+                        </div>
+                    </div>
+                    ${renderWorldbookCompareSide(row.left, 'left')}${renderWorldbookCompareSide(row.right, 'right')}
+                </div>`).join('')
+                : '<div class="ctb-readonly-note">两本世界书没有名称相同但内容或设置不同的条目。</div>';
+        return `<div class="ctb-worldbook-compare-panel">
+            <div class="ctb-inline ctb-worldbook-compare-toolbar"><strong>双世界书对比</strong><span>左侧：${escapeHTML(worldbookBook)}</span><select class="ctb-input" id="ctb-worldbook-compare-target">${targetOptions || '<option value="">没有其他世界书</option>'}</select><button type="button" class="ctb-button" data-action="refresh-worldbook-compare"${worldbookCompareTarget && !worldbookCompareLoading ? '' : ' disabled'}>刷新对比</button></div>
+            <div class="ctb-preset-compare-list ctb-worldbook-compare-list">${content}</div>
+        </div>`;
+    }
     
     function renderWorldbookRows(records) {
         return records.map((record) => {
@@ -1174,8 +1474,10 @@ export function createWorldbookModule(deps) {
                     <input class="ctb-input" id="ctb-worldbook-search" placeholder="搜索条目名称、关键词或内容" value="${escapeHTML(worldbookSearch)}">
                     <button type="button" class="ctb-button" data-action="filter-worldbook">筛选</button>
                     <button type="button" class="ctb-button${worldbookBatchMode ? ' ctb-primary' : ''}" data-action="toggle-worldbook-batch">${worldbookBatchMode ? '完成' : '编辑'}</button>
+                    <button type="button" class="ctb-button${worldbookCompareOpen ? ' ctb-primary' : ''}" data-action="toggle-worldbook-compare"${worldbookBook && worldbookBooks.length > 1 ? '' : ' disabled'}>${worldbookCompareOpen ? '关闭对比' : '双书对比'}</button>
                 </div>
                 ${renderWorldbookSimulation()}
+                ${renderWorldbookCompare()}
                 ${batchTools}
                 <div class="ctb-worldbook-entry-list">${list}</div>
             </section>
@@ -1225,6 +1527,12 @@ export function createWorldbookModule(deps) {
         else if (id === 'ctb-worldbook-content' && worldbookDraft) { worldbookDraft.content = target.value; markWorldbookDraftDirty(); }
         else if (id === 'ctb-worldbook-order' && worldbookDraft) { worldbookDraft.order = Number(target.value) || 0; markWorldbookDraftDirty(); }
         else if (id === 'ctb-worldbook-depth' && worldbookDraft) { worldbookDraft.depth = Math.max(0, Number(target.value) || 0); markWorldbookDraftDirty(); }
+        else if (id === 'ctb-worldbook-compare-comment' && worldbookCompareDraft) worldbookCompareDraft.raw.comment = target.value;
+        else if (id === 'ctb-worldbook-compare-keys' && worldbookCompareDraft) worldbookCompareDraft.raw.key = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean);
+        else if (id === 'ctb-worldbook-compare-keysecondary' && worldbookCompareDraft) worldbookCompareDraft.raw.keysecondary = target.value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean);
+        else if (id === 'ctb-worldbook-compare-content' && worldbookCompareDraft) worldbookCompareDraft.raw.content = target.value;
+        else if (id === 'ctb-worldbook-compare-order' && worldbookCompareDraft) worldbookCompareDraft.raw.order = Number(target.value) || 0;
+        else if (id === 'ctb-worldbook-compare-depth' && worldbookCompareDraft) worldbookCompareDraft.raw.depth = Math.max(0, Number(target.value) || 0);
         else return false;
         return true;
     }
@@ -1241,6 +1549,8 @@ export function createWorldbookModule(deps) {
             syncWorldbookSelectionUI();
         } else if (id === 'ctb-worldbook-book') {
             await chooseWorldbook(target.value);
+        } else if (id === 'ctb-worldbook-compare-target') {
+            await loadWorldbookCompareTarget(target.value);
         } else if (id === 'ctb-worldbook-position' && worldbookDraft) {
             worldbookDraft.position = Number(target.value) || 0;
             markWorldbookDraftDirty();
@@ -1258,6 +1568,18 @@ export function createWorldbookModule(deps) {
             worldbookDraft.extensions = { ...(worldbookDraft.extensions && typeof worldbookDraft.extensions === 'object' ? worldbookDraft.extensions : {}) };
             worldbookDraft.extensions.prevent_recursion = target.checked;
             markWorldbookDraftDirty();
+        } else if (id === 'ctb-worldbook-compare-selective-logic' && worldbookCompareDraft) {
+            worldbookCompareDraft.raw.selectiveLogic = [0, 1, 2, 3].includes(Number(target.value)) ? Number(target.value) : 0;
+        } else if (id === 'ctb-worldbook-compare-position' && worldbookCompareDraft) {
+            worldbookCompareDraft.raw.position = Number(target.value) || 0;
+        } else if (id === 'ctb-worldbook-compare-enabled' && worldbookCompareDraft) {
+            worldbookCompareDraft.raw.disable = !target.checked;
+        } else if (id === 'ctb-worldbook-compare-constant' && worldbookCompareDraft) {
+            worldbookCompareDraft.raw.constant = target.checked;
+        } else if (id === 'ctb-worldbook-compare-exclude-recursion' && worldbookCompareDraft) {
+            worldbookCompareDraft.raw.excludeRecursion = target.checked;
+        } else if (id === 'ctb-worldbook-compare-prevent-recursion' && worldbookCompareDraft) {
+            worldbookCompareDraft.raw.preventRecursion = target.checked;
         } else return false;
         return true;
     }
@@ -1270,6 +1592,12 @@ export function createWorldbookModule(deps) {
             case 'delete-worldbook': await deleteWorldbookBook(); return true;
             case 'new-worldbook-entry': createWorldbookEntry(); return true;
             case 'toggle-worldbook-batch': toggleWorldbookBatchMode(); return true;
+            case 'toggle-worldbook-compare': await toggleWorldbookCompare(); return true;
+            case 'refresh-worldbook-compare': await loadWorldbookCompareTarget(worldbookCompareTarget); return true;
+            case 'edit-worldbook-compare-entry': startWorldbookCompareEdit(data.worldbookCompareSide, data.worldbookUid); return true;
+            case 'save-worldbook-compare-edit': await commitWorldbookCompareDraft(); return true;
+            case 'cancel-worldbook-compare-edit': worldbookCompareDraft = null; renderPanel(); return true;
+            case 'overwrite-worldbook-compare-entry': await overwriteWorldbookCompareEntry(data.worldbookCompareDirection, data.worldbookLeftUid, data.worldbookRightUid); return true;
             case 'simulate-worldbook-triggers': await simulateWorldbookTriggers(); return true;
             case 'toggle-worldbook-simulation-entry': toggleWorldbookSimulationEntry(data.worldbookUid); return true;
             case 'filter-worldbook': worldbookVisibleLimit = 120; renderPanel(); return true;

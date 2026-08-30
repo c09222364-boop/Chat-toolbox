@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.2.5
+// @version      1.2.6
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、IF 支线收藏、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -14,7 +14,7 @@ import { createPostEditModule } from './post-edit.js';
 (function () {
     'use strict';
 
-    const VERSION = '1.2.5';
+    const VERSION = '1.2.6';
     const PREFIX = 'chat-toolbox';
     const ROOT_ID = `${PREFIX}-root`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
@@ -68,7 +68,7 @@ import { createPostEditModule } from './post-edit.js';
         'channel-main': '选择“跟随酒馆主接口”会使用酒馆当前连接；选择自定义渠道则使用单独填写的地址、密钥和模型。',
         'system-cache': '用于填写模型的身份、写作要求和输出格式。留空时使用默认提示词。',
         'if-branch-scope': '先从开场词库选择一条指令建立临时 IF 支线，然后直接在酒馆主聊天中连续对话。结束时可收藏并删除整条支线、仅删除，或保留为主线。',
-        'worldbook-save': '进入世界书管理时会优先打开当前角色卡绑定的世界书；“模拟”会读取最近 2 层，显示常驻条目和关键词条目的触发结果与字数。条目修改会先暂存在页面中，点击“现在保存”后才会写入世界书文件。',
+        'worldbook-save': '进入世界书管理时会优先打开当前角色卡绑定的世界书；“模拟”可检查最近 2 层触发的条目并展开实际正文。“双书对比”会列出两本书中同名但内容或设置不同的条目，可编辑任一侧或完整覆盖另一侧。普通条目修改会先暂存在页面中，点击“现在保存”后写入世界书文件。',
         'preset-transfer': '用于查看、编辑、复制或移动预设中的提示词条目。单预设模式处理一本预设，双预设模式在两本预设之间转移条目。',
     });
 
