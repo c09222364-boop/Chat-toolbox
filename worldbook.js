@@ -1,3 +1,5 @@
+import { renderTextDifference } from './compare-diff.js';
+
 function worldbookEntryIdentifier(entry, fallback = '') {
     const value = entry?.uid ?? entry?.id ?? fallback;
     const number = Number(value);
@@ -799,6 +801,7 @@ export function createWorldbookModule(deps) {
 
     function worldbookCompareRows() {
         if (!worldbookCompareOpen || !worldbookCompareTarget) return [];
+        const query = worldbookSearch.trim().toLowerCase();
         const source = currentWorldbookView().map((record) => String(record.uid) === String(worldbookEditingUid) && worldbookDraft
             ? { ...record, raw: deepClone(worldbookDraft) }
             : record);
@@ -808,7 +811,8 @@ export function createWorldbookModule(deps) {
         left.forEach((record, name) => {
             const target = right.get(name);
             if (target && worldbookCompareKey(record) !== worldbookCompareKey(target)) {
-                rows.push({ name, left: record, right: target, differences: worldbookCompareDifferenceLabels(record, target) });
+                const searchText = `${name}\n${worldbookRecordSearchText(record)}\n${worldbookRecordSearchText(target)}`.toLowerCase();
+                if (!query || searchText.includes(query)) rows.push({ name, left: record, right: target, differences: worldbookCompareDifferenceLabels(record, target) });
             }
         });
         return rows;
@@ -1344,7 +1348,7 @@ export function createWorldbookModule(deps) {
         </div>`;
     }
 
-    function renderWorldbookCompareSide(record, side) {
+    function renderWorldbookCompareSide(record, side, highlightedContent, differences) {
         const raw = record?.raw || {};
         const editing = worldbookCompareDraft?.side === side && String(worldbookCompareDraft?.uid) === String(record?.uid);
         const sideName = side === 'right' ? worldbookCompareTarget : worldbookBook;
@@ -1353,10 +1357,11 @@ export function createWorldbookModule(deps) {
         const primary = Array.isArray(raw.key) && raw.key.length ? raw.key.join('、') : '无';
         const secondary = Array.isArray(raw.keysecondary) && raw.keysecondary.length ? raw.keysecondary.join('、') : '无';
         const status = raw.disable ? '关闭' : raw.constant ? '启用 · 常驻蓝灯' : '启用 · 关键词绿灯';
+        const differenceClass = (name) => differences.includes(name) ? ' class="is-different"' : '';
         return `<div class="ctb-preset-compare-side ctb-worldbook-compare-side">
             <div class="ctb-preset-compare-side-head"><small>${escapeHTML(sideName)}</small><button type="button" class="ctb-button ctb-preset-compare-edit" data-action="edit-worldbook-compare-entry" data-worldbook-compare-side="${side}" data-worldbook-uid="${escapeHTML(record.uid)}">编辑并保存</button></div>
-            <div class="ctb-worldbook-compare-meta"><span>${escapeHTML(status)}</span><span>${escapeHTML(position)}</span><span>深度 ${worldbookDepth(raw)}</span><span>优先级 ${worldbookOrder(raw)}</span><span>主关键词：${escapeHTML(primary)}</span><span>次要关键词：${escapeHTML(secondary)}</span></div>
-            <p>${escapeHTML(String(raw.content || '') || '（空内容）')}</p>
+            <div class="ctb-worldbook-compare-meta"><span${differenceClass('状态')}>${escapeHTML(status)}</span><span${differenceClass('位置')}>${escapeHTML(position)}</span><span${differenceClass('深度')}>深度 ${worldbookDepth(raw)}</span><span${differenceClass('优先级')}>优先级 ${worldbookOrder(raw)}</span><span${differenceClass('关键词')}>主关键词：${escapeHTML(primary)}</span><span${differenceClass('关键词')}>次要关键词：${escapeHTML(secondary)}</span>${differences.includes('递归') ? '<span class="is-different">递归设置不同</span>' : ''}${differences.includes('其他设置') ? '<span class="is-different">其他设置不同</span>' : ''}</div>
+            <p>${highlightedContent || '（空内容）'}</p>
         </div>`;
     }
 
@@ -1367,7 +1372,9 @@ export function createWorldbookModule(deps) {
         const content = worldbookCompareLoading
             ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 正在读取并比较世界书…</div>'
             : rows.length
-                ? rows.slice(0, 120).map((row) => `<div class="ctb-preset-compare-row ctb-worldbook-compare-row">
+                ? rows.slice(0, 120).map((row) => {
+                    const highlighted = renderTextDifference(row.left.raw?.content, row.right.raw?.content, escapeHTML);
+                    return `<div class="ctb-preset-compare-row ctb-worldbook-compare-row">
                     <div class="ctb-preset-compare-title ctb-worldbook-compare-title">
                         <span>${escapeHTML(row.differences.join('、') || '内容不同')}</span>
                         <strong>${escapeHTML(row.name)}</strong>
@@ -1376,8 +1383,9 @@ export function createWorldbookModule(deps) {
                             <button type="button" class="ctb-button" data-action="overwrite-worldbook-compare-entry" data-worldbook-compare-direction="right-to-left" data-worldbook-left-uid="${escapeHTML(row.left.uid)}" data-worldbook-right-uid="${escapeHTML(row.right.uid)}">右侧覆盖左侧</button>
                         </div>
                     </div>
-                    ${renderWorldbookCompareSide(row.left, 'left')}${renderWorldbookCompareSide(row.right, 'right')}
-                </div>`).join('')
+                    ${renderWorldbookCompareSide(row.left, 'left', highlighted.left, row.differences)}${renderWorldbookCompareSide(row.right, 'right', highlighted.right, row.differences)}
+                </div>`;
+                }).join('')
                 : '<div class="ctb-readonly-note">两本世界书没有名称相同但内容或设置不同的条目。</div>';
         return `<div class="ctb-worldbook-compare-panel">
             <div class="ctb-inline ctb-worldbook-compare-toolbar"><strong>双世界书对比</strong><span>左侧：${escapeHTML(worldbookBook)}</span><select class="ctb-input" id="ctb-worldbook-compare-target">${targetOptions || '<option value="">没有其他世界书</option>'}</select><button type="button" class="ctb-button" data-action="refresh-worldbook-compare"${worldbookCompareTarget && !worldbookCompareLoading ? '' : ' disabled'}>刷新对比</button></div>
@@ -1457,10 +1465,10 @@ export function createWorldbookModule(deps) {
                 </div>` : '';
         return `<section class="ctb-section">
                 <div class="ctb-section-title">世界书管理 ${infoButton('worldbook-save')}</div>
-                <button type="button" class="ctb-button ctb-primary-soft ctb-worldbook-simulate-button" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}>
+                ${worldbookCompareOpen ? '' : `<button type="button" class="ctb-button ctb-primary-soft ctb-worldbook-simulate-button" data-action="simulate-worldbook-triggers" title="读取最近 2 层正文和发言者名称，检查常驻、主关键词与次要关键词逻辑"${worldbookBook && !worldbookLoading ? '' : ' disabled'}>
                     <span><i class="fa-solid fa-bolt"></i> 模拟</span>
                     <small>${worldbookLoading ? '正在加载世界书…' : worldbookBook ? escapeHTML(worldbookBook) : '没有可用世界书'}</small>
-                </button>
+                </button>`}
                 <div class="ctb-inline ctb-manager-toolbar">
                     <select class="ctb-input" id="ctb-worldbook-book">${books || '<option value="">没有世界书</option>'}</select>
                     <button type="button" class="ctb-button" data-action="refresh-worldbook">刷新</button>
@@ -1473,15 +1481,12 @@ export function createWorldbookModule(deps) {
                 <div class="ctb-inline ctb-manager-toolbar">
                     <input class="ctb-input" id="ctb-worldbook-search" placeholder="搜索条目名称、关键词或内容" value="${escapeHTML(worldbookSearch)}">
                     <button type="button" class="ctb-button" data-action="filter-worldbook">筛选</button>
-                    <button type="button" class="ctb-button${worldbookBatchMode ? ' ctb-primary' : ''}" data-action="toggle-worldbook-batch">${worldbookBatchMode ? '完成' : '编辑'}</button>
+                    ${worldbookCompareOpen ? '' : `<button type="button" class="ctb-button${worldbookBatchMode ? ' ctb-primary' : ''}" data-action="toggle-worldbook-batch">${worldbookBatchMode ? '完成' : '编辑'}</button>`}
                     <button type="button" class="ctb-button${worldbookCompareOpen ? ' ctb-primary' : ''}" data-action="toggle-worldbook-compare"${worldbookBook && worldbookBooks.length > 1 ? '' : ' disabled'}>${worldbookCompareOpen ? '关闭对比' : '双书对比'}</button>
                 </div>
-                ${renderWorldbookSimulation()}
-                ${renderWorldbookCompare()}
-                ${batchTools}
-                <div class="ctb-worldbook-entry-list">${list}</div>
+                ${worldbookCompareOpen ? renderWorldbookCompare() : `${renderWorldbookSimulation()}${batchTools}<div class="ctb-worldbook-entry-list">${list}</div>`}
             </section>
-            <div class="ctb-inline ctb-manager-savebar"><span data-worldbook-save-status>${worldbookDraftDirty || worldbookDirty ? '修改已暂存，关闭工具箱时会统一保存' : '当前世界书已同步'}</span><button type="button" class="ctb-button ctb-save" data-action="save-worldbook"${worldbookBook && !worldbookSaving ? '' : ' disabled'}>${worldbookSaving ? '保存中…' : '现在保存'}</button></div>`;
+            ${worldbookCompareOpen ? '' : `<div class="ctb-inline ctb-manager-savebar"><span data-worldbook-save-status>${worldbookDraftDirty || worldbookDirty ? '修改已暂存，关闭工具箱时会统一保存' : '当前世界书已同步'}</span><button type="button" class="ctb-button ctb-save" data-action="save-worldbook"${worldbookBook && !worldbookSaving ? '' : ' disabled'}>${worldbookSaving ? '保存中…' : '现在保存'}</button></div>`}`;
     }
 
     function discardChanges() {
