@@ -6,7 +6,7 @@
     "js": "聊天工具箱.user.js",
     "css": "style.css",
     "author": "c09222364-boop",
-    "version": "1.2.8",
+    "version": "1.2.10",
     "homePage": "https://github.com/c09222364-boop/Chat-toolbox",
     "auto_update": true
 }

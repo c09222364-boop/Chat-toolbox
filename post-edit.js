@@ -155,19 +155,18 @@ export function createPostEditModule(deps) {
         return channelById(id);
     }
     
-    function beginNewChannel(feature) {
+    function beginNewChannel() {
         channelEditor = {
-            feature,
             isNew: true,
             draft: makeChannel(`自定义渠道 ${getSettings().ai.channels.length + 1}`),
         };
         renderPanel();
     }
     
-    function beginEditChannel(feature, channelId) {
+    function beginEditChannel(channelId) {
         const channel = channelById(channelId);
         if (!channel) return;
-        channelEditor = { feature, isNew: false, draft: cloneChannel(channel) };
+        channelEditor = { isNew: false, draft: cloneChannel(channel) };
         renderPanel();
     }
     
@@ -184,7 +183,7 @@ export function createPostEditModule(deps) {
             if (index < 0) return notify('要保存的渠道已经不存在', 'error');
             getSettings().ai.channels.splice(index, 1, cloneChannel(draft));
         }
-        getSettings()[channelEditor.feature].channelId = draft.id;
+        getSettings().postEdit.channelId = draft.id;
         const name = draft.name;
         channelEditor = null;
         saveSettings();
@@ -197,8 +196,8 @@ export function createPostEditModule(deps) {
         renderPanel();
     }
     
-    function selectedChannel(feature) {
-        const id = getSettings()[feature]?.channelId || 'main';
+    function selectedChannel() {
+        const id = getSettings().postEdit?.channelId || 'main';
         return id === 'main' ? null : channelById(id);
     }
     
@@ -309,8 +308,8 @@ export function createPostEditModule(deps) {
         }
     }
     
-    async function callAiText(feature, messages) {
-        const channel = selectedChannel(feature);
+    async function callAiText(messages) {
+        const channel = selectedChannel();
         if (!channel) {
             const context = getContext();
             const generateRaw = context.generateRaw || host.generateRaw || host.SillyTavern?.generateRaw;
@@ -703,7 +702,7 @@ export function createPostEditModule(deps) {
         try {
             const messages = buildPostEditRequest();
             postEditPromptPreview = buildPromptPreview(messages);
-            const output = await callAiText('postEdit', messages);
+            const output = await callAiText(messages);
             const parsed = parsePostEditResult(output, postEditDraft.originalContent);
             if (!parsed.fullRevised) throw new Error('API 返回了空文本');
             postEditReview = parsed.reviews;
@@ -782,22 +781,22 @@ export function createPostEditModule(deps) {
         }
     }
     
-    function renderChannelSettings(feature) {
-        const featureSettings = getSettings()[feature];
+    function renderChannelSettings() {
+        const featureSettings = getSettings().postEdit;
         const currentId = featureSettings.channelId || 'main';
         const current = channelById(currentId);
         const options = [`<option value="main"${currentId === 'main' || !current ? ' selected' : ''}>跟随酒馆主接口</option>`]
             .concat((getSettings().ai.channels || []).map((channel) => `<option value="${escapeHTML(channel.id)}"${currentId === channel.id ? ' selected' : ''}>${escapeHTML(channel.name || '未命名渠道')}</option>`))
             .join('');
-        const editor = channelEditor?.feature === feature ? channelEditor : null;
+        const editor = channelEditor;
         const editing = editor?.draft;
         const editorForm = editing ? `
             <div class="ctb-channel-grid">
-                <input class="ctb-input" id="ctb-${feature}-channel-name" data-channel-id="${escapeHTML(editing.id)}" placeholder="渠道名称" value="${escapeHTML(editing.name || '')}">
-                <input class="ctb-input" id="ctb-${feature}-channel-url" data-channel-id="${escapeHTML(editing.id)}" placeholder="OpenAI 兼容 API 地址" value="${escapeHTML(editing.url || '')}">
-                <input class="ctb-input" id="ctb-${feature}-channel-key" data-channel-id="${escapeHTML(editing.id)}" type="password" autocomplete="off" placeholder="API Key" value="${escapeHTML(editing.key || '')}">
+                <input class="ctb-input" id="ctb-postEdit-channel-name" data-channel-id="${escapeHTML(editing.id)}" placeholder="渠道名称" value="${escapeHTML(editing.name || '')}">
+                <input class="ctb-input" id="ctb-postEdit-channel-url" data-channel-id="${escapeHTML(editing.id)}" placeholder="OpenAI 兼容 API 地址" value="${escapeHTML(editing.url || '')}">
+                <input class="ctb-input" id="ctb-postEdit-channel-key" data-channel-id="${escapeHTML(editing.id)}" type="password" autocomplete="off" placeholder="API Key" value="${escapeHTML(editing.key || '')}">
                 <div class="ctb-inline ctb-model-row">
-                    <select class="ctb-input" id="ctb-${feature}-channel-model" data-channel-id="${escapeHTML(editing.id)}">
+                    <select class="ctb-input" id="ctb-postEdit-channel-model" data-channel-id="${escapeHTML(editing.id)}">
                         ${editing.model && !(editing.models || []).includes(editing.model) ? `<option value="${escapeHTML(editing.model)}" selected>${escapeHTML(editing.model)}</option>` : ''}
                         ${(editing.models || []).map((model) => `<option value="${escapeHTML(model)}"${editing.model === model ? ' selected' : ''}>${escapeHTML(model)}</option>`).join('')}
                         ${!editing.model && !(editing.models || []).length ? '<option value="">先拉取模型</option>' : ''}
@@ -805,16 +804,16 @@ export function createPostEditModule(deps) {
                     <button type="button" class="ctb-button" data-action="fetch-models" data-channel-id="${escapeHTML(editing.id)}"${channelLoadingId ? ' disabled' : ''}>${channelLoadingId === editing.id ? '拉取中…' : '拉取模型'}</button>
                 </div>
                 <div class="ctb-inline">
-                    <label class="ctb-mini-field">温度 <input class="ctb-input" id="ctb-${feature}-channel-temperature" data-channel-id="${escapeHTML(editing.id)}" type="number" min="0" max="2" step="0.1" value="${escapeHTML(editing.temperature ?? 0.2)}"></label>
-                    <label class="ctb-mini-field">最大输出 <input class="ctb-input" id="ctb-${feature}-channel-tokens" data-channel-id="${escapeHTML(editing.id)}" type="number" min="1" step="1" value="${escapeHTML(editing.maxTokens || 4096)}"></label>
+                    <label class="ctb-mini-field">温度 <input class="ctb-input" id="ctb-postEdit-channel-temperature" data-channel-id="${escapeHTML(editing.id)}" type="number" min="0" max="2" step="0.1" value="${escapeHTML(editing.temperature ?? 0.2)}"></label>
+                    <label class="ctb-mini-field">最大输出 <input class="ctb-input" id="ctb-postEdit-channel-tokens" data-channel-id="${escapeHTML(editing.id)}" type="number" min="1" step="1" value="${escapeHTML(editing.maxTokens || 4096)}"></label>
                 </div>
                 <div class="ctb-channel-editor-actions"><button type="button" class="ctb-button ctb-primary" data-action="save-channel">保存渠道</button><button type="button" class="ctb-button" data-action="cancel-channel">取消</button>${editor.isNew ? '' : `<button type="button" class="ctb-button ctb-danger" data-action="delete-channel" data-channel-id="${escapeHTML(editing.id)}">删除渠道</button>`}</div>
             </div>` : '';
-        const summary = current ? `<div class="ctb-channel-summary"><div><strong>${escapeHTML(current.name || '未命名渠道')}</strong><small>${escapeHTML([current.model || '未选择模型', (() => { try { return new URL(normalizeProxyUrl(current.url)).host; } catch (_) { return current.url || '未填写地址'; } })()].join(' · '))}</small></div><button type="button" class="ctb-button" data-action="edit-channel" data-feature="${feature}" data-channel-id="${escapeHTML(current.id)}"><i class="fa-solid fa-pen"></i> 编辑</button></div>` : '';
+        const summary = current ? `<div class="ctb-channel-summary"><div><strong>${escapeHTML(current.name || '未命名渠道')}</strong><small>${escapeHTML([current.model || '未选择模型', (() => { try { return new URL(normalizeProxyUrl(current.url)).host; } catch (_) { return current.url || '未填写地址'; } })()].join(' · '))}</small></div><button type="button" class="ctb-button" data-action="edit-channel" data-channel-id="${escapeHTML(current.id)}"><i class="fa-solid fa-pen"></i> 编辑</button></div>` : '';
         return `
             <div class="ctb-inline ctb-channel-picker">
-                <select class="ctb-input" id="ctb-${feature}-channel">${options}</select>
-                <button type="button" class="ctb-button" data-action="add-channel" data-feature="${feature}"><i class="fa-solid fa-plus"></i> 新渠道</button>
+                <select class="ctb-input" id="ctb-postEdit-channel">${options}</select>
+                <button type="button" class="ctb-button" data-action="add-channel"><i class="fa-solid fa-plus"></i> 新渠道</button>
             </div>
             ${editorForm || summary}`;
     }
@@ -869,7 +868,7 @@ export function createPostEditModule(deps) {
             </section>
             <section class="ctb-section">
                 <div class="ctb-section-title">生成渠道 ${infoButton('channel-main')}</div>
-                ${renderChannelSettings('postEdit')}
+                ${renderChannelSettings()}
             </section>
             <section class="ctb-section">
                 <div class="ctb-section-title">内置 system 提示词 ${infoButton('system-cache')}</div>
@@ -958,8 +957,8 @@ export function createPostEditModule(deps) {
 
     async function handleAction(action, data = {}) {
         switch (action) {
-            case 'add-channel': beginNewChannel(data.feature); return true;
-            case 'edit-channel': beginEditChannel(data.feature, data.channelId); return true;
+            case 'add-channel': beginNewChannel(); return true;
+            case 'edit-channel': beginEditChannel(data.channelId); return true;
             case 'save-channel': saveChannelEditor(); return true;
             case 'cancel-channel': cancelChannelEditor(); return true;
             case 'delete-channel': {

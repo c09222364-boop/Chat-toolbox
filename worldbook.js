@@ -783,6 +783,38 @@ export function createWorldbookModule(deps) {
         return JSON.stringify(worldbookComparableRaw(record?.raw || {}));
     }
 
+    function worldbookCompareValue(raw, key, extensionKey = key, fallback = null) {
+        return worldbookOriginalExtensionValue(raw, key, extensionKey, fallback);
+    }
+
+    function worldbookUnknownDifferenceKeys(a, b) {
+        const knownTop = new Set([
+            'uid', 'displayIndex', 'comment', 'name', 'title', 'content', 'key', 'keysecondary', 'constant', 'selective', 'selectiveLogic',
+            'order', 'position', 'depth', 'disable', 'excludeRecursion', 'preventRecursion', 'delayUntilRecursion', 'probability', 'useProbability',
+            'role', 'outletName', 'group', 'groupOverride', 'groupWeight', 'scanDepth', 'caseSensitive', 'matchWholeWords', 'useGroupScoring',
+            'automationId', 'vectorized', 'sticky', 'cooldown', 'delay', 'matchPersonaDescription', 'matchCharacterDescription',
+            'matchCharacterPersonality', 'matchCharacterDepthPrompt', 'matchScenario', 'matchCreatorNotes', 'triggers', 'ignoreBudget',
+            'characterFilter', 'addMemo', 'extensions',
+        ]);
+        const knownExtensions = new Set([
+            'displayIndex', 'display_index', 'exclude_recursion', 'prevent_recursion', 'delay_until_recursion', 'depth', 'probability', 'useProbability',
+            'position', 'role', 'selectiveLogic', 'outlet_name', 'group', 'group_override', 'group_weight', 'scan_depth', 'case_sensitive',
+            'match_whole_words', 'use_group_scoring', 'automation_id', 'vectorized', 'sticky', 'cooldown', 'delay', 'match_persona_description',
+            'match_character_description', 'match_character_personality', 'match_character_depth_prompt', 'match_scenario', 'match_creator_notes',
+            'triggers', 'ignore_budget',
+        ]);
+        const changed = [];
+        const addChanged = (prefix, left, right, known) => {
+            const keys = new Set([...Object.keys(left || {}), ...Object.keys(right || {})]);
+            keys.forEach((key) => {
+                if (!known.has(key) && JSON.stringify(left?.[key]) !== JSON.stringify(right?.[key])) changed.push(prefix ? `${prefix}.${key}` : key);
+            });
+        };
+        addChanged('', a, b, knownTop);
+        addChanged('extensions', a?.extensions, b?.extensions, knownExtensions);
+        return changed;
+    }
+
     function worldbookCompareDifferenceLabels(left, right) {
         const a = left?.raw || {};
         const b = right?.raw || {};
@@ -794,8 +826,24 @@ export function createWorldbookModule(deps) {
         if (worldbookPosition(a) !== worldbookPosition(b)) differences.push('位置');
         if (worldbookDepth(a) !== worldbookDepth(b)) differences.push('深度');
         if (worldbookOrder(a) !== worldbookOrder(b)) differences.push('优先级');
-        if (Boolean(a.excludeRecursion) !== Boolean(b.excludeRecursion) || Boolean(a.preventRecursion) !== Boolean(b.preventRecursion)) differences.push('递归');
-        if (!differences.length && worldbookCompareKey(left) !== worldbookCompareKey(right)) differences.push('其他设置');
+        if (Boolean(a.excludeRecursion) !== Boolean(b.excludeRecursion) || Boolean(a.preventRecursion) !== Boolean(b.preventRecursion) || worldbookCompareValue(a, 'delayUntilRecursion', 'delay_until_recursion', false) !== worldbookCompareValue(b, 'delayUntilRecursion', 'delay_until_recursion', false)) differences.push('递归设置');
+        if (worldbookCompareValue(a, 'useProbability', 'useProbability', true) !== worldbookCompareValue(b, 'useProbability', 'useProbability', true) || Number(worldbookCompareValue(a, 'probability', 'probability', 100)) !== Number(worldbookCompareValue(b, 'probability', 'probability', 100))) differences.push('触发概率');
+        if (worldbookCompareValue(a, 'role', 'role', 0) !== worldbookCompareValue(b, 'role', 'role', 0)) differences.push('消息角色');
+        if (worldbookCompareValue(a, 'scanDepth', 'scan_depth', null) !== worldbookCompareValue(b, 'scanDepth', 'scan_depth', null)) differences.push('扫描深度');
+        if (worldbookCompareValue(a, 'caseSensitive', 'case_sensitive', null) !== worldbookCompareValue(b, 'caseSensitive', 'case_sensitive', null) || worldbookCompareValue(a, 'matchWholeWords', 'match_whole_words', null) !== worldbookCompareValue(b, 'matchWholeWords', 'match_whole_words', null) || worldbookCompareValue(a, 'useGroupScoring', 'use_group_scoring', null) !== worldbookCompareValue(b, 'useGroupScoring', 'use_group_scoring', null)) differences.push('匹配规则');
+        if (String(worldbookCompareValue(a, 'group', 'group', '')) !== String(worldbookCompareValue(b, 'group', 'group', '')) || Boolean(worldbookCompareValue(a, 'groupOverride', 'group_override', false)) !== Boolean(worldbookCompareValue(b, 'groupOverride', 'group_override', false)) || Number(worldbookCompareValue(a, 'groupWeight', 'group_weight', 100)) !== Number(worldbookCompareValue(b, 'groupWeight', 'group_weight', 100))) differences.push('分组设置');
+        if (worldbookCompareValue(a, 'sticky', 'sticky', null) !== worldbookCompareValue(b, 'sticky', 'sticky', null) || worldbookCompareValue(a, 'cooldown', 'cooldown', null) !== worldbookCompareValue(b, 'cooldown', 'cooldown', null) || worldbookCompareValue(a, 'delay', 'delay', null) !== worldbookCompareValue(b, 'delay', 'delay', null)) differences.push('定时效果');
+        if (String(worldbookCompareValue(a, 'automationId', 'automation_id', '')) !== String(worldbookCompareValue(b, 'automationId', 'automation_id', ''))) differences.push('自动化 ID');
+        if (Boolean(worldbookCompareValue(a, 'vectorized', 'vectorized', false)) !== Boolean(worldbookCompareValue(b, 'vectorized', 'vectorized', false))) differences.push('向量化');
+        if (String(worldbookCompareValue(a, 'outletName', 'outlet_name', '')) !== String(worldbookCompareValue(b, 'outletName', 'outlet_name', ''))) differences.push('命名出口');
+        const matchSourceKeys = ['matchPersonaDescription', 'matchCharacterDescription', 'matchCharacterPersonality', 'matchCharacterDepthPrompt', 'matchScenario', 'matchCreatorNotes'];
+        if (matchSourceKeys.some((key) => Boolean(worldbookCompareValue(a, key, key.replace(/[A-Z]/g, (value) => `_${value.toLowerCase()}`), false)) !== Boolean(worldbookCompareValue(b, key, key.replace(/[A-Z]/g, (value) => `_${value.toLowerCase()}`), false))) || !same(a.characterFilter || null, b.characterFilter || null)) differences.push('匹配范围');
+        if (!same(worldbookCompareValue(a, 'triggers', 'triggers', []), worldbookCompareValue(b, 'triggers', 'triggers', []))) differences.push('生成触发器');
+        if (Boolean(worldbookCompareValue(a, 'ignoreBudget', 'ignore_budget', false)) !== Boolean(worldbookCompareValue(b, 'ignoreBudget', 'ignore_budget', false))) differences.push('预算设置');
+        if (Boolean(a.addMemo) !== Boolean(b.addMemo)) differences.push('备注设置');
+        if (String(a.comment || '') !== String(b.comment || '') || String(a.name || '') !== String(b.name || '') || String(a.title || '') !== String(b.title || '')) differences.push('名称字段');
+        const unknown = worldbookUnknownDifferenceKeys(a, b);
+        if (unknown.length) differences.push(`扩展字段：${unknown.slice(0, 6).join('、')}${unknown.length > 6 ? '等' : ''}`);
         return differences;
     }
 
@@ -1348,6 +1396,45 @@ export function createWorldbookModule(deps) {
         </div>`;
     }
 
+    function renderWorldbookAdvancedDifferences(raw, differences) {
+        const chips = [];
+        const add = (label, value) => {
+            if (differences.includes(label)) chips.push(`<span class="is-different">${escapeHTML(label)}：${escapeHTML(value)}</span>`);
+        };
+        const onOffDefault = (value) => value === null || value === undefined ? '继承全局' : value ? '开启' : '关闭';
+        const probabilityEnabled = Boolean(worldbookCompareValue(raw, 'useProbability', 'useProbability', true));
+        add('触发概率', probabilityEnabled ? `${Number(worldbookCompareValue(raw, 'probability', 'probability', 100))}%` : '不启用概率');
+        const role = Number(worldbookCompareValue(raw, 'role', 'role', 0));
+        add('消息角色', ['system', 'user', 'assistant'][role] || String(role));
+        const scanDepth = worldbookCompareValue(raw, 'scanDepth', 'scan_depth', null);
+        add('扫描深度', scanDepth === null || scanDepth === undefined ? '继承全局' : String(scanDepth));
+        add('匹配规则', `大小写 ${onOffDefault(worldbookCompareValue(raw, 'caseSensitive', 'case_sensitive', null))} · 全词 ${onOffDefault(worldbookCompareValue(raw, 'matchWholeWords', 'match_whole_words', null))} · 分组评分 ${onOffDefault(worldbookCompareValue(raw, 'useGroupScoring', 'use_group_scoring', null))}`);
+        add('分组设置', `分组 ${String(worldbookCompareValue(raw, 'group', 'group', '')) || '无'} · 覆盖 ${worldbookCompareValue(raw, 'groupOverride', 'group_override', false) ? '开' : '关'} · 权重 ${Number(worldbookCompareValue(raw, 'groupWeight', 'group_weight', 100))}`);
+        add('定时效果', `粘性 ${worldbookCompareValue(raw, 'sticky', 'sticky', null) ?? 0} · 冷却 ${worldbookCompareValue(raw, 'cooldown', 'cooldown', null) ?? 0} · 延迟 ${worldbookCompareValue(raw, 'delay', 'delay', null) ?? 0}`);
+        add('自动化 ID', String(worldbookCompareValue(raw, 'automationId', 'automation_id', '')) || '无');
+        add('向量化', worldbookCompareValue(raw, 'vectorized', 'vectorized', false) ? '开启' : '关闭');
+        add('命名出口', String(worldbookCompareValue(raw, 'outletName', 'outlet_name', '')) || '无');
+        if (differences.includes('匹配范围')) {
+            const sourceLabels = [
+                ['matchPersonaDescription', 'match_persona_description', '用户设定'],
+                ['matchCharacterDescription', 'match_character_description', '角色描述'],
+                ['matchCharacterPersonality', 'match_character_personality', '角色性格'],
+                ['matchCharacterDepthPrompt', 'match_character_depth_prompt', '角色注释'],
+                ['matchScenario', 'match_scenario', '场景'],
+                ['matchCreatorNotes', 'match_creator_notes', '创作者注释'],
+            ].filter(([key, extensionKey]) => Boolean(worldbookCompareValue(raw, key, extensionKey, false))).map(([, , label]) => label);
+            if (raw.characterFilter) sourceLabels.push('角色/标签过滤');
+            chips.push(`<span class="is-different">匹配范围：${escapeHTML(sourceLabels.join('、') || '仅聊天内容')}</span>`);
+        }
+        const triggers = worldbookCompareValue(raw, 'triggers', 'triggers', []);
+        add('生成触发器', Array.isArray(triggers) && triggers.length ? triggers.map((item) => typeof item === 'string' ? item : JSON.stringify(item)).join('、') : '全部');
+        add('预算设置', worldbookCompareValue(raw, 'ignoreBudget', 'ignore_budget', false) ? '忽略预算' : '遵循预算');
+        add('备注设置', raw.addMemo ? '使用条目名称作为备注' : '不使用备注');
+        add('名称字段', String(raw.comment || raw.name || raw.title || '') || '空');
+        differences.filter((label) => label.startsWith('扩展字段：')).forEach((label) => chips.push(`<span class="is-different">${escapeHTML(label)}</span>`));
+        return chips.join('');
+    }
+
     function renderWorldbookCompareSide(record, side, highlightedContent, differences) {
         const raw = record?.raw || {};
         const editing = worldbookCompareDraft?.side === side && String(worldbookCompareDraft?.uid) === String(record?.uid);
@@ -1360,7 +1447,7 @@ export function createWorldbookModule(deps) {
         const differenceClass = (name) => differences.includes(name) ? ' class="is-different"' : '';
         return `<div class="ctb-preset-compare-side ctb-worldbook-compare-side">
             <div class="ctb-preset-compare-side-head"><small>${escapeHTML(sideName)}</small><button type="button" class="ctb-button ctb-preset-compare-edit" data-action="edit-worldbook-compare-entry" data-worldbook-compare-side="${side}" data-worldbook-uid="${escapeHTML(record.uid)}">编辑并保存</button></div>
-            <div class="ctb-worldbook-compare-meta"><span${differenceClass('状态')}>${escapeHTML(status)}</span><span${differenceClass('位置')}>${escapeHTML(position)}</span><span${differenceClass('深度')}>深度 ${worldbookDepth(raw)}</span><span${differenceClass('优先级')}>优先级 ${worldbookOrder(raw)}</span><span${differenceClass('关键词')}>主关键词：${escapeHTML(primary)}</span><span${differenceClass('关键词')}>次要关键词：${escapeHTML(secondary)}</span>${differences.includes('递归') ? '<span class="is-different">递归设置不同</span>' : ''}${differences.includes('其他设置') ? '<span class="is-different">其他设置不同</span>' : ''}</div>
+            <div class="ctb-worldbook-compare-meta"><span${differenceClass('状态')}>${escapeHTML(status)}</span><span${differenceClass('位置')}>${escapeHTML(position)}</span><span${differenceClass('深度')}>深度 ${worldbookDepth(raw)}</span><span${differenceClass('优先级')}>优先级 ${worldbookOrder(raw)}</span><span${differenceClass('关键词')}>主关键词：${escapeHTML(primary)}</span><span${differenceClass('关键词')}>次要关键词：${escapeHTML(secondary)}</span>${differences.includes('递归设置') ? `<span class="is-different">递归：不可递归 ${raw.excludeRecursion ? '开' : '关'} · 阻止进一步递归 ${raw.preventRecursion ? '开' : '关'} · 仅递归时检查 ${worldbookCompareValue(raw, 'delayUntilRecursion', 'delay_until_recursion', false) ? '开' : '关'}</span>` : ''}${renderWorldbookAdvancedDifferences(raw, differences)}</div>
             <p>${highlightedContent || '（空内容）'}</p>
         </div>`;
     }
