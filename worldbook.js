@@ -1323,7 +1323,7 @@ export function createWorldbookModule(deps) {
                 </div>`;
             }).join('')
             : '<div class="ctb-hint">最近 2 层没有触发当前世界书的关键词条目。</div>';
-        return `<div class="ctb-worldbook-simulation"><div class="ctb-worldbook-simulation-head"><strong>触发结果：${worldbookSimulation.triggered.length} 条 · 总字数 ${Number(worldbookSimulation.totalCharacters) || 0}</strong><span>扫描 ${escapeHTML(floorText)} · 已开启 ${worldbookSimulation.scanned} 条</span></div><div class="ctb-worldbook-simulation-list">${items}</div></div>`;
+        return `<div class="ctb-worldbook-simulation"><div class="ctb-worldbook-simulation-head"><strong>触发结果：${worldbookSimulation.triggered.length} 条 · 总字数 ${Number(worldbookSimulation.totalCharacters) || 0}</strong><span>扫描 ${escapeHTML(floorText)} · 已开启 ${worldbookSimulation.scanned} 条</span></div><div class="ctb-worldbook-simulation-list" data-ctb-scroll-key="worldbook-simulation-list">${items}</div></div>`;
     }
     
     function renderWorldbookInlineEditor(record) {
@@ -1476,7 +1476,7 @@ export function createWorldbookModule(deps) {
                 : '<div class="ctb-readonly-note">两本世界书没有名称相同但内容或设置不同的条目。</div>';
         return `<div class="ctb-worldbook-compare-panel">
             <div class="ctb-inline ctb-worldbook-compare-toolbar"><strong>双世界书对比</strong><span>左侧：${escapeHTML(worldbookBook)}</span><select class="ctb-input" id="ctb-worldbook-compare-target">${targetOptions || '<option value="">没有其他世界书</option>'}</select><button type="button" class="ctb-button" data-action="refresh-worldbook-compare"${worldbookCompareTarget && !worldbookCompareLoading ? '' : ' disabled'}>刷新对比</button></div>
-            <div class="ctb-preset-compare-list ctb-worldbook-compare-list">${content}</div>
+            <div class="ctb-preset-compare-list ctb-worldbook-compare-list" data-ctb-scroll-key="worldbook-compare-list">${content}</div>
         </div>`;
     }
     
