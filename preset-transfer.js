@@ -1,7 +1,7 @@
-import { renderTextDifference } from './compare-diff.js';
+import { normalizeComparableText, renderTextDifference } from './compare-diff.js';
 
 export function createPresetTransferModule(deps) {
-    const { host, getContext, deepClone, notify, renderPanel, getRoot, escapeHTML, infoButton, requestDialog } = deps;
+    const { host, getContext, deepClone, notify, renderPanel, getRoot, escapeHTML, infoButton, requestDialog, requestSaveBeforeClose } = deps;
 
     let presetTransferLoading = false;
     let presetTransferLoadedOnce = false;
@@ -20,6 +20,8 @@ export function createPresetTransferModule(deps) {
     let presetTransferAnchor = { kind: 'top', anchorId: '' };
     let presetTransferDraft = null;
     let presetCompareOpen = false;
+    let presetTransferSaving = false;
+    const presetTransferPendingDocuments = new Map();
 
     function getPresetTransferManager() {
         const context = getContext();
@@ -287,6 +289,59 @@ export function createPresetTransferModule(deps) {
         presetEntryArrayInfo(verify);
         return verify;
     }
+
+    async function loadWorkingPresetDocument(manager, name) {
+        if (presetTransferPendingDocuments.has(name)) return deepClone(presetTransferPendingDocuments.get(name));
+        if (name === presetTransferSource && presetTransferSourceDocument) return deepClone(presetTransferSourceDocument);
+        if (name === presetTransferTarget && presetTransferTargetDocument) return deepClone(presetTransferTargetDocument);
+        return loadPresetTransferDocument(manager, name);
+    }
+
+    function stagePresetDocument(name, document) {
+        const presetName = String(name || '');
+        if (!presetName || !document) return;
+        const next = deepClone(document);
+        presetEntryArrayInfo(next);
+        presetTransferPendingDocuments.set(presetName, next);
+        if (presetName === presetTransferSource) {
+            presetTransferSourceDocument = deepClone(next);
+            presetTransferSourceEntries = presetTransferRecords(next);
+        }
+        if (presetName === presetTransferTarget) {
+            presetTransferTargetDocument = deepClone(next);
+            presetTransferTargetEntries = presetTransferRecords(next);
+        }
+    }
+
+    async function savePendingPresetDocuments() {
+        if (presetTransferSaving || !presetTransferPendingDocuments.size) return true;
+        presetTransferSaving = true;
+        renderPanel();
+        try {
+            const manager = getPresetTransferManager();
+            for (const [name, document] of [...presetTransferPendingDocuments.entries()]) {
+                const verified = await savePresetTransferDocument(manager, name, document);
+                presetTransferPendingDocuments.delete(name);
+                if (name === presetTransferSource) {
+                    presetTransferSourceDocument = deepClone(verified);
+                    presetTransferSourceEntries = presetTransferRecords(verified);
+                }
+                if (name === presetTransferTarget) {
+                    presetTransferTargetDocument = deepClone(verified);
+                    presetTransferTargetEntries = presetTransferRecords(verified);
+                }
+            }
+            notify('预设修改已全部保存', 'success');
+            return true;
+        } catch (error) {
+            presetTransferError = error.message || String(error);
+            notify(`保存预设修改失败：${error.message}`, 'error');
+            return false;
+        } finally {
+            presetTransferSaving = false;
+            renderPanel();
+        }
+    }
     
     async function loadPresetTransfer({ force = false } = {}) {
         if (presetTransferLoading && !force) return;
@@ -305,10 +360,10 @@ export function createPresetTransferModule(deps) {
                     ? presetTransferTarget
                     : (names.find((name) => name !== presetTransferSource) || '');
             }
-            presetTransferSourceDocument = await loadPresetTransferDocument(manager, presetTransferSource);
+            presetTransferSourceDocument = await loadWorkingPresetDocument(manager, presetTransferSource);
             presetTransferSourceEntries = presetTransferRecords(presetTransferSourceDocument);
             if (presetTransferTarget) {
-                presetTransferTargetDocument = await loadPresetTransferDocument(manager, presetTransferTarget);
+                presetTransferTargetDocument = await loadWorkingPresetDocument(manager, presetTransferTarget);
                 presetTransferTargetEntries = presetTransferRecords(presetTransferTargetDocument);
             } else {
                 presetTransferTargetDocument = null;
@@ -328,6 +383,7 @@ export function createPresetTransferModule(deps) {
     }
     
     async function choosePresetTransferSide(side, name) {
+        if (!(await stageOpenPresetDraft())) return;
         const next = String(name || '');
         if (side === 'source') {
             const previousSource = presetTransferSource;
@@ -345,21 +401,17 @@ export function createPresetTransferModule(deps) {
     
     async function swapPresetTransferSides() {
         if (presetTransferModeValue !== 'dual' || !presetTransferTarget) return;
+        if (!(await stageOpenPresetDraft())) return;
         const source = presetTransferSource;
         presetTransferSource = presetTransferTarget;
         presetTransferTarget = source;
-        presetTransferSelected = new Set();
-        presetTransferAnchor = { kind: 'top', anchorId: '' };
-        presetTransferDraft = null;
         return loadPresetTransfer({ force: true });
     }
     
     async function setPresetTransferMode(mode) {
+        if (!(await stageOpenPresetDraft())) return;
         const next = mode === 'dual' ? 'dual' : 'single';
         presetTransferModeValue = next;
-        presetTransferSelected = new Set();
-        presetTransferAnchor = { kind: 'top', anchorId: '' };
-        presetTransferDraft = null;
         if (next === 'single') presetTransferTarget = '';
         await loadPresetTransfer({ force: true });
     }
@@ -383,17 +435,17 @@ export function createPresetTransferModule(deps) {
     
     async function duplicatePresetEntriesInternal(selected) {
         const manager = getPresetTransferManager();
-        const document = await loadPresetTransferDocument(manager, presetTransferSource);
+        const document = await loadWorkingPresetDocument(manager, presetTransferSource);
         const info = presetEntryArrayInfo(document);
         const ids = clonePresetEntriesIntoDocument(document, info, selected, presetAnchorForOperation(), { renameCopies: true });
-        const verify = await savePresetTransferDocument(manager, presetTransferSource, document);
-        verifyPresetOperation(verify, ids);
+        verifyPresetOperation(document, ids);
+        stagePresetDocument(presetTransferSource, document);
         return ids;
     }
     
     async function reorderPresetEntriesInternal(selected) {
         const manager = getPresetTransferManager();
-        const document = await loadPresetTransferDocument(manager, presetTransferSource);
+        const document = await loadWorkingPresetDocument(manager, presetTransferSource);
         const group = presetMainPromptOrder(document, true);
         const selectedIds = new Set(selected.map((entry) => String(entry.id)));
         const selectedOrder = group.order.filter((item) => selectedIds.has(presetOrderIdentifier(item)));
@@ -409,12 +461,13 @@ export function createPresetTransferModule(deps) {
             identifier: presetOrderIdentifier(item),
             enabled: item.enabled !== false,
         })));
-        const verify = await savePresetTransferDocument(manager, presetTransferSource, document);
-        verifyPresetOperation(verify, selectedIds);
+        verifyPresetOperation(document, selectedIds);
+        stagePresetDocument(presetTransferSource, document);
         return selectedIds;
     }
     
     async function transferPresetEntries(mode) {
+        if (!(await stageOpenPresetDraft())) return;
         const selected = presetSelectedRecords();
         if (!selected.length) return notify('请先勾选要处理的预设条目', 'warning');
         if (presetTransferModeValue === 'single') {
@@ -423,7 +476,7 @@ export function createPresetTransferModule(deps) {
             try {
                 if (mode === 'copy') await duplicatePresetEntriesInternal(selected);
                 else await reorderPresetEntriesInternal(selected);
-                notify(`已在当前预设${mode === 'copy' ? '复制' : '移动'} ${selected.length} 个条目`, 'success');
+                notify(`已暂存${mode === 'copy' ? '复制' : '移动'} ${selected.length} 个条目；请点击“现在保存”写入预设`, 'success');
                 await loadPresetTransfer({ force: true });
             } catch (error) {
                 presetTransferError = error.message || String(error);
@@ -437,18 +490,15 @@ export function createPresetTransferModule(deps) {
         if (!presetTransferTarget || presetTransferTarget === presetTransferSource) return notify('请选择不同的目标预设', 'warning');
         presetTransferLoading = true;
         renderPanel();
-        let targetCommitted = false;
         try {
             const manager = getPresetTransferManager();
-            const sourceDocument = await loadPresetTransferDocument(manager, presetTransferSource);
-            const targetDocument = await loadPresetTransferDocument(manager, presetTransferTarget);
+            const sourceDocument = await loadWorkingPresetDocument(manager, presetTransferSource);
+            const targetDocument = await loadWorkingPresetDocument(manager, presetTransferTarget);
             const sourceInfo = presetEntryArrayInfo(sourceDocument);
             const targetInfo = presetEntryArrayInfo(targetDocument);
             const selectedIds = new Set(selected.map((entry) => String(entry.id)));
             const createdIds = clonePresetEntriesIntoDocument(targetDocument, targetInfo, selected, presetAnchorForOperation());
-            const targetVerify = await savePresetTransferDocument(manager, presetTransferTarget, targetDocument);
-            verifyPresetOperation(targetVerify, createdIds);
-            targetCommitted = true;
+            verifyPresetOperation(targetDocument, createdIds);
             if (mode === 'move') {
                 sourceInfo.entries = sourceInfo.entries.filter((raw, index) => {
                     const id = presetRawIdentifier(raw, index);
@@ -456,16 +506,16 @@ export function createPresetTransferModule(deps) {
                 });
                 sourceDocument[sourceInfo.key] = sourceInfo.entries;
                 removePresetPromptOrder(sourceDocument, selectedIds);
-                const sourceVerify = await savePresetTransferDocument(manager, presetTransferSource, sourceDocument);
-                const remaining = new Set(presetTransferRecords(sourceVerify).map((entry) => String(entry.id)));
+                const remaining = new Set(presetTransferRecords(sourceDocument).map((entry) => String(entry.id)));
                 for (const id of selectedIds) if (remaining.has(id)) throw new Error(`来源预设仍保留条目 ${id}`);
             }
-            notify(`已${mode === 'move' ? '移动' : '复制'} ${selected.length} 个预设条目`, 'success');
+            stagePresetDocument(presetTransferTarget, targetDocument);
+            if (mode === 'move') stagePresetDocument(presetTransferSource, sourceDocument);
+            notify(`已暂存${mode === 'move' ? '移动' : '复制'} ${selected.length} 个预设条目；请点击“现在保存”写入预设`, 'success');
             await loadPresetTransfer({ force: true });
         } catch (error) {
             presetTransferError = error.message || String(error);
-            const suffix = targetCommitted && mode === 'move' ? '（目标已保存，来源未删除）' : '';
-            notify(`预设条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}${suffix}`, 'error');
+            notify(`预设条目${mode === 'move' ? '移动' : '复制'}失败：${error.message}`, 'error');
         } finally {
             presetTransferLoading = false;
             renderPanel();
@@ -473,6 +523,7 @@ export function createPresetTransferModule(deps) {
     }
     
     async function deletePresetEntries() {
+        if (!(await stageOpenPresetDraft())) return;
         const selected = presetSelectedRecords();
         if (!selected.length) return;
         const confirmed = await requestDialog({
@@ -486,14 +537,14 @@ export function createPresetTransferModule(deps) {
         renderPanel();
         try {
             const manager = getPresetTransferManager();
-            const document = await loadPresetTransferDocument(manager, presetTransferSource);
+            const document = await loadWorkingPresetDocument(manager, presetTransferSource);
             const info = presetEntryArrayInfo(document);
             const ids = new Set(selected.map((entry) => entry.id));
             info.entries = info.entries.filter((raw, index) => !ids.has(presetRawIdentifier(raw, index)));
             document[info.key] = info.entries;
             removePresetPromptOrder(document, ids);
-            await savePresetTransferDocument(manager, presetTransferSource, document);
-            notify(`已删除 ${selected.length} 个预设条目`, 'success');
+            stagePresetDocument(presetTransferSource, document);
+            notify(`已暂存删除 ${selected.length} 个预设条目；请点击“现在保存”写入预设`, 'success');
             await loadPresetTransfer({ force: true });
         } catch (error) {
             presetTransferError = error.message || String(error);
@@ -526,7 +577,7 @@ export function createPresetTransferModule(deps) {
         const draft = presetTransferDraft;
         const manager = getPresetTransferManager();
         const presetName = String(draft.presetName || presetTransferSource);
-        const document = await loadPresetTransferDocument(manager, presetName);
+        const document = await loadWorkingPresetDocument(manager, presetName);
         const info = presetEntryArrayInfo(document);
         const index = info.entries.findIndex((raw, rawIndex) => presetRawIdentifier(raw, rawIndex) === draft.id);
         if (index < 0) throw new Error('条目已不存在，无法保存');
@@ -543,25 +594,33 @@ export function createPresetTransferModule(deps) {
         } else if (draft.enabled !== false) {
             addPresetPromptOrder(document, draft.id, true, { kind: 'top', anchorId: '' });
         }
-        const verify = await savePresetTransferDocument(manager, presetName, document);
-        verifyPresetOperation(verify, [draft.id], { requireOrder: false });
+        verifyPresetOperation(document, [draft.id], { requireOrder: false });
+        stagePresetDocument(presetName, document);
         presetTransferDraft = null;
     }
     
     async function commitPresetEntryDraft() {
         if (!presetTransferDraft) return;
-        presetTransferLoading = true;
-        renderPanel();
         try {
             await savePresetEntryDraft();
-            notify('预设条目已保存', 'success');
-            await loadPresetTransfer({ force: true });
+            notify('预设条目已暂存；请点击“现在保存”写入预设', 'success');
         } catch (error) {
             presetTransferError = error.message || String(error);
-            notify(`保存预设条目失败：${error.message}`, 'error');
-        } finally {
-            presetTransferLoading = false;
+            notify(`暂存预设条目失败：${error.message}`, 'error');
+        }
+        renderPanel();
+    }
+
+    async function stageOpenPresetDraft() {
+        if (!presetTransferDraft) return true;
+        try {
+            await savePresetEntryDraft();
+            return true;
+        } catch (error) {
+            presetTransferError = error.message || String(error);
+            notify(`暂存预设条目失败：${error.message}`, 'error');
             renderPanel();
+            return false;
         }
     }
     
@@ -599,19 +658,19 @@ export function createPresetTransferModule(deps) {
     
     function presetCompareSummary(source, target) {
         const nameKey = (entry) => String(entry?.name || '').trim();
-        const compareKey = (entry) => JSON.stringify({
-            content: presetEntryDisplayContent(entry),
-            role: String(entry?.raw?.role || ''),
-            enabled: entry?.enabled !== false,
-        });
         const left = new Map(source.filter((entry) => !entry.marker && nameKey(entry)).map((entry) => [nameKey(entry), entry]));
         const right = new Map(target.filter((entry) => !entry.marker && nameKey(entry)).map((entry) => [nameKey(entry), entry]));
         const rows = [];
         left.forEach((entry, name) => {
             // A comparison is meaningful only when both presets contain the
             // exact same entry name.  Unique source/target rows are omitted.
-            if (right.has(name) && compareKey(entry) !== compareKey(right.get(name))) {
-                rows.push({ kind: '内容不同', name, left: entry, right: right.get(name) });
+            const target = right.get(name);
+            if (target) {
+                const differences = [];
+                if (normalizeComparableText(presetEntryDisplayContent(entry)) !== normalizeComparableText(presetEntryDisplayContent(target))) differences.push('正文');
+                if (String(entry.raw?.role || 'system') !== String(target.raw?.role || 'system')) differences.push('角色');
+                if (entry.enabled !== target.enabled || entry.inserted !== target.inserted) differences.push('启用状态');
+                if (differences.length) rows.push({ kind: differences.join('、'), differences, name, left: entry, right: target });
             }
         });
         return rows;
@@ -638,14 +697,14 @@ export function createPresetTransferModule(deps) {
         return `<div class="ctb-preset-placement" aria-label="条目放置位置"><div class="ctb-preset-placement-label"><strong>放到哪里</strong><span>复制或移动后写入${placementScope}</span></div><div class="ctb-preset-placement-main"><div class="ctb-placement-choices">${placeButton('top', '列表开头')}${placeButton('after', '所选条目后')}</div>${needsReference ? `<label class="ctb-placement-reference"><span>插入到哪条后面</span><select class="ctb-input" id="ctb-preset-transfer-anchor" aria-label="插入到哪条后面"${candidates.length ? '' : ' disabled'}>${referenceOptions}</select></label>` : ''}</div></div>`;
     }
     
-    function renderPresetDraftFields(saveLabel = '保存条目') {
+    function renderPresetDraftFields(saveLabel = '暂存条目') {
         const draft = presetTransferDraft;
         if (!draft) return '';
         return `<label class="ctb-field"><span>名称</span><input class="ctb-input" id="ctb-preset-draft-name" value="${escapeHTML(draft.raw?.name || draft.raw?.comment || '')}"></label>
             <label class="ctb-field"><span>角色</span><select class="ctb-input" id="ctb-preset-draft-role"><option value="system"${draft.raw?.role === 'system' ? ' selected' : ''}>system</option><option value="user"${draft.raw?.role === 'user' ? ' selected' : ''}>user</option><option value="assistant"${draft.raw?.role === 'assistant' ? ' selected' : ''}>assistant</option></select></label>
             <label class="ctb-field"><span>内容</span><textarea class="ctb-input ctb-preset-draft-content" id="ctb-preset-draft-content">${escapeHTML(presetEntryDisplayContent(draft.raw))}</textarea></label>
             <label class="ctb-check"><input type="checkbox" id="ctb-preset-draft-enabled"${draft.enabled !== false ? ' checked' : ''}>加入主发送顺序并启用</label>
-            <div class="ctb-inline ctb-preset-draft-actions"><button type="button" class="ctb-button ctb-primary" data-action="save-preset-edit">${saveLabel}</button><button type="button" class="ctb-button" data-action="cancel-preset-edit">收起</button></div>`;
+            <div class="ctb-inline ctb-preset-draft-actions"><button type="button" class="ctb-button ctb-primary" data-action="save-preset-edit">${saveLabel}</button><button type="button" class="ctb-button" data-action="cancel-preset-edit">放弃本条修改</button></div>`;
     }
     
     function renderPresetTransferTab() {
@@ -686,10 +745,10 @@ export function createPresetTransferModule(deps) {
         const renderCompareSide = (entry, side, highlightedContent, row) => {
             const label = side === 'target' ? '目标' : '来源';
             const editing = !!draft && draft.surface === 'compare' && draft.side === side && String(draft.id) === String(entry?.id);
-            if (editing) return `<div class="ctb-preset-compare-side is-editing"><small>${label} · 直接编辑</small><div class="ctb-preset-compare-editor">${renderPresetDraftFields('保存此侧')}</div></div>`;
+            if (editing) return `<div class="ctb-preset-compare-side is-editing"><small>${label} · 直接编辑</small><div class="ctb-preset-compare-editor">${renderPresetDraftFields('暂存此侧')}</div></div>`;
             const roleDifferent = String(row.left.raw?.role || '') !== String(row.right.raw?.role || '');
             const enabledDifferent = row.left.enabled !== row.right.enabled || row.left.inserted !== row.right.inserted;
-            return `<div class="ctb-preset-compare-side"><div class="ctb-preset-compare-side-head"><small>${label}</small><button type="button" class="ctb-button ctb-preset-compare-edit" data-action="edit-preset-entry" data-preset-entry-id="${escapeHTML(entry.id)}" data-preset-side="${side}" data-preset-surface="compare">编辑并保存</button></div><div class="ctb-preset-compare-meta"><span${roleDifferent ? ' class="is-different"' : ''}>角色：${escapeHTML(entry.raw?.role || 'system')}</span><span${enabledDifferent ? ' class="is-different"' : ''}>${entry.inserted ? (entry.enabled ? '启用' : '停用') : '未加入主顺序'}</span></div><p>${highlightedContent || '（空内容）'}</p></div>`;
+            return `<div class="ctb-preset-compare-side"><div class="ctb-preset-compare-side-head"><small>${label}</small><button type="button" class="ctb-button ctb-preset-compare-edit" data-action="edit-preset-entry" data-preset-entry-id="${escapeHTML(entry.id)}" data-preset-side="${side}" data-preset-surface="compare">编辑并暂存</button></div><div class="ctb-preset-compare-meta"><span${roleDifferent ? ' class="is-different"' : ''}>角色：${escapeHTML(entry.raw?.role || 'system')}</span><span${enabledDifferent ? ' class="is-different"' : ''}>${entry.inserted ? (entry.enabled ? '启用' : '停用') : '未加入主顺序'}</span></div><p>${highlightedContent || '（空内容）'}</p></div>`;
         };
         const compare = mode === 'dual' && presetCompareOpen ? `<div class="ctb-preset-compare-list" data-ctb-scroll-key="preset-compare-list">${compareRows.length ? compareRows.slice(0, 120).map((row) => {
             const highlighted = renderTextDifference(presetEntryDisplayContent(row.left), presetEntryDisplayContent(row.right), escapeHTML);
@@ -703,9 +762,39 @@ export function createPresetTransferModule(deps) {
         const presetLists = `<section class="ctb-section ctb-preset-transfer-grid${mode === 'single' ? ' is-single' : ''}"><div><div class="ctb-section-title">${mode === 'single' ? '当前预设' : '来源预设'} <span>${sourceCount}</span></div><select class="ctb-input" id="ctb-preset-transfer-source">${sourceOptions || '<option value="">没有预设</option>'}</select>${renderLoadFilter('source')}<div class="ctb-preset-entry-list" data-ctb-scroll-key="preset-source-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : sourceList}</div></div>${mode === 'dual' ? `<div><div class="ctb-section-title">目标预设 <span>${targetCount}</span></div><select class="ctb-input" id="ctb-preset-transfer-target">${targetOptions || '<option value="">没有其他预设</option>'}</select>${renderLoadFilter('target')}<div class="ctb-preset-entry-list" data-ctb-scroll-key="preset-target-list">${presetTransferLoading ? '<div class="ctb-world-empty"><span class="ctb-save-spinner"></span> 读取中…</div>' : targetList}</div></div>` : ''}</section>`;
         const compareSelectors = `<section class="ctb-section ctb-preset-transfer-grid ctb-preset-compare-selectors"><div><div class="ctb-section-title">来源预设</div><select class="ctb-input" id="ctb-preset-transfer-source">${sourceOptions || '<option value="">没有预设</option>'}</select></div><div><div class="ctb-section-title">目标预设</div><select class="ctb-input" id="ctb-preset-transfer-target">${targetOptions || '<option value="">没有其他预设</option>'}</select></div></section>`;
         const presetActions = `<section class="ctb-section ctb-preset-actions"><div class="ctb-inline ctb-manager-toolbar"><span>已选 <span data-preset-selection-count>${presetTransferSelected.size}</span> 条</span>${transferControls}<button type="button" class="ctb-button ctb-danger" data-preset-bulk-action="delete" data-action="delete-preset-entries"${presetTransferSelected.size && !presetTransferLoading ? '' : ' disabled'}>批量删除</button></div>${renderPresetPlacementControls()}</section>`;
+        const hasPending = presetTransferPendingDocuments.size > 0 || Boolean(presetTransferDraft);
+        const saveStatus = presetTransferDraft
+            ? '当前条目尚未暂存'
+            : presetTransferPendingDocuments.size
+                ? `已有 ${presetTransferPendingDocuments.size} 个预设等待保存`
+                : '当前预设已同步';
+        const saveBar = `<div class="ctb-inline ctb-manager-savebar"><span data-preset-save-status>${saveStatus}</span><button type="button" class="ctb-button ctb-save" data-action="save-preset-changes"${hasPending && !presetTransferSaving && !presetTransferLoading ? '' : ' disabled'}>${presetTransferSaving ? '保存中…' : '现在保存'}</button></div>`;
         return `<section class="ctb-section"><div class="ctb-section-title">预设条目转移 ${infoButton('preset-transfer')}</div></section>
             <section class="ctb-section"><div class="ctb-inline ctb-manager-toolbar"><button type="button" class="ctb-button${mode === 'single' ? ' ctb-primary' : ''}" data-action="set-preset-transfer-mode" data-mode="single">单预设编辑</button><button type="button" class="ctb-button${mode === 'dual' ? ' ctb-primary' : ''}" data-action="set-preset-transfer-mode" data-mode="dual">双预设对比/转移</button>${mode === 'dual' ? '<button type="button" class="ctb-button" data-action="swap-preset-sides">交换左右</button>' : ''}<input class="ctb-input" id="ctb-preset-transfer-search" placeholder="搜索条目" value="${escapeHTML(presetTransferSearch)}"><button type="button" class="ctb-button" data-action="filter-preset-transfer">筛选</button><button type="button" class="ctb-button" data-action="refresh-preset-transfer">刷新预设</button>${mode === 'dual' ? `<button type="button" class="ctb-button" data-action="toggle-preset-compare">${presetCompareOpen ? '关闭差异' : `比较差异${compareRows.length ? `（${compareRows.length}）` : ''}`}</button>` : ''}</div>${presetTransferError ? `<div class="ctb-readonly-note ctb-world-error">${escapeHTML(presetTransferError)}</div>` : ''}</section>
-            ${presetCompareOpen && mode === 'dual' ? `${compareSelectors}${compare}` : `${presetLists}${presetActions}`}`;
+            ${presetCompareOpen && mode === 'dual' ? `${compareSelectors}${compare}` : `${presetLists}${presetActions}`}${saveBar}`;
+    }
+
+    function discardPresetChanges() {
+        presetTransferPendingDocuments.clear();
+        presetTransferDraft = null;
+        presetTransferSourceDocument = null;
+        presetTransferTargetDocument = null;
+        presetTransferSourceEntries = [];
+        presetTransferTargetEntries = [];
+        presetTransferSelected = new Set();
+        presetTransferLoadedOnce = false;
+    }
+
+    async function beforePanelClose() {
+        if (!(await stageOpenPresetDraft())) return false;
+        if (!presetTransferPendingDocuments.size) return true;
+        const decision = await requestSaveBeforeClose('保存预设并关闭', `有 ${presetTransferPendingDocuments.size} 个预设包含未保存修改。你可以统一保存后关闭、放弃修改退出，或返回继续编辑。`);
+        if (decision === 'cancel' || decision === null) return false;
+        if (decision === 'discard') {
+            discardPresetChanges();
+            return true;
+        }
+        return savePendingPresetDocuments();
     }
 
     function handleInput(target) {
@@ -732,10 +821,10 @@ export function createPresetTransferModule(deps) {
             presetTransferAnchor.anchorId = String(target.value || '');
             renderPanel();
         } else if (id === 'ctb-preset-transfer-load-source' || id === 'ctb-preset-transfer-load-target') {
+            if (!(await stageOpenPresetDraft())) return true;
             presetTransferLoadModeValue = target.value === 'enabled' ? 'enabled' : 'all';
             presetTransferSelected = new Set();
             presetTransferAnchor = { kind: 'top', anchorId: '' };
-            presetTransferDraft = null;
             presetTransferVisibleLimit = 120;
             renderPanel();
         } else if (id === 'ctb-preset-draft-role' && presetTransferDraft) {
@@ -748,12 +837,12 @@ export function createPresetTransferModule(deps) {
 
     async function handleAction(action, data = {}) {
         switch (action) {
-            case 'refresh-preset-transfer': await loadPresetTransfer({ force: true }); return true;
+            case 'refresh-preset-transfer': if (await stageOpenPresetDraft()) await loadPresetTransfer({ force: true }); return true;
             case 'filter-preset-transfer': presetTransferVisibleLimit = 120; renderPanel(); return true;
             case 'more-preset-transfer-entries': presetTransferVisibleLimit += 120; renderPanel(); return true;
             case 'set-preset-transfer-mode': await setPresetTransferMode(data.mode); return true;
             case 'swap-preset-sides': await swapPresetTransferSides(); return true;
-            case 'toggle-preset-compare': presetCompareOpen = !presetCompareOpen; renderPanel(); return true;
+            case 'toggle-preset-compare': if (!(await stageOpenPresetDraft())) return true; presetCompareOpen = !presetCompareOpen; renderPanel(); return true;
             case 'set-preset-anchor':
                 presetTransferAnchor = {
                     kind: data.presetAnchorKind === 'after' ? 'after' : 'top',
@@ -765,14 +854,15 @@ export function createPresetTransferModule(deps) {
                 const id = String(data.presetEntryId || '');
                 const side = data.presetSide === 'target' ? 'target' : 'source';
                 if (presetTransferDraft?.surface === 'list' && presetTransferDraft.side === side && String(presetTransferDraft.id) === id) {
-                    presetTransferDraft = null;
+                    await stageOpenPresetDraft();
                     renderPanel();
-                } else startPresetEntryEdit(id, side, 'list');
+                } else if (await stageOpenPresetDraft()) startPresetEntryEdit(id, side, 'list');
                 return true;
             }
-            case 'edit-preset-entry': startPresetEntryEdit(data.presetEntryId, data.presetSide || 'source', data.presetSurface || 'list'); return true;
+            case 'edit-preset-entry': if (await stageOpenPresetDraft()) startPresetEntryEdit(data.presetEntryId, data.presetSide || 'source', data.presetSurface || 'list'); return true;
             case 'save-preset-edit': await commitPresetEntryDraft(); return true;
             case 'cancel-preset-edit': presetTransferDraft = null; renderPanel(); return true;
+            case 'save-preset-changes': if (await stageOpenPresetDraft()) await savePendingPresetDocuments(); return true;
             case 'copy-preset-entries': await transferPresetEntries('copy'); return true;
             case 'move-preset-entries': await transferPresetEntries('move'); return true;
             case 'delete-preset-entries': await deletePresetEntries(); return true;
@@ -785,5 +875,6 @@ export function createPresetTransferModule(deps) {
         handleInput,
         handleChange,
         handleAction,
+        beforePanelClose,
     };
 }

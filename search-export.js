@@ -637,7 +637,7 @@ export function createSearchExportModule(deps) {
     function renderSearchTab() {
         const bookmarkRows = currentBookmarks();
         const list = results.length ? `
-            <div class="ctb-results" id="ctb-results">
+            <div class="ctb-results" id="ctb-results" data-ctb-scroll-key="search-results">
                 <div class="ctb-results-title">找到 ${results.length}${results.length >= MAX_RESULTS ? '+' : ''} 条结果（点击跳转）</div>
                 ${results.map((result, index) => `<button type="button" class="ctb-result-row${index === currentResultIndex ? ' is-active' : ''}" data-action="jump-result" data-result-index="${index}">
                     <span class="ctb-result-meta"><span>${escapeHTML(result.name)}</span><span>#${escapeHTML(result.id)}${result.occurrence > 1 ? ` · 第 ${result.occurrence} 处` : ''}</span></span>

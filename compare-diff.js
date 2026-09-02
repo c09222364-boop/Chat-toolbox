@@ -43,6 +43,15 @@ function marked(value, different, escapeHTML) {
     return different ? `<mark class="ctb-compare-difference">${text || '&nbsp;'}</mark>` : text;
 }
 
+export function normalizeComparableText(value) {
+    return String(value ?? '')
+        .replace(/\r\n?/g, '\n')
+        .split('\n')
+        .map((line) => line.replace(/[ \t]+$/g, ''))
+        .join('\n')
+        .replace(/^\n+|\n+$/g, '');
+}
+
 function renderSentencePair(leftLine, rightLine, escapeHTML) {
     if (structuredPromptLine(leftLine) || structuredPromptLine(rightLine)) {
         return { left: marked(leftLine, true, escapeHTML), right: marked(rightLine, true, escapeHTML) };
@@ -67,8 +76,8 @@ function renderSentencePair(leftLine, rightLine, escapeHTML) {
  * intact and are highlighted as a whole.
  */
 export function renderTextDifference(leftValue, rightValue, escapeHTML) {
-    const left = String(leftValue ?? '').split('\n');
-    const right = String(rightValue ?? '').split('\n');
+    const left = normalizeComparableText(leftValue).split('\n');
+    const right = normalizeComparableText(rightValue).split('\n');
     const matches = lcsMatches(left, right);
     const leftHtml = [];
     const rightHtml = [];

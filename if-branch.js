@@ -17,6 +17,7 @@ export function createIfBranchModule(deps) {
         deepClone,
         normalizeIfPrompt,
         normalizeIfFavorite,
+        countNonWhitespaceCharacters,
         saveSettings,
         saveChat,
         notify,
@@ -54,10 +55,6 @@ export function createIfBranchModule(deps) {
     function ifBranchCharacterName() {
         const card = currentCharacterCard();
         return String(card?.name || host.SillyTavern?.name2 || '角色');
-    }
-    
-    function ifBranchCharacterCount(value) {
-        return Array.from(String(value || '').replace(/\s/g, '')).length;
     }
     
     function ifBranchMessageRole(message) {
@@ -108,7 +105,7 @@ export function createIfBranchModule(deps) {
             startIndex,
             messages,
             layers: messages.length,
-            characters: messages.reduce((sum, message) => sum + ifBranchCharacterCount(messageText(message)), 0),
+            characters: messages.reduce((sum, message) => sum + countNonWhitespaceCharacters(messageText(message)), 0),
         };
     }
     
@@ -457,7 +454,7 @@ export function createIfBranchModule(deps) {
     }
     
     function ifFavoriteCharacters(favorite) {
-        return favorite.messages.reduce((sum, message) => sum + ifBranchCharacterCount(message.text), 0);
+        return favorite.messages.reduce((sum, message) => sum + countNonWhitespaceCharacters(message.text), 0);
     }
     
     async function copyIfFavorite(id) {
@@ -520,7 +517,7 @@ export function createIfBranchModule(deps) {
         const messages = favorite.messages.map((message, index) => {
             const role = message.role === 'user' ? '用户' : message.role === 'system' ? '系统' : '角色';
             const content = escapeHTML(message.text).replace(/\n/g, '<br>');
-            return `<article class="ctb-if-reader-message is-${message.role}"><div class="ctb-if-reader-meta"><strong>${index + 1}. ${role}${message.name ? ` · ${escapeHTML(message.name)}` : ''}</strong><span>${ifBranchCharacterCount(message.text)} 字</span></div><div class="ctb-if-reader-plain">${content}</div></article>`;
+            return `<article class="ctb-if-reader-message is-${message.role}"><div class="ctb-if-reader-meta"><strong>${index + 1}. ${role}${message.name ? ` · ${escapeHTML(message.name)}` : ''}</strong><span>${countNonWhitespaceCharacters(message.text)} 字</span></div><div class="ctb-if-reader-plain">${content}</div></article>`;
         }).join('');
         return `<div class="ctb-reader-overlay" role="dialog" aria-modal="true">
             <div class="ctb-reader-card">

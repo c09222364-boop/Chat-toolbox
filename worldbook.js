@@ -1,4 +1,4 @@
-import { renderTextDifference } from './compare-diff.js';
+import { normalizeComparableText, renderTextDifference } from './compare-diff.js';
 
 function worldbookEntryIdentifier(entry, fallback = '') {
     const value = entry?.uid ?? entry?.id ?? fallback;
@@ -98,8 +98,8 @@ export function synchronizeWorldbookOriginalData(document) {
 export function createWorldbookModule(deps) {
     const {
         host, getContext, getChat, chatKey, currentCharacterCard, deepClone,
-        stProxyJson, notify, renderPanel, getRoot, requestDialog,
-        escapeHTML, messageId, messageName, messageText, infoButton,
+        stProxyJson, notify, renderPanel, getRoot, requestDialog, requestSaveBeforeClose,
+        escapeHTML, messageId, messageName, messageText, infoButton, countNonWhitespaceCharacters,
     } = deps;
 
     let worldbookLoading = false;
@@ -301,12 +301,8 @@ export function createWorldbookModule(deps) {
         return String(raw.comment || raw.name || keys || `条目 ${record?.uid || ''}`);
     }
     
-    function worldbookTextCharacterCount(value) {
-        return Array.from(String(value || '').replace(/\s/g, '')).length;
-    }
-    
     function worldbookWordCount(record) {
-        return worldbookTextCharacterCount(record?.raw?.content);
+        return countNonWhitespaceCharacters(record?.raw?.content);
     }
     
     function worldbookRecordSearchText(record) {
@@ -769,20 +765,6 @@ export function createWorldbookModule(deps) {
         return String(worldbookRecordLabel(record) || '').trim();
     }
 
-    function worldbookComparableRaw(raw, path = '') {
-        if (Array.isArray(raw)) return raw.map((value) => worldbookComparableRaw(value, path));
-        if (!raw || typeof raw !== 'object') return raw;
-        const ignored = path === '' ? new Set(['uid', 'displayIndex']) : path === 'extensions' ? new Set(['displayIndex', 'display_index']) : new Set();
-        return Object.keys(raw).filter((key) => !ignored.has(key)).sort().reduce((result, key) => {
-            result[key] = worldbookComparableRaw(raw[key], path ? `${path}.${key}` : key);
-            return result;
-        }, {});
-    }
-
-    function worldbookCompareKey(record) {
-        return JSON.stringify(worldbookComparableRaw(record?.raw || {}));
-    }
-
     function worldbookCompareValue(raw, key, extensionKey = key, fallback = null) {
         return worldbookOriginalExtensionValue(raw, key, extensionKey, fallback);
     }
@@ -820,7 +802,7 @@ export function createWorldbookModule(deps) {
         const b = right?.raw || {};
         const same = (first, second) => JSON.stringify(first) === JSON.stringify(second);
         const differences = [];
-        if (String(a.content || '') !== String(b.content || '')) differences.push('正文');
+        if (normalizeComparableText(a.content) !== normalizeComparableText(b.content)) differences.push('正文');
         if (!same(a.key || [], b.key || []) || !same(a.keysecondary || [], b.keysecondary || []) || Number(a.selectiveLogic || 0) !== Number(b.selectiveLogic || 0)) differences.push('关键词');
         if (Boolean(a.disable) !== Boolean(b.disable) || Boolean(a.constant) !== Boolean(b.constant)) differences.push('状态');
         if (worldbookPosition(a) !== worldbookPosition(b)) differences.push('位置');
@@ -858,9 +840,10 @@ export function createWorldbookModule(deps) {
         const rows = [];
         left.forEach((record, name) => {
             const target = right.get(name);
-            if (target && worldbookCompareKey(record) !== worldbookCompareKey(target)) {
+            if (target) {
+                const differences = worldbookCompareDifferenceLabels(record, target);
                 const searchText = `${name}\n${worldbookRecordSearchText(record)}\n${worldbookRecordSearchText(target)}`.toLowerCase();
-                if (!query || searchText.includes(query)) rows.push({ name, left: record, right: target, differences: worldbookCompareDifferenceLabels(record, target) });
+                if (differences.length && (!query || searchText.includes(query))) rows.push({ name, left: record, right: target, differences });
             }
         });
         return rows;
@@ -1268,10 +1251,10 @@ export function createWorldbookModule(deps) {
             const message = worldbookTemplateMessage({ raw: item.raw, content: String(item.raw?.content || '') });
             try {
                 const rendered = await renderPromptTemplateText(message.content, message, index, templateState);
-                item.characters = worldbookTextCharacterCount(rendered);
+                item.characters = countNonWhitespaceCharacters(rendered);
                 item.content = rendered;
             } catch (error) {
-                item.characters = worldbookTextCharacterCount(message.content);
+                item.characters = countNonWhitespaceCharacters(message.content);
                 item.reason = `${item.reason}；EJS 解析失败，按原文统计`;
                 item.content = '';
                 item.contentError = '无法解析这条内容，因此不能确认实际发送正文。';
@@ -1463,7 +1446,7 @@ export function createWorldbookModule(deps) {
                     const highlighted = renderTextDifference(row.left.raw?.content, row.right.raw?.content, escapeHTML);
                     return `<div class="ctb-preset-compare-row ctb-worldbook-compare-row">
                     <div class="ctb-preset-compare-title ctb-worldbook-compare-title">
-                        <span>${escapeHTML(row.differences.join('、') || '内容不同')}</span>
+                        <span>${escapeHTML(row.differences.join('、'))}</span>
                         <strong>${escapeHTML(row.name)}</strong>
                         <div class="ctb-worldbook-compare-overwrite">
                             <button type="button" class="ctb-button" data-action="overwrite-worldbook-compare-entry" data-worldbook-compare-direction="left-to-right" data-worldbook-left-uid="${escapeHTML(row.left.uid)}" data-worldbook-right-uid="${escapeHTML(row.right.uid)}">左侧覆盖右侧</button>
@@ -1590,15 +1573,7 @@ export function createWorldbookModule(deps) {
     async function beforePanelClose() {
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
         if (worldbookDirty || worldbookPendingDocuments.size) {
-            const decision = await requestDialog({
-                title: '保存世界书并关闭',
-                message: '世界书有未保存修改。你可以保存后关闭、直接放弃修改退出，或返回继续编辑。',
-                buttons: [
-                    { label: '保存并关闭', value: 'save', tone: 'primary' },
-                    { label: '不保存退出', value: 'discard', tone: 'danger' },
-                    { label: '取消继续编辑', value: 'cancel' },
-                ],
-            });
+            const decision = await requestSaveBeforeClose('保存世界书并关闭', '世界书有未保存修改。你可以保存后关闭、直接放弃修改退出，或返回继续编辑。');
             if (decision === 'cancel' || decision === null) return false;
             if (decision === 'discard') {
                 discardChanges();
@@ -1717,5 +1692,6 @@ export function createWorldbookModule(deps) {
         handleChange,
         handleAction,
         beforePanelClose,
+        isWide: () => worldbookCompareOpen,
     };
 }

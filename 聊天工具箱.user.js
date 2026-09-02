@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.2.11
+// @version      1.2.14
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、IF 支线收藏、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -14,7 +14,7 @@ import { createPostEditModule } from './post-edit.js';
 (function () {
     'use strict';
 
-    const VERSION = '1.2.11';
+    const VERSION = '1.2.14';
     const PREFIX = 'chat-toolbox';
     const ROOT_ID = `${PREFIX}-root`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
@@ -69,7 +69,7 @@ import { createPostEditModule } from './post-edit.js';
         'system-cache': '用于填写模型的身份、写作要求和输出格式。留空时使用默认提示词。',
         'if-branch-scope': '先从开场词库选择一条指令建立临时 IF 支线，然后直接在酒馆主聊天中连续对话。结束时可收藏并删除整条支线、仅删除，或保留为主线。',
         'worldbook-save': '进入世界书管理时会优先打开当前角色卡绑定的世界书；“模拟”可检查最近 2 层触发的条目并展开实际正文。“双书对比”只显示同名但内容或设置不同的条目，差异句子和设置会标深红，可编辑任一侧或完整覆盖另一侧。普通条目修改会先暂存在页面中，点击“现在保存”后写入世界书文件。',
-        'preset-transfer': '用于查看、编辑、复制或移动预设中的提示词条目。双预设模式可进入纯差异视图，只显示同名但正文、角色或启用状态不同的条目，并将差异句子与设置标深红。',
+        'preset-transfer': '用于查看、编辑、复制或移动预设中的提示词条目。所有修改先暂存在工具箱中，可点击“现在保存”一次写入；关闭工具箱时也会询问是否保存。双预设模式可进入纯差异视图，只显示同名但正文、角色或启用状态不同的条目。',
     });
 
     function defaults() {
@@ -257,12 +257,12 @@ import { createPostEditModule } from './post-edit.js';
         const toastr = host.toastr;
         if (root && !root.hidden) {
             transientNotice = { message: String(message), level: String(level || 'info') };
-            renderPanel();
+            syncTransientNotice();
             const snapshot = transientNotice;
             host.setTimeout(() => {
                 if (transientNotice === snapshot) {
                     transientNotice = null;
-                    renderPanel();
+                    syncTransientNotice();
                 }
             }, level === 'error' ? 9000 : 4200);
             return;
@@ -293,6 +293,21 @@ import { createPostEditModule } from './post-edit.js';
         if (!transientNotice) return '';
         const tone = transientNotice.level === 'error' ? 'error' : transientNotice.level === 'warning' ? 'warning' : transientNotice.level === 'success' ? 'success' : 'info';
         return `<div class="ctb-notice-overlay" role="alertdialog" aria-modal="true"><div class="ctb-notice-card is-${tone}"><div class="ctb-notice-title">${tone === 'error' ? '插件错误' : tone === 'warning' ? '提示' : tone === 'success' ? '已完成' : '聊天工具箱'}</div><div class="ctb-notice-message">${escapeHTML(transientNotice.message)}</div><button type="button" class="ctb-button ctb-primary" data-action="close-notice">知道了</button></div></div>`;
+    }
+
+    function syncTransientNotice() {
+        if (!root || root.hidden) return;
+        const existing = root.querySelector('.ctb-notice-overlay');
+        if (!transientNotice) {
+            existing?.remove();
+            return;
+        }
+        const template = doc.createElement('template');
+        template.innerHTML = renderTransientNotice();
+        const next = template.content.firstElementChild;
+        if (!next) return;
+        if (existing) existing.replaceWith(next);
+        else root.querySelector('.ctb-card')?.appendChild(next);
     }
 
     function renderDialog() {
@@ -336,6 +351,18 @@ import { createPostEditModule } from './post-edit.js';
         });
     }
 
+    function requestSaveBeforeClose(title, message) {
+        return requestDialog({
+            title,
+            message,
+            buttons: [
+                { label: '保存并关闭', value: 'save', tone: 'primary' },
+                { label: '不保存退出', value: 'discard', tone: 'danger' },
+                { label: '取消继续编辑', value: 'cancel' },
+            ],
+        });
+    }
+
     function cancelPendingDialog() {
         const dialog = pendingDialog;
         pendingDialog = null;
@@ -372,6 +399,10 @@ import { createPostEditModule } from './post-edit.js';
     function escapeCss(value) {
         if (host.CSS?.escape) return host.CSS.escape(String(value));
         return String(value).replace(/["\\]/g, '\\$&');
+    }
+
+    function countNonWhitespaceCharacters(value) {
+        return Array.from(String(value || '').replace(/\s/g, '')).length;
     }
 
     function getContext() {
@@ -589,6 +620,7 @@ import { createPostEditModule } from './post-edit.js';
 
     async function closePanel() {
         if (!(await worldbook.beforePanelClose())) return;
+        if (!(await presetTransfer.beforePanelClose())) return;
         infoMessage = null;
         transientNotice = null;
         cancelPendingDialog();
@@ -678,6 +710,7 @@ import { createPostEditModule } from './post-edit.js';
         deepClone,
         normalizeIfPrompt,
         normalizeIfFavorite,
+        countNonWhitespaceCharacters,
         saveSettings,
         saveChat,
         notify,
@@ -715,11 +748,13 @@ import { createPostEditModule } from './post-edit.js';
         renderPanel,
         getRoot: () => root,
         requestDialog,
+        requestSaveBeforeClose,
         escapeHTML,
         messageId,
         messageName,
         messageText,
         infoButton,
+        countNonWhitespaceCharacters,
     });
 
 
@@ -733,6 +768,7 @@ import { createPostEditModule } from './post-edit.js';
         escapeHTML,
         infoButton,
         requestDialog,
+        requestSaveBeforeClose,
     });
 
 
@@ -802,7 +838,7 @@ import { createPostEditModule } from './post-edit.js';
             ? renderers[activeTab]()
             : '<div class="ctb-results ctb-results-empty">所有功能都已在 Extensions 设置中关闭；菜单入口会继续保留。</div>';
         const tabs = modules.map((module) => `<button type="button" class="ctb-tab${activeTab === module.tab ? ' is-active' : ''}" data-action="tab" data-tab="${module.tab}">${module.label}</button>`).join('');
-        const wideManager = activeTab === 'preset-transfer';
+        const wideManager = activeTab === 'preset-transfer' || (activeTab === 'worldbook' && worldbook.isWide());
         const theme = settings.uiTheme === 'green' ? 'green' : 'blue';
         const nextThemeLabel = theme === 'green' ? '蓝色界面' : '绿色界面';
         root.innerHTML = `<div class="ctb-card ctb-theme-${theme}${wideManager ? ' ctb-card-wide' : ''}" role="dialog" aria-modal="true" aria-label="聊天工具箱" data-ctb-version="${VERSION}">
@@ -892,7 +928,7 @@ import { createPostEditModule } from './post-edit.js';
             case 'toggle-ui-theme':
                 settings.uiTheme = settings.uiTheme === 'green' ? 'blue' : 'green';
                 return renderPanel();
-            case 'close-notice': transientNotice = null; return renderPanel();
+            case 'close-notice': transientNotice = null; return syncTransientNotice();
             case 'resolve-dialog': return resolvePendingDialog(data.dialogChoice);
             case 'show-info': infoMessage = infoMessage === data.infoKey ? null : data.infoKey; return renderPanel();
             case 'close-info': infoMessage = null; return renderPanel();
