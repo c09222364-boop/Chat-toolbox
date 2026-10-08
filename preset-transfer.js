@@ -762,14 +762,15 @@ export function createPresetTransferModule(deps) {
     }
 
     async function beforePanelClose() {
+        if (presetTransferSaving) {
+            notify('预设正在保存，请完成后再关闭', 'info');
+            return false;
+        }
         if (!(await stageOpenPresetDraft())) return false;
         if (!presetTransferPendingDocuments.size) return true;
         const decision = await requestSaveBeforeClose('保存预设并关闭', `有 ${presetTransferPendingDocuments.size} 个预设包含未保存修改。你可以统一保存后关闭、放弃修改退出，或返回继续编辑。`);
         if (decision === 'cancel' || decision === null) return false;
-        if (decision === 'discard') {
-            discardPresetChanges();
-            return true;
-        }
+        if (decision === 'discard') return discardPresetChanges;
         return savePendingPresetDocuments();
     }
 

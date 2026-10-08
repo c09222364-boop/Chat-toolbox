@@ -1,14 +1,14 @@
-function lcsMatches(left, right, key = (value) => value) {
+function lcsMatches(left, right) {
     const prefix = [];
     const suffix = [];
     let start = 0;
     let leftEnd = left.length;
     let rightEnd = right.length;
-    while (start < leftEnd && start < rightEnd && key(left[start]) === key(right[start])) {
+    while (start < leftEnd && start < rightEnd && left[start] === right[start]) {
         prefix.push([start, start]);
         start += 1;
     }
-    while (leftEnd > start && rightEnd > start && key(left[leftEnd - 1]) === key(right[rightEnd - 1])) {
+    while (leftEnd > start && rightEnd > start && left[leftEnd - 1] === right[rightEnd - 1]) {
         suffix.push([--leftEnd, --rightEnd]);
     }
     suffix.reverse();
@@ -20,7 +20,7 @@ function lcsMatches(left, right, key = (value) => value) {
     const table = Array.from({ length: rows }, () => new Uint16Array(columns));
     for (let i = left.length - 1; i >= 0; i -= 1) {
         for (let j = right.length - 1; j >= 0; j -= 1) {
-            table[i][j] = key(left[i]) === key(right[j])
+            table[i][j] = left[i] === right[j]
                 ? table[i + 1][j + 1] + 1
                 : Math.max(table[i + 1][j], table[i][j + 1]);
         }
@@ -29,7 +29,7 @@ function lcsMatches(left, right, key = (value) => value) {
     let i = 0;
     let j = 0;
     while (i < left.length && j < right.length) {
-        if (key(left[i]) === key(right[j])) {
+        if (left[i] === right[j]) {
             matches.push([i + start, j + start]);
             i += 1;
             j += 1;

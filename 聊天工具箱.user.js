@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         聊天工具箱（查找、导出与 AI 改写）
-// @version      1.2.15
+// @version      1.2.16
 // @description  SillyTavern 当前聊天的楼层导航、暂存式查找替换、TXT/EPUB 导出、AI 词句修改、IF 支线收藏、世界书管理与预设条目转移
 // @match        *://*/*
 // ==/UserScript==
@@ -14,7 +14,7 @@ import { createPostEditModule } from './post-edit.js';
 (function () {
     'use strict';
 
-    const VERSION = '1.2.15';
+    const VERSION = '1.2.16';
     const PREFIX = 'chat-toolbox';
     const ROOT_ID = `${PREFIX}-root`;
     const ENTRY_ID = `${PREFIX}-menu-entry`;
@@ -54,6 +54,7 @@ import { createPostEditModule } from './post-edit.js';
     // leak into SillyTavern's page-level toastr layer while the panel is open.
     let transientNotice = null;
     let pendingDialog = null;
+    let panelClosing = false;
     let settings = defaults();
 
     const INFO = Object.freeze({
@@ -619,12 +620,26 @@ import { createPostEditModule } from './post-edit.js';
     }
 
     async function closePanel() {
-        if (!(await worldbook.beforePanelClose())) return;
-        if (!(await presetTransfer.beforePanelClose())) return;
-        infoMessage = null;
-        transientNotice = null;
-        cancelPendingDialog();
-        if (root) root.hidden = true;
+        if (panelClosing || !root || root.hidden) return;
+        if (searchExport.isSaving()) return notify('查找替换正在保存，请完成后再关闭', 'info');
+        panelClosing = true;
+        try {
+            // 放弃操作延后到全部确认通过，避免后续取消关闭时丢失前一模块的暂存。
+            const worldbookDecision = await worldbook.beforePanelClose();
+            if (!worldbookDecision) return;
+            const presetDecision = await presetTransfer.beforePanelClose();
+            if (!presetDecision) return;
+            if (searchExport.isSaving()) return notify('查找替换正在保存，请完成后再关闭', 'info');
+            if (typeof worldbookDecision === 'function') worldbookDecision();
+            if (typeof presetDecision === 'function') presetDecision();
+            searchExport.onPanelClosed();
+            infoMessage = null;
+            transientNotice = null;
+            cancelPendingDialog();
+            root.hidden = true;
+        } finally {
+            panelClosing = false;
+        }
     }
 
 
@@ -666,6 +681,7 @@ import { createPostEditModule } from './post-edit.js';
 
     const postEdit = createPostEditModule({
         host,
+        deepClone,
         aiRequestTimeoutSec: AI_REQUEST_TIMEOUT_SEC,
         getSettings: () => settings,
         defaults,

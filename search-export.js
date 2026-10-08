@@ -217,6 +217,16 @@ export function createSearchExportModule(deps) {
     function rememberUndo(entries, label, saved = false) {
         lastUndo = { entries, label, saved, chatKey: chatKey() };
     }
+
+    function restoreChatEntries(chat, entries) {
+        entries.forEach((entry) => {
+            const message = chat[entry.rawIndex];
+            if (!message) return;
+            if (entry.field === 'name') message.name = entry.before;
+            else setMessageText(message, entry.before);
+            refreshVisibleMessage(entry.rawIndex);
+        });
+    }
     
     async function undoLast() {
         if (!lastUndo?.entries?.length) {
@@ -233,13 +243,7 @@ export function createSearchExportModule(deps) {
             return;
         }
         const chat = getChat();
-        backup.entries.forEach((entry) => {
-            const message = chat[entry.rawIndex];
-            if (!message) return;
-            if (entry.field === 'name') message.name = entry.before;
-            else setMessageText(message, entry.before);
-            refreshVisibleMessage(entry.rawIndex);
-        });
+        restoreChatEntries(chat, backup.entries);
         const saved = backup.saved ? await saveChat() : true;
         lastUndo = null;
         renderPanel();
@@ -395,13 +399,7 @@ export function createSearchExportModule(deps) {
             searchSaveState.phase = '保存完成';
             notify(`已一次写入并保存 ${count} 条修改`, 'success');
         } catch (error) {
-            entries.forEach((entry) => {
-                const message = chat[entry.rawIndex];
-                if (!message) return;
-                if (entry.field === 'name') message.name = entry.before;
-                else setMessageText(message, entry.before);
-                refreshVisibleMessage(entry.rawIndex);
-            });
+            restoreChatEntries(chat, entries);
             if (metadata && typeof metadata === 'object') metadata.tainted = previousTainted;
             notify(`保存失败，已恢复聊天内存；暂存稿仍保留：${error.message}`, 'error');
         } finally {
@@ -521,13 +519,13 @@ export function createSearchExportModule(deps) {
         if (input) input.value = ui.exportTags;
     }
     
-    function renderTagMultiSelector({ inputId, value, placeholder, scanAction, closeAction, dataAttribute, open, options }) {
-        const selected = new Set(parseTags(value).map((tag) => tag.toLocaleLowerCase()));
-        const picker = open ? `<div class="ctb-export-tag-picker">
-            <div class="ctb-export-tag-picker-head"><span>当前聊天中的成对标签</span><button type="button" class="ctb-button" data-action="${closeAction}">完成</button></div>
-            <div class="ctb-export-tag-options">${options.length ? options.map((item) => `<label class="ctb-export-tag-option"><input type="checkbox" ${dataAttribute}="${escapeHTML(item.name)}"${selected.has(item.name.toLocaleLowerCase()) ? ' checked' : ''}><span>${escapeHTML(item.name)}</span><small>${item.count} 处</small></label>`).join('') : '<div class="ctb-hint">当前聊天没有扫描到成对标签；仍可在上方手动填写。</div>'}</div>
+    function renderExportTagSelector() {
+        const selected = new Set(parseTags(ui.exportTags).map((tag) => tag.toLocaleLowerCase()));
+        const picker = ui.exportTagPickerOpen ? `<div class="ctb-export-tag-picker">
+            <div class="ctb-export-tag-picker-head"><span>当前聊天中的成对标签</span><button type="button" class="ctb-button" data-action="close-export-tags">完成</button></div>
+            <div class="ctb-export-tag-options">${ui.exportTagOptions.length ? ui.exportTagOptions.map((item) => `<label class="ctb-export-tag-option"><input type="checkbox" data-export-tag="${escapeHTML(item.name)}"${selected.has(item.name.toLocaleLowerCase()) ? ' checked' : ''}><span>${escapeHTML(item.name)}</span><small>${item.count} 处</small></label>`).join('') : '<div class="ctb-hint">当前聊天没有扫描到成对标签；仍可在上方手动填写。</div>'}</div>
         </div>` : '';
-        return `<div class="ctb-export-tag-input"><input class="ctb-input" id="${inputId}" placeholder="${escapeHTML(placeholder)}" value="${escapeHTML(value)}"><button type="button" class="ctb-icon-button" data-action="${scanAction}" title="扫描当前聊天中的标签" aria-label="扫描当前聊天中的标签"><i class="fa-solid fa-wand-magic-sparkles"></i></button></div>${picker}`;
+        return `<div class="ctb-export-tag-input"><input class="ctb-input" id="ctb-export-tags" placeholder="例如 content, options" value="${escapeHTML(ui.exportTags)}"><button type="button" class="ctb-icon-button" data-action="scan-export-tags" title="扫描当前聊天中的标签" aria-label="扫描当前聊天中的标签"><i class="fa-solid fa-wand-magic-sparkles"></i></button></div>${picker}`;
     }
     
     function cleanText(text) {
@@ -677,23 +675,14 @@ export function createSearchExportModule(deps) {
                     <span class="ctb-result-counter">${results.length ? `${currentResultIndex + 1} / ${results.length}` : '0 / 0'}</span>
                     ${infoButton('search-results')}
                 </div>
-                ${canReplace ? `<div class="ctb-inline ctb-replace-row"><input class="ctb-input" id="ctb-replacement" placeholder="替换为（可以留空）" value="${escapeHTML(ui.replacement)}"${searchSaveState.saving ? ' disabled' : ''}><button type="button" class="ctb-button" data-action="replace-current"${searchSaveState.saving ? ' disabled' : ''}>替换当前</button><button type="button" class="ctb-button ctb-danger" data-action="replace-all"${searchSaveState.saving ? ' disabled' : ''}>整体替换</button><button type="button" class="ctb-button ctb-save" data-action="save-search-changes"${dirtyChanges.size && !searchSaveState.saving ? '' : ' disabled'}>${searchSaveState.saving ? '正在保存…' : `保存修改${dirtyChanges.size ? ` (${dirtyChanges.size})` : ''}`}</button></div>${searchSaveState.saving ? '<div class="ctb-save-progress"><span class="ctb-save-spinner"></span><span id="ctb-save-status">正在保存，请勿刷新页面。</span></div>' : dirtyChanges.size ? `<div class="ctb-staged-note">已暂存 ${dirtyChanges.size} 条消息；保存前聊天界面和聊天文件都不会变化。</div>` : ''}` : `<div class="ctb-info-line">${infoButton('json-readonly')}</div>`}
+${canReplace ? `<div class="ctb-inline ctb-replace-row"><input class="ctb-input" id="ctb-replacement" placeholder="替换为（可以留空）" value="${escapeHTML(ui.replacement)}"${searchSaveState.saving ? ' disabled' : ''}><button type="button" class="ctb-button" data-action="replace-current"${searchSaveState.saving ? ' disabled' : ''}>替换当前</button><button type="button" class="ctb-button ctb-danger" data-action="replace-all"${searchSaveState.saving ? ' disabled' : ''}>整体替换</button><button type="button" class="ctb-button ctb-save" data-action="save-search-changes"${dirtyChanges.size && !searchSaveState.saving ? '' : ' disabled'}>${searchSaveState.saving ? '正在保存…' : `保存修改${dirtyChanges.size ? ` (${dirtyChanges.size})` : ''}`}</button></div>${searchSaveState.saving ? '<div class="ctb-save-progress"><span class="ctb-save-spinner"></span><span id="ctb-save-status">正在保存，请勿刷新页面。</span></div>' : dirtyChanges.size ? `<div class="ctb-staged-note">已暂存 ${dirtyChanges.size} 条消息；点击“保存修改”才写入聊天，关闭工具箱会丢弃未保存的替换。</div>` : ''}` : `<div class="ctb-info-line">${infoButton('json-readonly')}</div>`}
                 ${lastUndo ? `<div class="ctb-undo-row"><span>可撤销：${escapeHTML(lastUndo.label)}</span>${infoButton('undo')}<button type="button" class="ctb-button" data-action="undo">撤销上次</button></div>` : ''}
             </section>
             ${list}`;
     }
     
     function renderExportTab() {
-        const tagSelector = renderTagMultiSelector({
-            inputId: 'ctb-export-tags',
-            value: ui.exportTags,
-            placeholder: '例如 content, options',
-            scanAction: 'scan-export-tags',
-            closeAction: 'close-export-tags',
-            dataAttribute: 'data-export-tag',
-            open: ui.exportTagPickerOpen,
-            options: ui.exportTagOptions,
-        });
+        const tagSelector = renderExportTagSelector();
         return `
             <section class="ctb-section">
                 <div class="ctb-section-title">导出文件名</div>
@@ -775,6 +764,13 @@ export function createSearchExportModule(deps) {
         return true;
     }
 
+    function onPanelClosed() {
+        dirtyChanges.clear();
+        results = [];
+        currentResultIndex = -1;
+        if (lastUndo?.staged) lastUndo = null;
+    }
+
     return {
         renderSearchTab,
         renderExportTab,
@@ -783,6 +779,8 @@ export function createSearchExportModule(deps) {
         handleAction,
         handleKeydown,
         rememberUndo,
+        isSaving: () => searchSaveState.saving,
+        onPanelClosed,
         destroy: stopSearchSaveClock,
     };
 }

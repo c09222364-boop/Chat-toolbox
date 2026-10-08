@@ -1,6 +1,6 @@
 export function createPostEditModule(deps) {
     const {
-        host, aiRequestTimeoutSec, getSettings, defaults, getContext, getChat,
+        host, aiRequestTimeoutSec, getSettings, defaults, getContext, getChat, deepClone,
         messageId, messageText, setMessageText, isAssistantMessage,
         escapeRegex, normalizeBlankLines, saveChat, verifySavedEntries,
         refreshVisibleMessage, emitMessageEdited, emitMessageUpdated,
@@ -11,11 +11,9 @@ export function createPostEditModule(deps) {
 
     let postEditDraft = null;
     let postEditLoading = false;
-    let postEditEditing = false;
     let postEditReview = [];
     let postEditReviewEditingIndex = -1;
     let postEditPromptPreview = null;
-    let postEditPreviewLoading = false;
     let channelLoadingId = '';
     let channelEditor = null;
 
@@ -77,7 +75,6 @@ export function createPostEditModule(deps) {
                 revisedContent: '',
                 tag: match.tag,
             };
-            postEditEditing = false;
             postEditReview = [];
             postEditReviewEditingIndex = -1;
             postEditPromptPreview = null;
@@ -142,10 +139,6 @@ export function createPostEditModule(deps) {
         return getSettings().ai?.channels?.find((channel) => channel.id === id) || null;
     }
     
-    function cloneChannel(channel) {
-        return JSON.parse(JSON.stringify(channel));
-    }
-    
     function channelDraftById(id) {
         if (channelEditor?.draft?.id === id) return channelEditor.draft;
         return channelById(id);
@@ -162,7 +155,7 @@ export function createPostEditModule(deps) {
     function beginEditChannel(channelId) {
         const channel = channelById(channelId);
         if (!channel) return;
-        channelEditor = { isNew: false, draft: cloneChannel(channel) };
+        channelEditor = { isNew: false, draft: deepClone(channel) };
         renderPanel();
     }
     
@@ -173,11 +166,11 @@ export function createPostEditModule(deps) {
         draft.url = String(draft.url || '').trim();
         if (!draft.name) return notify('请填写渠道名称', 'warning');
         if (!draft.url) return notify('请填写 API 地址', 'warning');
-        if (channelEditor.isNew) getSettings().ai.channels.push(cloneChannel(draft));
+        if (channelEditor.isNew) getSettings().ai.channels.push(deepClone(draft));
         else {
             const index = getSettings().ai.channels.findIndex((channel) => channel.id === draft.id);
             if (index < 0) return notify('要保存的渠道已经不存在', 'error');
-            getSettings().ai.channels.splice(index, 1, cloneChannel(draft));
+            getSettings().ai.channels.splice(index, 1, deepClone(draft));
         }
         getSettings().postEdit.channelId = draft.id;
         const name = draft.name;
@@ -217,56 +210,25 @@ export function createPostEditModule(deps) {
         return { 'Content-Type': 'application/json' };
     }
     
-    function requestAbortError(message = '请求已取消') {
-        const error = new Error(message);
-        error.name = 'AbortError';
-        return error;
+    async function waitForGeneration(promise) {
+        let timer;
+        try {
+            return await Promise.race([
+                promise,
+                new Promise((_, reject) => {
+                    timer = host.setTimeout(() => reject(new Error(`请求超过 ${AI_REQUEST_TIMEOUT_SEC} 秒，已停止等待`)), AI_REQUEST_TIMEOUT_SEC * 1000);
+                }),
+            ]);
+        } finally {
+            host.clearTimeout(timer);
+        }
     }
     
-    function waitForAbortable(promise, { signal = null, timeoutSec = 0 } = {}) {
-        if (!signal && !(Number(timeoutSec) > 0)) return promise;
-        return new Promise((resolve, reject) => {
-            let settled = false;
-            let timer = null;
-            const cleanup = () => {
-                if (timer) host.clearTimeout(timer);
-                signal?.removeEventListener?.('abort', onAbort);
-            };
-            const settle = (callback, value) => {
-                if (settled) return;
-                settled = true;
-                cleanup();
-                callback(value);
-            };
-            const onAbort = () => settle(reject, requestAbortError());
-            if (signal?.aborted) return onAbort();
-            signal?.addEventListener?.('abort', onAbort, { once: true });
-            const seconds = Number(timeoutSec);
-            if (seconds > 0) {
-                timer = host.setTimeout(
-                    () => settle(reject, new Error(`请求超过 ${Math.round(seconds)} 秒，已自动取消`)),
-                    seconds * 1000,
-                );
-            }
-            Promise.resolve(promise).then(
-                (value) => settle(resolve, value),
-                (error) => settle(reject, error),
-            );
-        });
-    }
-    
-    async function stProxyJson(path, body, { timeoutSec = AI_REQUEST_TIMEOUT_SEC, signal = null } = {}) {
+    async function stProxyJson(path, body, { timeoutSec = AI_REQUEST_TIMEOUT_SEC } = {}) {
         const Controller = host.AbortController || globalThis.AbortController;
         const controller = typeof Controller === 'function' ? new Controller() : null;
         const timeoutMs = Math.max(10, Math.min(600, Number(timeoutSec) || AI_REQUEST_TIMEOUT_SEC)) * 1000;
         let timedOut = false;
-        let externallyAborted = false;
-        const abortFromSignal = () => {
-            externallyAborted = true;
-            controller?.abort();
-        };
-        if (signal?.aborted) abortFromSignal();
-        else signal?.addEventListener?.('abort', abortFromSignal, { once: true });
         const timer = controller ? host.setTimeout(() => {
             timedOut = true;
             controller.abort();
@@ -276,7 +238,7 @@ export function createPostEditModule(deps) {
                 method: 'POST',
                 headers: stRequestHeaders(),
                 body: JSON.stringify(body),
-                ...(controller ? { signal: controller.signal } : signal ? { signal } : {}),
+                ...(controller ? { signal: controller.signal } : {}),
             });
             const raw = await response.text();
             let json = {};
@@ -287,12 +249,10 @@ export function createPostEditModule(deps) {
             }
             return json;
         } catch (error) {
-            if (error?.name === 'AbortError' && externallyAborted) throw requestAbortError();
             if (error?.name === 'AbortError' && timedOut) throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒，已自动取消`);
             throw error;
         } finally {
             if (timer) host.clearTimeout(timer);
-            signal?.removeEventListener?.('abort', abortFromSignal);
         }
     }
     
@@ -321,7 +281,7 @@ export function createPostEditModule(deps) {
                 systemPrompt: firstSystem,
                 responseLength: 8192,
             });
-            const output = await waitForAbortable(generation, { timeoutSec: AI_REQUEST_TIMEOUT_SEC });
+            const output = await waitForGeneration(generation);
             return apiOutputText(output);
         }
         if (!channel.model) throw new Error('请先拉取并选择模型');
@@ -627,7 +587,6 @@ export function createPostEditModule(deps) {
         return {
             text: texts.filter(Boolean).join('\n\n'),
             characters: texts.reduce((total, text) => total + countCharacters(text), 0),
-            messages: items.length,
         };
     }
     
@@ -669,18 +628,14 @@ export function createPostEditModule(deps) {
         return null;
     }
     
-    async function previewPostEditPrompt() {
-        if (postEditPreviewLoading) return;
+    function previewPostEditPrompt() {
         if (!postEditDraft && !preparePostEditFloor({ silent: true })) return notify('请先读取要修改的 AI 楼层', 'warning');
-        postEditPreviewLoading = true;
-        renderPanel();
         try {
             postEditPromptPreview = buildPromptPreview(buildPostEditRequest());
         } catch (error) {
             postEditPromptPreview = null;
             notify(`无法生成发送预览：${error.message}`, 'error');
         } finally {
-            postEditPreviewLoading = false;
             renderPanel();
         }
     }
@@ -704,7 +659,6 @@ export function createPostEditModule(deps) {
             if (!parsed.fullRevised) throw new Error('API 返回了空文本');
             postEditReview = parsed.reviews;
             postEditDraft.revisedContent = parsed.fullRevised;
-            postEditEditing = false;
             postEditReviewEditingIndex = -1;
             if (!postEditReview.length) throw new Error('没有得到可审核的逐段修改，请检查 system 提示词或模型返回格式');
             notify(`API 修改完成，共 ${postEditReview.length} 段待审核`, 'success');
@@ -768,7 +722,6 @@ export function createPostEditModule(deps) {
             postEditDraft.revisedContent = '';
             postEditReview = [];
             postEditPromptPreview = null;
-            postEditEditing = false;
             renderPanel();
             notify(`已采用并保存楼层 #${postEditDraft.floor}`, 'success');
         } catch (error) {
@@ -878,7 +831,7 @@ export function createPostEditModule(deps) {
             </section>
             <section class="ctb-section">
                 <div class="ctb-inline ctb-post-actions">
-                    <button type="button" class="ctb-button" data-action="preview-post-edit-prompt"${postEditPreviewLoading ? ' disabled' : ''}><i class="fa-solid fa-eye"></i> ${postEditPreviewLoading ? '整理中…' : '预览发送内容'}</button>
+                    <button type="button" class="ctb-button" data-action="preview-post-edit-prompt"><i class="fa-solid fa-eye"></i> 预览发送内容</button>
                     <button type="button" class="ctb-button ctb-primary" data-action="run-post-edit" ${draft && !postEditLoading ? '' : 'disabled'}>${postEditLoading ? '修改中…' : '调用 API 修改'}</button>
                     <button type="button" class="ctb-button" data-action="clear-post-edit" ${draft ? '' : 'disabled'}>清空预览</button>
                 </div>
@@ -887,7 +840,7 @@ export function createPostEditModule(deps) {
             ${draft ? `<section class="ctb-section ctb-post-preview">
                 <div class="ctb-section-title">楼层 #${escapeHTML(draft.floor)} · 修改预览</div>
                 <div class="ctb-post-column"><div class="ctb-post-label">原正文</div><pre class="ctb-post-text" data-ctb-scroll-key="post-edit-original">${renderPostEditParagraphPreview(draft.originalContent, changedParagraphs)}</pre></div>
-                <div class="ctb-post-column"><div class="ctb-post-label ctb-post-label-actions"><span>完整修改后（备用总稿）</span>${revised ? `<button type="button" class="ctb-review-expand" data-action="toggle-post-edit-editor" title="${postEditEditing ? '完成编辑' : '编辑修改后正文'}" aria-label="${postEditEditing ? '完成编辑' : '编辑修改后正文'}"><i class="fa-solid ${postEditEditing ? 'fa-check' : 'fa-pen'}"></i></button>` : ''}</div>${postEditEditing ? `<textarea class="ctb-input ctb-post-text ctb-post-edit-textarea" id="ctb-post-edit-revised" data-ctb-scroll-key="post-edit-revised">${escapeHTML(revised)}</textarea>` : `<pre class="ctb-post-text" data-ctb-scroll-key="post-edit-revised">${revised ? renderPostEditParagraphPreview(revised, changedParagraphs) : '点击“调用 API 修改”后显示结果。'}</pre>`}</div>
+                <div class="ctb-post-column"><div class="ctb-post-label">完整修改后</div><pre class="ctb-post-text" data-ctb-scroll-key="post-edit-revised">${revised ? renderPostEditParagraphPreview(revised, changedParagraphs) : '点击“调用 API 修改”后显示结果。'}</pre></div>
              </section>` : '<div class="ctb-results ctb-results-empty">先选择楼层并读取正文，再调用 API 生成修改预览。</div>'}
             ${reviewList}`;
     }
@@ -899,9 +852,7 @@ export function createPostEditModule(deps) {
         else if (id === 'ctb-post-edit-system') getSettings().postEdit.systemPrompt = target.value;
         else if (id === 'ctb-post-edit-rules') getSettings().postEdit.rules = target.value;
         else if (id === 'ctb-post-edit-preset-name') getSettings().postEdit.presetName = target.value;
-        else if (id === 'ctb-post-edit-revised') {
-            if (postEditDraft) postEditDraft.revisedContent = target.value;
-        } else if (id?.startsWith('ctb-post-edit-review-revised-')) {
+        else if (id?.startsWith('ctb-post-edit-review-revised-')) {
             const index = Number(id.slice('ctb-post-edit-review-revised-'.length));
             if (postEditReview[index]) {
                 postEditReview[index].replacement = target.value;
@@ -979,7 +930,7 @@ export function createPostEditModule(deps) {
             case 'save-post-preset': savePostEditPreset(); return true;
             case 'delete-post-preset': await deletePostEditPreset(); return true;
             case 'prepare-post-edit': preparePostEditFloor(); return true;
-            case 'preview-post-edit-prompt': await previewPostEditPrompt(); return true;
+            case 'preview-post-edit-prompt': previewPostEditPrompt(); return true;
             case 'close-post-edit-preview': postEditPromptPreview = null; renderPanel(); return true;
             case 'run-post-edit': await runPostEdit(); return true;
             case 'apply-post-edit': await applyPostEdit(); return true;
@@ -991,8 +942,7 @@ export function createPostEditModule(deps) {
             }
             case 'post-edit-all': postEditReview.forEach((review) => { review.decision = data.decision; }); renderPanel(); return true;
             case 'toggle-post-edit-review-editor': postEditReviewEditingIndex = postEditReviewEditingIndex === Number(data.reviewIndex) ? -1 : Number(data.reviewIndex); renderPanel(); return true;
-            case 'toggle-post-edit-editor': postEditEditing = !postEditEditing; renderPanel(); return true;
-            case 'clear-post-edit': postEditDraft = null; postEditEditing = false; postEditReview = []; postEditPromptPreview = null; postEditReviewEditingIndex = -1; renderPanel(); return true;
+            case 'clear-post-edit': postEditDraft = null; postEditReview = []; postEditPromptPreview = null; postEditReviewEditingIndex = -1; renderPanel(); return true;
             default: return false;
         }
     }

@@ -916,11 +916,6 @@ export function createWorldbookModule(deps) {
         raw.displayIndex = Number.isFinite(Number(record?.displayIndex)) ? Number(record.displayIndex) : worldbookDisplayIndex(record?.raw, 0);
         raw.selective = Array.isArray(raw.keysecondary) && raw.keysecondary.length > 0;
         raw.selectiveLogic = [0, 1, 2, 3].includes(Number(raw.selectiveLogic)) ? Number(raw.selectiveLogic) : 0;
-        raw.excludeRecursion = Boolean(raw.excludeRecursion);
-        raw.preventRecursion = Boolean(raw.preventRecursion);
-        raw.extensions = { ...(raw.extensions && typeof raw.extensions === 'object' ? raw.extensions : {}) };
-        raw.extensions.exclude_recursion = raw.excludeRecursion;
-        raw.extensions.prevent_recursion = raw.preventRecursion;
         return raw;
     }
 
@@ -965,8 +960,10 @@ export function createWorldbookModule(deps) {
             const book = side === 'right' ? worldbookCompareTarget : worldbookBook;
             worldbookCompareDraft = null;
             notify(`世界书“${book}”的条目已保存`, 'success');
+            return true;
         } catch (error) {
             notify(`保存对比条目失败：${error.message}`, 'error');
+            return false;
         } finally {
             worldbookCompareLoading = false;
             renderPanel();
@@ -1308,17 +1305,17 @@ export function createWorldbookModule(deps) {
         return `<div class="ctb-worldbook-simulation"><div class="ctb-worldbook-simulation-head"><strong>触发结果：${worldbookSimulation.triggered.length} 条 · 总字数 ${Number(worldbookSimulation.totalCharacters) || 0}</strong><span>扫描 ${escapeHTML(floorText)} · 已开启 ${worldbookSimulation.scanned} 条</span></div><div class="ctb-worldbook-simulation-list" data-ctb-scroll-key="worldbook-simulation-list">${items}</div></div>`;
     }
     
+    function renderWorldbookLogicOptions(value) {
+        return ['AND ANY · 任一', 'NOT ALL · 不全有', 'NOT ANY · 一个都没有', 'AND ALL · 全部']
+            .map((label, index) => `<option value="${index}"${Number(value ?? 0) === index ? ' selected' : ''}>${label}</option>`).join('');
+    }
+
     function renderWorldbookInlineEditor(record) {
         const draft = worldbookDraft || record.raw || {};
         const positionItems = WORLDBOOK_POSITIONS.filter((item) => item.value !== 7);
         if (Number(draft.position) === 7) positionItems.push({ value: 7, label: '命名出口（保留现有设置）' });
         const positionOptions = positionItems.map((item) => `<option value="${item.value}"${Number(draft.position ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
-        const logicOptions = [
-            { value: 0, label: 'AND ANY · 任一' },
-            { value: 1, label: 'NOT ALL · 不全有' },
-            { value: 2, label: 'NOT ANY · 一个都没有' },
-            { value: 3, label: 'AND ALL · 全部' },
-        ].map((item) => `<option value="${item.value}"${Number(draft.selectiveLogic ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
+        const logicOptions = renderWorldbookLogicOptions(draft.selectiveLogic);
         return `<div class="ctb-worldbook-inline-editor">
             <div class="ctb-worldbook-inline-editor-head"><strong>编辑条目</strong><span data-worldbook-draft-status>${worldbookDraftDirty ? '当前条目有未暂存修改' : '已载入'}</span></div>
             <div class="ctb-worldbook-editor-grid">
@@ -1349,12 +1346,7 @@ export function createWorldbookModule(deps) {
         const draft = worldbookCompareDraft?.raw;
         if (!draft) return '';
         const positionOptions = WORLDBOOK_POSITIONS.map((item) => `<option value="${item.value}"${Number(draft.position ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
-        const logicOptions = [
-            { value: 0, label: 'AND ANY · 任一' },
-            { value: 1, label: 'NOT ALL · 不全有' },
-            { value: 2, label: 'NOT ANY · 一个都没有' },
-            { value: 3, label: 'AND ALL · 全部' },
-        ].map((item) => `<option value="${item.value}"${Number(draft.selectiveLogic ?? 0) === item.value ? ' selected' : ''}>${item.label}</option>`).join('');
+        const logicOptions = renderWorldbookLogicOptions(draft.selectiveLogic);
         return `<div class="ctb-worldbook-compare-editor">
             <div class="ctb-worldbook-compare-editor-grid">
                 <label class="ctb-field"><span>名称</span><input class="ctb-input" id="ctb-worldbook-compare-comment" value="${escapeHTML(draft.comment || '')}"></label>
@@ -1576,14 +1568,18 @@ export function createWorldbookModule(deps) {
     }
 
     async function beforePanelClose() {
+        if (worldbookSaving || worldbookCompareLoading) {
+            notify('世界书正在读取或保存，请完成后再关闭', 'info');
+            return false;
+        }
         if (worldbookDraftDirty) applyWorldbookDraft({ quiet: true });
-        if (worldbookDirty || worldbookPendingDocuments.size) {
+        const comparisonChanged = worldbookCompareDraft && JSON.stringify(worldbookCompareDraft.raw)
+            !== JSON.stringify(worldbookCompareRecord(worldbookCompareDraft.side, worldbookCompareDraft.uid)?.raw);
+        if (worldbookDirty || worldbookPendingDocuments.size || comparisonChanged) {
             const decision = await requestSaveBeforeClose('保存世界书并关闭', '世界书有未保存修改。你可以保存后关闭、直接放弃修改退出，或返回继续编辑。');
             if (decision === 'cancel' || decision === null) return false;
-            if (decision === 'discard') {
-                discardChanges();
-                return true;
-            }
+            if (decision === 'discard') return discardChanges;
+            if (comparisonChanged && !(await commitWorldbookCompareDraft())) return false;
             if (worldbookDirty && !(await saveCurrentWorldbook())) return false;
             if (!(await savePendingWorldbooks())) return false;
         }

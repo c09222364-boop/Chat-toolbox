@@ -43,9 +43,7 @@
 #chat-toolbox-root .ctb-post-preview>.ctb-section-title{grid-column:1/-1;}
 #chat-toolbox-root .ctb-post-column{min-width:0;}
 #chat-toolbox-root .ctb-post-label{margin-bottom:4px;color:#777b81;font-size:11px;}
-#chat-toolbox-root .ctb-post-label-actions{display:flex;align-items:center;justify-content:space-between;gap:6px;}
 #chat-toolbox-root .ctb-post-text{height:170px;max-height:32vh;overflow:auto;margin:0;padding:8px;border:1px solid #d0d2d7;border-radius:3px;background:#ececef;color:#55585d;font:11px/1.5 var(--mainFontFamily,Arial,sans-serif);white-space:pre-wrap;word-break:break-word;}
-#chat-toolbox-root .ctb-post-edit-textarea{width:100%;resize:vertical;}
 #chat-toolbox-root .ctb-save{background:#789b82!important;color:#fff!important;}
 #chat-toolbox-root .ctb-staged-note,#chat-toolbox-root .ctb-save-progress{display:flex;align-items:center;gap:7px;margin-top:6px;padding:6px 8px;border:1px solid #c9d4cc;border-radius:3px;background:#e7ece8;color:#657069;font-size:11px;}
 #chat-toolbox-root .ctb-save-progress{border-color:#b9c9d4;background:#e5ebef;color:#566974;}
