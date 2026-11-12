@@ -13,12 +13,13 @@ export function createSearchExportModule(deps) {
 
     let results = [];
     let currentResultIndex = -1;
+    let lastSearchKey = '';
     let lastUndo = null;
     let dirtyChanges = new Map();
     let searchSaveState = { saving: false, phase: '', startedAt: 0 };
     let searchSaveTimer = null;
     const ui = {
-        query: '', replacement: '', scope: 'mes', regex: false, floor: '',
+        query: '', replacement: '', scope: 'mes', searchTag: '', regex: false, floor: '',
         bookmarkEditing: false, bookmarkName: '', exportFilename: '',
         exportStart: '', exportEnd: '', exportTags: '', exportIncludeUser: false,
         exportShowName: true, exportShowFloor: false, exportClean: true,
@@ -90,6 +91,48 @@ export function createSearchExportModule(deps) {
             after: compact(`${source.slice(start + length, right)}${right < source.length ? '…' : ''}`),
         };
     }
+
+    function searchTagName() {
+        const value = ui.scope === 'mes' ? ui.searchTag.trim() : '';
+        if (!value) return '';
+        const tag = value.startsWith('<') && value.endsWith('>') ? value.slice(1, -1) : value;
+        if (!/^[A-Za-z_\u4e00-\u9fff][\w:.\-\u4e00-\u9fff]*$/.test(tag)) throw new Error('请填写一个标签名，例如 content');
+        return tag.toLowerCase();
+    }
+
+    // Offsets refer to the untouched message. Only publish ranges from a closed pair.
+    function* searchRanges(text, tag) {
+        if (!tag) { yield [0, text.length]; return; }
+        const tokens = /<!--[\s\S]*?(?:-->|$)|<(\/?)([\w:.\-\u4e00-\u9fff]+)(?=[\s/>])(?:[^<>"']|"[^"]*"|'[^']*')*>/g;
+        let depth = 0, start = 0;
+        const pieces = [];
+        for (const token of text.matchAll(tokens)) {
+            if (token[2]?.toLowerCase() !== tag) continue;
+            if (depth > 0) pieces.push([start, token.index]);
+            if (token[1]) {
+                if (depth > 0 && --depth === 0) { yield* pieces; pieces.length = 0; }
+            } else if (!/\/\s*>$/.test(token[0])) depth++;
+            start = token.index + token[0].length;
+        }
+    }
+
+    function rewriteRanges(text, tag, transform) {
+        if (!tag) return transform(text);
+        let result = '', cursor = 0;
+        for (const [start, end] of searchRanges(text, tag)) {
+            result += text.slice(cursor, start) + transform(text.slice(start, end));
+            cursor = end;
+        }
+        return result + text.slice(cursor);
+    }
+
+    function searchPattern() {
+        return ui.regex ? compileRegex(ui.query) : new RegExp(escapeRegex(ui.query), 'gi');
+    }
+
+    function searchKey() {
+        return JSON.stringify([chatKey(), ui.scope, ui.query, ui.regex, ui.scope === 'mes' ? ui.searchTag.trim() : '']);
+    }
     
     function executeSearch({ preserveIndex = false, silent = false } = {}) {
         const query = String(ui.query || '');
@@ -104,37 +147,20 @@ export function createSearchExportModule(deps) {
     
         try {
             const found = [];
-            const regex = ui.regex ? compileRegex(query) : null;
-            for (const row of iterateRows()) {
+            const regex = searchPattern();
+            const tag = searchTagName();
+            lastSearchKey = searchKey();
+            rows: for (const row of iterateRows()) {
                 const value = fieldValue(row, ui.scope);
                 if (!value) continue;
                 let occurrence = 0;
-                if (regex) {
-                    regex.lastIndex = 0;
-                    for (const match of value.matchAll(regex)) {
-                        const matched = match[0] ?? '';
-                        const start = match.index ?? 0;
-                        occurrence += 1;
-                        found.push({ ...row, scope: ui.scope, start, length: matched.length, match: matched, preview: previewFor(value, start, matched.length), regex: true, occurrence });
-                        if (found.length >= MAX_RESULTS) break;
-                        // 对空匹配留给 matchAll 的规范推进；这里避免异常输入把界面塞满。
-                        if (!matched && start >= value.length) break;
-                    }
-                } else {
-                    const needle = query.toLocaleLowerCase();
-                    const haystack = value.toLocaleLowerCase();
-                    let from = 0;
-                    while (from <= haystack.length) {
-                        const start = haystack.indexOf(needle, from);
-                        if (start < 0) break;
-                        const match = value.slice(start, start + query.length);
-                        occurrence += 1;
-                        found.push({ ...row, scope: ui.scope, start, length: match.length, match, preview: previewFor(value, start, match.length), regex: false, occurrence });
-                        if (found.length >= MAX_RESULTS) break;
-                        from = start + Math.max(query.length, 1);
+                for (const [lo, hi] of searchRanges(value, tag)) {
+                    const segment = value.slice(lo, hi);
+                    for (const match of segment.matchAll(regex)) {
+                        found.push({ ...row, scope: ui.scope, scanned: value, lo, hi, start: lo + match.index, length: match[0].length, match: match[0], preview: previewFor(segment, match.index, match[0].length), occurrence: ++occurrence });
+                        if (found.length >= MAX_RESULTS) break rows;
                     }
                 }
-                if (found.length >= MAX_RESULTS) break;
             }
             results = found;
             currentResultIndex = found.length ? (preserveIndex ? Math.min(Math.max(previousIndex, 0), found.length - 1) : 0) : -1;
@@ -250,17 +276,14 @@ export function createSearchExportModule(deps) {
         notify(saved ? `已撤销：${backup.label}${backup.saved ? '，并已保存' : '（尚未保存）'}` : '已撤销，但没有找到自动保存接口，请手动保存', saved ? 'success' : 'warning');
     }
     
-    function resultReplacement(result) {
-        const value = fieldValue(result, result.scope);
-        if (value.slice(result.start, result.start + result.length) !== result.match) throw new Error('结果内容已经变化，请重新查找后再替换');
-        let replacement = ui.replacement;
-        if (result.regex) {
-            const re = compileRegex(ui.query);
-            re.lastIndex = 0;
-            replacement = result.match.replace(re, ui.replacement);
-        }
-        const next = value.slice(0, result.start) + replacement + value.slice(result.start + result.length);
-        return result.scope === 'mes' ? normalizeBlankLines(next) : next;
+    function resultReplacement(result, value) {
+        if (lastSearchKey !== searchKey() || value !== result.scanned) throw new Error('查找范围或正文已变化，请重新查找');
+        const pattern = searchPattern();
+        const once = new RegExp(pattern.source, pattern.flags.replace(/[gy]/g, '') + 'y');
+        once.lastIndex = result.start - result.lo;
+        const segment = value.slice(result.lo, result.hi);
+        const next = value.slice(0, result.lo) + segment.replace(once, ui.regex ? ui.replacement : () => ui.replacement) + value.slice(result.hi);
+        return result.scope === 'mes' && !searchTagName() ? normalizeBlankLines(next) : next;
     }
     
     function selectNextAfterReplacement(previous) {
@@ -291,8 +314,8 @@ export function createSearchExportModule(deps) {
         const message = getChat()[result.rawIndex];
         if (!message) return notify('原消息已经不存在，请重新查找', 'warning');
         try {
-            const next = resultReplacement(result);
-            const before = fieldValue(result, result.scope);
+            const before = fieldValue(chatRow(message, result.rawIndex), result.scope);
+            const next = resultReplacement(result, before);
             if (next === before) return notify('替换后内容没有变化', 'info');
             stageValue(result.rawIndex, result.scope, next);
             rememberUndo([{ rawIndex: result.rawIndex, field: result.scope, before }], `替换楼层 #${result.id}`);
@@ -309,25 +332,26 @@ export function createSearchExportModule(deps) {
         if (ui.scope === 'json') return notify('完整消息 JSON 仅用于查找，不能直接替换', 'warning');
         if (!ui.query.trim()) return notify('请输入查找内容', 'warning');
         if (!results.length) return notify('没有可替换的匹配结果', 'info');
+        if (lastSearchKey !== searchKey()) return notify('查找条件已变化，请重新查找', 'warning');
         const confirmed = await requestDialog({
             title: '确认整体替换',
-            message: `确定要替换当前范围内的 ${results.length} 个匹配吗？替换只会先暂存，仍需点击“保存修改”才写入聊天文件。`,
+            message: `确定替换${searchTagName() ? ' <' + searchTagName() + '> 标签内' : '当前范围内'}的全部匹配吗？修改先暂存，点击“保存修改”才写入聊天。`,
         });
-        if (!confirmed) return;
+        if (!confirmed || lastSearchKey !== searchKey()) return;
         return replaceAllNow();
     }
     
     function replaceAllNow() {
         try {
-            const re = ui.regex ? compileRegex(ui.query) : new RegExp(escapeRegex(ui.query), 'gi');
+            const re = searchPattern();
+            const tag = searchTagName();
             const changed = [];
             for (const row of iterateRows()) {
                 const current = fieldValue(row, ui.scope);
-                re.lastIndex = 0;
-                if (!re.test(current)) continue;
-                re.lastIndex = 0;
-                const replaced = current.replace(re, ui.replacement);
-                const next = ui.scope === 'mes' ? normalizeBlankLines(replaced) : replaced;
+                if (!current) continue;
+                const replaced = rewriteRanges(current, tag, segment => segment.replace(re, ui.regex || !tag ? ui.replacement : () => ui.replacement));
+                if (replaced === current) continue;
+                const next = ui.scope === 'mes' && !tag ? normalizeBlankLines(replaced) : replaced;
                 if (next === current) continue;
                 changed.push({ rawIndex: row.rawIndex, field: ui.scope, before: current });
                 stageValue(row.rawIndex, ui.scope, next);
@@ -343,10 +367,12 @@ export function createSearchExportModule(deps) {
     }
     
     function stageBlankLineCleanup() {
+        let tag;
+        try { tag = searchTagName(); } catch (error) { return notify(error.message, 'warning'); }
         const changed = [];
         for (const row of iterateRows()) {
             const current = fieldValue(row, 'mes');
-            const next = collapseExtraBlankLines(current);
+            const next = rewriteRanges(current, tag, collapseExtraBlankLines);
             if (next === current) continue;
             changed.push({ rawIndex: row.rawIndex, field: 'mes', before: current });
             stageValue(row.rawIndex, 'mes', next);
@@ -362,7 +388,7 @@ export function createSearchExportModule(deps) {
     async function saveSearchChanges() {
         if (!dirtyChanges.size) return notify('当前没有需要保存的修改', 'info');
         if (searchSaveState.saving) return;
-        const entries = Array.from(dirtyChanges.values()).map((entry) => ({ ...entry }));
+        const entries = Array.from(dirtyChanges.values()).map((entry) => ({ ...entry, normalize: false }));
         const chat = getChat();
         for (const entry of entries) {
             if (entry.chatKey !== chatKey()) return notify('当前聊天已经切换。为避免写错文件，本次暂存没有保存', 'error');
@@ -380,7 +406,7 @@ export function createSearchExportModule(deps) {
             entries.forEach((entry) => {
                 const message = chat[entry.rawIndex];
                 if (entry.field === 'name') message.name = entry.after;
-                else setMessageText(message, normalizeBlankLines(entry.after));
+                else setMessageText(message, entry.after);
             });
             if (metadata && typeof metadata === 'object') metadata.tainted = true;
             searchSaveState.phase = '正在一次保存整个聊天文件…';
@@ -664,6 +690,7 @@ export function createSearchExportModule(deps) {
                     <button type="button" class="ctb-scope${ui.scope === 'name' ? ' is-active' : ''}" data-action="set-scope" data-scope="name">发言者 name</button>
                     <button type="button" class="ctb-scope${ui.scope === 'json' ? ' is-active' : ''}" data-action="set-scope" data-scope="json">完整消息 JSON</button>
                 </div>
+                ${ui.scope === 'mes' ? `<label class="ctb-search-tag"><span>限定标签</span><input class="ctb-input" id="ctb-search-tag" placeholder="例如 content；留空查全部正文" value="${escapeXml(ui.searchTag)}"></label>` : ''}
                 <div class="ctb-inline ctb-search-row">
                     <input class="ctb-input" id="ctb-query" placeholder="输入要查找的内容…" value="${escapeHTML(ui.query)}">
                     <label class="ctb-check"><input id="ctb-regex" type="checkbox"${ui.regex ? ' checked' : ''}> 正则</label>
@@ -708,6 +735,7 @@ ${canReplace ? `<div class="ctb-inline ctb-replace-row"><input class="ctb-input"
     function handleInput(target) {
         const id = target?.id;
         if (id === 'ctb-query') ui.query = target.value;
+        else if (id === 'ctb-search-tag') ui.searchTag = target.value;
         else if (id === 'ctb-replacement') ui.replacement = target.value;
         else if (id === 'ctb-floor') ui.floor = target.value;
         else if (id === 'ctb-bookmark-name') ui.bookmarkName = target.value;
@@ -758,7 +786,7 @@ ${canReplace ? `<div class="ctb-inline ctb-replace-row"><input class="ctb-input"
     }
 
     function handleKeydown(event) {
-        if (event.key !== 'Enter' || event.target?.id !== 'ctb-query') return false;
+        if (event.key !== 'Enter' || !['ctb-query', 'ctb-search-tag'].includes(event.target?.id)) return false;
         event.preventDefault();
         executeSearch();
         return true;

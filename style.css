@@ -364,3 +364,4 @@
     #chat-toolbox-root .ctb-worldbook-compare-editor-grid{grid-template-columns:1fr;}
     #chat-toolbox-root .ctb-placement-reference{align-items:stretch;flex-direction:column;gap:3px;}
 }
+#chat-toolbox-root .ctb-search-tag{display:grid;grid-template-columns:auto minmax(0,1fr);align-items:center;gap:6px;margin-bottom:6px;}
